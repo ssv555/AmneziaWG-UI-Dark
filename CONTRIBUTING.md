@@ -34,7 +34,9 @@ target\release\awg-ui.exe --demo
 ```
 
 Demo mode uses invented tunnels and keeps its settings in `%TEMP%\awg-ui-demo`. To capture a screenshot of the
-window for a pull request: `awg-ui.exe --demo --snapshot out.png` (add `--about` for the About window).
+window for a pull request: `awg-ui.exe --demo --snapshot out.png` (add `--about` for the About window). Before
+committing images, compress them losslessly with [oxipng](https://github.com/shssoichiro/oxipng):
+`oxipng -o max -Z --strip safe img/*.png` (the screenshots in `img/` shrink by about two thirds).
 
 ## Testing
 
