@@ -36,6 +36,11 @@ pub const DEV_STARTED: &str = "2026-10-03";
 /// Ссылка на репозиторий — появится в «О программе», когда будет задана.
 pub const REPO_URL: Option<&str> = Some("https://github.com/ssv555/AmneziaWG-UI-Dark");
 
+/// Заголовок окна: имя и версия. По нему же второй запуск находит уже открытое окно.
+fn window_title() -> String {
+    format!("{APP_TITLE} v{}", env!("CARGO_PKG_VERSION"))
+}
+
 const USAGE: &str = "awg-ui [--tray] [--demo] [--about] [--snapshot file.png] | --status | --autostart on|off";
 
 fn main() {
@@ -108,7 +113,7 @@ fn main() {
         println!("autostart: {} ({:?})", win::autostart_enabled(), result);
         std::process::exit(i32::from(result.is_err()));
     }
-    if !demo && snapshot.is_none() && win::another_instance(APP_TITLE) {
+    if !demo && snapshot.is_none() && win::another_instance(&window_title()) {
         return;
     }
 
@@ -134,7 +139,7 @@ fn main() {
     }
 
     let mut viewport = eframe::egui::ViewportBuilder::default()
-        .with_title(APP_TITLE)
+        .with_title(window_title())
         .with_inner_size([1280.0, 800.0])
         .with_min_inner_size([760.0, 480.0])
         .with_icon(eframe::egui::IconData { rgba: icon::rgba(64), width: 64, height: 64 })

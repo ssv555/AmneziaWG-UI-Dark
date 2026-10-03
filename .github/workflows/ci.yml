@@ -1,0 +1,32 @@
+# Tests and a warning-free build for every push to main and every pull request.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Test
+        run: cargo test --release --locked
+
+      # RUSTFLAGS would replace the static CRT flags from .cargo/config.toml, so warnings are caught in the output.
+      - name: Build without warnings
+        shell: pwsh
+        run: |
+          $out = cargo build --release --locked 2>&1 | Out-String
+          $out
+          if ($LASTEXITCODE -ne 0) { throw 'build failed' }
+          if ($out -match '(?m)^warning') { throw 'build has warnings' }

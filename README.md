@@ -79,8 +79,12 @@ simply brings the already open window to the front.
 
 ### Download
 
-Prebuilt releases are **coming soon** on the [Releases](https://github.com/ssv555/AmneziaWG-UI-Dark/releases) page.
-The app is a single portable `awg-ui.exe`; settings, statistics, logs and languages live next to it.
+Download `awg-ui.exe` from the [latest release](https://github.com/ssv555/AmneziaWG-UI-Dark/releases/latest), put it
+in any folder and run it. Nothing to install: it is a single portable file with no runtime to install (no Visual C++
+Redistributable, no .NET); settings, statistics, logs and languages live next to it. What changed in each version is
+listed in the [changelog](CHANGELOG.md).
+
+The exe is not code-signed yet, so Windows SmartScreen may warn on the first start: **More info -> Run anyway**.
 
 ### Build from source
 
@@ -186,8 +190,14 @@ Time connected is counted while the UI is running - that is why autostart is rec
 
 ## Roadmap
 
-- [ ] Signed release builds on GitHub Releases.
-- [ ] Standalone mode that does not need the native AmneziaWG window for editing and import.
+- [x] Ready-to-run builds on GitHub Releases ([changelog](CHANGELOG.md)).
+- [ ] Code-signed builds.
+- [ ] Three working modes, switchable in Settings (the current one stays the default):
+  1. **On top of AmneziaWG** (today): the official client runs and gets its own updates; this app manages it.
+  2. **Built-in engine**: the AmneziaWG tunnel engine ships inside the app as a DLL, so no AmneziaWG installation is
+     needed; tunnels are imported into the app's own folder (from `.conf` files or the native "Export all tunnels to
+     zip" archive).
+  3. **Extended engine** (later): the built-in engine with extra features of our own.
 - [ ] More translations.
 - [ ] Your ideas - open an issue!
 

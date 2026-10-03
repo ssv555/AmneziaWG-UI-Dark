@@ -1,0 +1,76 @@
+# Tag vX.Y.Z -> tests, release build, GitHub Release with awg-ui.exe and notes from CHANGELOG.
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Tag matches Cargo.toml
+        run: |
+          $version = $env:GITHUB_REF_NAME.TrimStart('v')
+          $cargo = (Select-String -Path Cargo.toml -Pattern '^version = "(.+)"' | Select-Object -First 1).Matches[0].Groups[1].Value
+          if ($cargo -ne $version) { throw "tag $env:GITHUB_REF_NAME does not match Cargo.toml version $cargo" }
+          "VERSION=$version" >> $env:GITHUB_ENV
+
+      - name: Test
+        run: cargo test --release --locked
+
+      - name: Build
+        run: cargo build --release --locked
+
+      - name: Package
+        run: |
+          New-Item -ItemType Directory dist, pack | Out-Null
+          Copy-Item target\release\awg-ui.exe dist\awg-ui.exe
+          Copy-Item target\release\awg-ui.exe, LICENSE, README.md, README.ru.md, CHANGELOG.md, CHANGELOG.ru.md pack\
+          Compress-Archive -Path pack\* -DestinationPath "dist\AmneziaWG-UI-Dark-v$env:VERSION-x64.zip"
+          Get-ChildItem dist | ForEach-Object { "$((Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower())  $($_.Name)" } |
+            Out-File dist\SHA256SUMS.txt -Encoding utf8NoBOM
+
+      - name: Release notes from CHANGELOG
+        run: |
+          function Changes($file) {
+            $pattern = '^\| \[?' + [regex]::Escape($env:VERSION) + '[\]\s|]'
+            $row = Get-Content $file -Encoding utf8 | Where-Object { $_ -match $pattern } | Select-Object -First 1
+            if (-not $row) { throw "$file has no row for $env:VERSION" }
+            ($row -split ' \| ')[2].TrimEnd(' ', '|') -split '<br>' | ForEach-Object { "- $_" }
+          }
+          $notes = @(
+            "## What's new"
+            Changes CHANGELOG.md
+            ''
+            '## Что нового'
+            Changes CHANGELOG.ru.md
+            ''
+            '---'
+            '`awg-ui.exe` is a single portable file for Windows 10/11 x64; it works on top of the official AmneziaWG client.'
+            'The file is not code-signed yet, so Windows SmartScreen may warn on first start: "More info" -> "Run anyway".'
+            'Checksums are in `SHA256SUMS.txt`.'
+          )
+          $notes | Out-File notes.md -Encoding utf8NoBOM
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create $env:GITHUB_REF_NAME (Get-ChildItem dist).FullName `
+            --title "AmneziaWG UI Dark v$env:VERSION" --notes-file notes.md

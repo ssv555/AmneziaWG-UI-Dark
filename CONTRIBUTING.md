@@ -103,6 +103,15 @@ Never paste private keys or full configs into an issue.
 3. Open a pull request: describe what changed and why, link the issue, attach a screenshot for UI changes.
 4. Be ready for a friendly review. Small, focused pull requests are merged fastest.
 
+Every push and pull request is checked by the CI workflow: tests and a warning-free release build on Windows.
+
+## Releases
+
+1. Raise `version` in `Cargo.toml` (and run `cargo build` so `Cargo.lock` follows).
+2. Add a row on top of the table in `CHANGELOG.md` and `CHANGELOG.ru.md`: version, date, changes separated by `<br>`.
+3. Push a tag `vX.Y.Z`. The release workflow checks that the tag matches `Cargo.toml`, runs the tests, builds
+   `awg-ui.exe` and publishes a GitHub Release with the exe, a zip, checksums and notes taken from the changelog rows.
+
 ## License of contributions
 
 The project is free for non-commercial use; commercial use requires the author's written permission (see
