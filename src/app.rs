@@ -1623,12 +1623,12 @@ fn drop_target(ui: &Ui, resp: &egui::Response, rect: Rect, target: Option<&str>,
     match verdict {
         Verdict::Noop => {}
         Verdict::Invalid => {
-            ui.painter().rect_stroke(area, 3.0, Stroke::new(1.5, RED), egui::StrokeKind::Inside);
+            ui.painter().rect_stroke(area, 3.0, Stroke::new(1.5_f32, RED), egui::StrokeKind::Inside);
             ui.ctx().set_cursor_icon(egui::CursorIcon::NotAllowed);
         }
         Verdict::Valid => {
             ui.painter().rect_filled(area, 3.0, BLUE.gamma_multiply(0.15));
-            ui.painter().rect_stroke(area, 3.0, Stroke::new(1.5, BLUE), egui::StrokeKind::Inside);
+            ui.painter().rect_stroke(area, 3.0, Stroke::new(1.5_f32, BLUE), egui::StrokeKind::Inside);
             if resp.dnd_release_payload::<Drag>().is_some() {
                 let to = target.map(str::to_string);
                 actions.push(match &*drag {
@@ -1667,7 +1667,7 @@ fn header(ui: &mut Ui, s: &mut Settings, actions: &mut Vec<Action>) {
     let (row, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), ROW_H), Sense::hover());
     let painter = ui.painter_at(row);
     let weak = ui.visuals().weak_text_color();
-    painter.line_segment([row.left_bottom(), row.right_bottom()], Stroke::new(1.0, ui.visuals().widgets.noninteractive.bg_stroke.color));
+    painter.line_segment([row.left_bottom(), row.right_bottom()], Stroke::new(1.0_f32, ui.visuals().widgets.noninteractive.bg_stroke.color));
     let cols = numeric_columns(s);
     let c = cells(row, &cols);
     let mut titled: Vec<(SortKey, &str, Rect)> = vec![(SortKey::Name, "col.tunnel", c.name)];
@@ -1694,7 +1694,7 @@ fn header(ui: &mut Ui, s: &mut Settings, actions: &mut Vec<Action>) {
             let drag = ui.interact(handle, id.with("resize"), Sense::drag());
             if drag.hovered() || drag.dragged() {
                 ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
-                painter.vline(rect.left(), row.y_range(), Stroke::new(1.0, weak));
+                painter.vline(rect.left(), row.y_range(), Stroke::new(1.0_f32, weak));
             }
             if let Some(w) = column_width(s, key) {
                 *w = (*w - drag.drag_delta().x).clamp(50.0, 320.0);
@@ -1739,7 +1739,7 @@ fn guides(ui: &Ui, painter: &egui::Painter, row: Rect, depth: usize) {
     let color = ui.visuals().widgets.noninteractive.bg_stroke.color;
     for k in 0..depth {
         let x = row.left() + k as f32 * INDENT + 10.0;
-        painter.vline(x, row.y_range(), Stroke::new(1.0, color));
+        painter.vline(x, row.y_range(), Stroke::new(1.0_f32, color));
     }
 }
 
@@ -2140,10 +2140,11 @@ fn details(ui: &mut Ui, d: &Detail, s: &mut Settings, actions: &mut Vec<Action>)
                 mono(fmt::rate(tx_rate), BLUE),
             ]);
             if s.view.ping {
+                // Нет ответа — прошлое значение и «н/д» красным; причина видна в состоянии и на полосе пинга.
                 let value = match &d.ping.last {
                     None => mono("…", GRAY),
                     Some(Ok(ms)) => mono(trf("unit.ms", &[&ms.to_string()]), VIOLET),
-                    Some(Err(e)) => mono(format!("{}: {e}", tr("st.no_reply")), RED),
+                    Some(Err(_)) => mono(stale_ping(d.ping), RED),
                 };
                 rows.push([label(&trf("st.ping_to", &[&d.ping.host])), value, label(""), label("")]);
             }
@@ -2272,7 +2273,7 @@ fn graph(ui: &mut Ui, live: &Live, ping: Option<&PingState>, s: &mut Settings) {
     let (rect, hover) = ui.allocate_exact_size(Vec2::new(ui.available_width(), height), Sense::hover());
     let painter = ui.painter_at(rect);
     painter.rect_filled(rect, egui::CornerRadius::same(4), ui.visuals().extreme_bg_color);
-    painter.hline(rect.x_range(), rect.center().y, Stroke::new(1.0, ui.visuals().faint_bg_color));
+    painter.hline(rect.x_range(), rect.center().y, Stroke::new(1.0_f32, ui.visuals().faint_bg_color));
     let series = live.rate_series(period);
     let points = bucket_max(&series, rect.width() as usize);
     let max = points.iter().map(|(r, t)| r.max(*t)).fold(1.0, f64::max);
@@ -2290,8 +2291,8 @@ fn graph(ui: &mut Ui, live: &Live, ping: Option<&PingState>, s: &mut Settings) {
             .collect()
     };
     if points.len() >= 2 {
-        painter.add(egui::Shape::line(line(|p| p.1), Stroke::new(1.5, BLUE)));
-        painter.add(egui::Shape::line(line(|p| p.0), Stroke::new(1.5, GREEN)));
+        painter.add(egui::Shape::line(line(|p| p.1), Stroke::new(1.5_f32, BLUE)));
+        painter.add(egui::Shape::line(line(|p| p.0), Stroke::new(1.5_f32, GREEN)));
     }
     painter.text(
         rect.left_top() + Vec2::new(6.0, 4.0),
@@ -2307,7 +2308,7 @@ fn graph(ui: &mut Ui, live: &Live, ping: Option<&PingState>, s: &mut Settings) {
             let p = points[points.len() - 1 - i];
             let x = rect.right() - i as f32 * step;
             let y = |v: f64| rect.bottom() - 4.0 - (v / scale) as f32 * (rect.height() - 8.0);
-            painter.vline(x, rect.y_range(), Stroke::new(1.0, ui.visuals().weak_text_color()));
+            painter.vline(x, rect.y_range(), Stroke::new(1.0_f32, ui.visuals().weak_text_color()));
             painter.circle_filled(Pos2::new(x, y(p.0)), 3.5, GREEN);
             painter.circle_filled(Pos2::new(x, y(p.1)), 3.5, BLUE);
             let when = fmt::ago((i * per_point) as u64);
@@ -2337,10 +2338,19 @@ fn graph(ui: &mut Ui, live: &Live, ping: Option<&PingState>, s: &mut Settings) {
     let (handle, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 8.0), Sense::drag());
     if resp.hovered() || resp.dragged() {
         ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeVertical);
-        ui.painter().hline(handle.x_range(), handle.center().y, Stroke::new(2.0, ui.visuals().weak_text_color()));
+        ui.painter().hline(handle.x_range(), handle.center().y, Stroke::new(2.0_f32, ui.visuals().weak_text_color()));
     }
     if resp.dragged() {
         s.graph_height = (s.graph_height + resp.drag_delta().y).clamp(GRAPH_MIN_H, GRAPH_MAX_H);
+    }
+}
+
+/// Пинг не прошёл: последнее удачное значение и «н/д», если оно было, иначе только «н/д».
+fn stale_ping(ping: &PingState) -> String {
+    let na = tr("st.na");
+    match ping.history.iter().rev().find_map(|(_, ms)| *ms) {
+        Some(ms) => format!("{} ({na})", trf("unit.ms", &[&ms.to_string()])),
+        None => na,
     }
 }
 
@@ -2363,7 +2373,7 @@ fn ping_strip(ui: &mut Ui, ping: &PingState, period: f64) {
                 painter.circle_filled(Pos2::new(x, y), 2.5, VIOLET);
             }
             None => {
-                painter.vline(x, rect.y_range(), Stroke::new(2.0, RED));
+                painter.vline(x, rect.y_range(), Stroke::new(2.0_f32, RED));
             }
         }
     }
@@ -2382,7 +2392,7 @@ fn ping_strip(ui: &mut Ui, ping: &PingState, period: f64) {
         return;
     };
     let x = rect.right() - (*age / period) as f32 * rect.width();
-    painter.vline(x, rect.y_range(), Stroke::new(1.0, ui.visuals().weak_text_color()));
+    painter.vline(x, rect.y_range(), Stroke::new(1.0_f32, ui.visuals().weak_text_color()));
     let (text, color) = match ms {
         Some(ms) => (trf("unit.ms", &[&ms.to_string()]), VIOLET),
         None => (tr("st.no_reply"), RED),
@@ -2419,6 +2429,15 @@ fn save_png(path: &str, image: &egui::ColorImage) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn failed_ping_shows_last_value_and_na() {
+        let now = Instant::now();
+        let mut ping = PingState::default();
+        assert_eq!(stale_ping(&ping), "n/a");
+        ping.history.extend([(now, Some(47)), (now, None), (now, None)]);
+        assert_eq!(stale_ping(&ping), "47 ms (n/a)");
+    }
 
     #[test]
     fn bucket_keeps_peaks() {

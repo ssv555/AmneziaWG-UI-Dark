@@ -146,6 +146,7 @@ const STRINGS: &[(&str, &str, &str)] = &[
     ("st.tx_rate", "Upload", "Передача"),
     ("st.ping_to", "Ping {0}", "Пинг до {0}"),
     ("st.no_reply", "no reply", "нет ответа"),
+    ("st.na", "n/a", "н/д"),
     ("tot.rx", "Downloaded total", "Скачано всего"),
     ("tot.tx", "Uploaded total", "Отдано всего"),
     ("tot.peak", "Peak download", "Пик приёма"),
