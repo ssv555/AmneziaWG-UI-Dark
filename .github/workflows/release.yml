@@ -43,8 +43,10 @@ jobs:
           Copy-Item target\release\awg-ui.exe dist\awg-ui.exe
           Copy-Item target\release\awg-ui.exe, LICENSE, README.md, README.ru.md, CHANGELOG.md, CHANGELOG.ru.md pack\
           Compress-Archive -Path pack\* -DestinationPath "dist\AmneziaWG-UI-Dark-v$env:VERSION-x64.zip"
-          Get-ChildItem dist | ForEach-Object { "$((Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower())  $($_.Name)" } |
-            Out-File dist\SHA256SUMS.txt -Encoding utf8NoBOM
+          # Hashes first, file second: Out-File would create SHA256SUMS.txt in dist before the listing.
+          $sums = Get-ChildItem dist | ForEach-Object { "$((Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower())  $($_.Name)" }
+          $sums | Out-File dist\SHA256SUMS.txt -Encoding utf8NoBOM
+          $sums
 
       - name: Release notes from CHANGELOG
         run: |

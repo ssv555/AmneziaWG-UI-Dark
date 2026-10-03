@@ -29,4 +29,6 @@ jobs:
           $out = cargo build --release --locked 2>&1 | Out-String
           $out
           if ($LASTEXITCODE -ne 0) { throw 'build failed' }
-          if ($out -match '(?m)^warning') { throw 'build has warnings' }
+          $warnings = $out -split "`r?`n" | Select-String -Pattern '^warning' -Context 0, 8
+          foreach ($w in $warnings) { "::error::$($w.Line) | $(($w.Context.PostContext | ForEach-Object Trim) -join ' | ')" }
+          if ($warnings) { throw 'build has warnings' }
