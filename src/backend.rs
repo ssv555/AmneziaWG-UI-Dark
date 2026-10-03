@@ -180,6 +180,16 @@ fn running_pipes() -> io::Result<Vec<String>> {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn demo_counter_only_grows() {
+        let mut prev = 0;
+        for i in 1..3000 {
+            let now = super::demo_bytes(i as f64 * 0.25, 60_000.0, 2.1);
+            assert!(now > prev, "t={}", i as f64 * 0.25);
+            prev = now;
+        }
+    }
+
+    #[test]
     fn lists_pipes_on_windows() {
         // Каналы есть в любой работающей Windows; ошибка здесь = неверный путь к пространству каналов.
         let all = std::fs::read_dir(crate::uapi::PIPE_ROOT).unwrap().count();
@@ -216,7 +226,6 @@ impl Demo {
     fn status(&self, tunnel: &str) -> Status {
         let t = self.started.elapsed().as_secs_f64();
         let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
-        let wave = (t / 3.0).sin().abs();
         Status {
             public_key: "xTIBA5rboUvnH4htodjb6e697QjLERt1NAB4mZqp8Dg=".into(),
             listen_port: 51820,
@@ -228,13 +237,26 @@ impl Demo {
                 public_key: "TrMvSoP4jYQlY6RIzBgbssQqY3vxI2Pi+y71lOWWXX0=".into(),
                 endpoint: format!("203.0.113.{}:51820", 10 + tunnel.len()),
                 last_handshake_sec: now - (t as u64 % 120),
-                rx_bytes: 2_065_694 + (t * 40_000.0 * (1.0 + wave)) as u64,
-                tx_bytes: 1_153_433 + (t * 9_000.0 * (1.0 + wave)) as u64,
+                rx_bytes: 2_065_694 + demo_bytes(t, 60_000.0, 0.0),
+                tx_bytes: 1_153_433 + demo_bytes(t, 14_000.0, 2.1),
                 keepalive: 25,
                 allowed_ips: (0..180).map(|i| format!("{}.{}.0.0/{}", 3 + i % 200, i * 7 % 255, 12 + i % 12)).collect(),
             }],
         }
     }
+
+    /// Выдуманная задержка пинга, мс.
+    pub fn ping_ms(&self) -> u32 {
+        let t = self.started.elapsed().as_secs_f64();
+        (42.0 + 6.0 * (t / 23.0).sin() + 3.0 * (t / 7.0).sin()) as u32
+    }
+}
+
+/// Счётчик байт демо-туннеля: интеграл скорости `rate·(1 + 0.55·sin(t/9) + 0.35·sin(t/2.7))`.
+/// Скорость всегда положительна, поэтому счётчик только растёт, а график похож на живой трафик.
+fn demo_bytes(t: f64, rate: f64, phase: f64) -> u64 {
+    let integral = |t: f64| t - 0.55 * 9.0 * (t / 9.0 + phase).cos() - 0.35 * 2.7 * (t / 2.7 + phase).cos();
+    (rate * (integral(t) - integral(0.0))) as u64
 }
 
 /// amneziawg.exe — из настроек службы менеджера; служба не найдена — стандартный путь в Program Files.

@@ -6,6 +6,7 @@ use std::net::{Ipv4Addr, ToSocketAddrs};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use crate::backend::Backend;
 use crate::monitor::Shared;
 
 const INTERVAL: Duration = Duration::from_secs(10);
@@ -56,7 +57,10 @@ pub fn spawn(shared: Arc<Shared>) {
                 continue;
             }
             next = Instant::now() + INTERVAL;
-            let result = resolve(&host).and_then(|ip| echo(ip, TIMEOUT_MS));
+            let result = match &shared.backend {
+                Backend::Demo(d) => Ok(d.ping_ms()),
+                Backend::Real(_) => resolve(&host).and_then(|ip| echo(ip, TIMEOUT_MS)),
+            };
             shared.ping.lock().unwrap().record(&host, result);
         }
     });

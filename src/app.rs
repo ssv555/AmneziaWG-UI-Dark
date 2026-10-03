@@ -18,7 +18,7 @@ use crate::health::{self, Health, Level};
 use crate::i18n::{self, tr, trf};
 use crate::monitor::{self, Live, Options, Shared, Snapshot};
 use crate::ping::PingState;
-use crate::settings::{Settings, SortKey, WindowRect};
+use crate::settings::{Settings, SortKey, WindowRect, MAX_SCALE, MIN_SCALE};
 use crate::stats::{self, Stats, TunnelStats};
 use crate::{tray, win};
 
@@ -32,7 +32,17 @@ const INDENT: f32 = 16.0;
 const NUM_FONT: f32 = 13.5;
 const GRAPH_MIN_H: f32 = 40.0;
 const GRAPH_MAX_H: f32 = 600.0;
-const PING_STRIP_H: f32 = 34.0;
+const PING_STRIP_H: f32 = 50.0;
+/// Масштабы в меню «Вид»; Ctrl+Plus/Minus даёт и промежуточные.
+const SCALES: [f32; 8] = [0.8, 0.9, 1.0, 1.1, 1.25, 1.5, 1.75, 2.0];
+/// Высота подписи над точками полосы пинга.
+const LEGEND_H: f32 = 24.0;
+/// Верх графика = пик × запас.
+const GRAPH_HEADROOM: f64 = 1.15;
+/// `--snapshot`: размер окна в точках, высота графика и предельное ожидание его заполнения.
+const SNAPSHOT_SIZE: [f32; 2] = [1600.0, 1100.0];
+const SNAPSHOT_GRAPH_H: f32 = 240.0;
+const SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(600);
 const PERIODS: [(u32, &str); 3] = [(120, "period.2m"), (600, "period.10m"), (3600, "period.1h")];
 
 const GREEN: Color32 = Color32::from_rgb(90, 200, 120);
@@ -181,6 +191,8 @@ pub struct App {
     search: String,
     hide_on_frame: Option<u64>,
     frame: u64,
+    /// Масштаб, который окно уже получило (сравнение ловит Ctrl+Plus/Minus).
+    zoom: f32,
     snapshot_file: Option<String>,
     started: Instant,
 }
@@ -248,6 +260,7 @@ impl App {
             sel_group: None,
             search: String::new(),
             frame: 0,
+            zoom: 1.0,
             snapshot_file: start.snapshot_file,
             started: Instant::now(),
         }
@@ -778,7 +791,7 @@ impl App {
                     });
                 }
                 ui.add_space(6.0);
-                ui.add(egui::Label::new(RichText::new(trf("about.files", &[&self.base_dir.display().to_string()])).weak()).wrap());
+                ui.add(egui::Label::new(RichText::new(trf("about.files", &[&fmt::short_path(&self.base_dir)])).weak()).wrap());
                 ui.add_space(8.0);
                 close = dialog_buttons(ui, &tr("btn.close"), true, None).0;
             });
@@ -898,12 +911,18 @@ impl App {
             ping_host: self.s.ping_host.trim().to_string(),
             notify: self.s.notify,
             tray: self.s.tray,
+            taskbar: self.s.taskbar,
         };
         let mut o = self.shared.options.lock().unwrap();
         if o.tray != new.tray {
             tray::set_visible(new.tray);
         }
-        if o.ping != new.ping || o.ping_host != new.ping_host || o.notify != new.notify || o.tray != new.tray {
+        if o.ping != new.ping
+            || o.ping_host != new.ping_host
+            || o.notify != new.notify
+            || o.tray != new.tray
+            || o.taskbar != new.taskbar
+        {
             *o = new;
         }
     }
@@ -987,11 +1006,37 @@ impl App {
         }
     }
 
-    /// `--snapshot файл.png`: через несколько секунд сохранить кадр окна и выйти.
+    /// Масштаб интерфейса поверх масштаба Windows: из меню — в окно, с клавиатуры (Ctrl+Plus/Minus) — в настройки.
+    fn sync_zoom(&mut self, ctx: &egui::Context) {
+        if self.snapshot_file.is_some() {
+            return; // у снимка свой масштаб
+        }
+        let current = ctx.zoom_factor();
+        if (current - self.zoom).abs() > 0.001 {
+            self.s.ui_scale = current.clamp(MIN_SCALE, MAX_SCALE);
+        }
+        if (self.s.ui_scale - current).abs() > 0.001 {
+            ctx.set_zoom_factor(self.s.ui_scale);
+        }
+        // Новый масштаб вступает в силу со следующего кадра.
+        self.zoom = self.s.ui_scale;
+    }
+
+    /// `--snapshot файл.png`: кадр окна в масштабе Windows, когда график заполнен за весь период; потом выход.
     fn handle_snapshot(&mut self, ctx: &egui::Context) {
         let Some(path) = self.snapshot_file.clone() else { return };
         ctx.request_repaint();
-        if self.started.elapsed() > Duration::from_secs(6) {
+        if self.frame == 3 {
+            // Размер в точках: при масштабе Windows 150 % снимок выйдет в полтора раза больше в пикселях.
+            self.s.graph_height = SNAPSHOT_GRAPH_H;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(false));
+            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(SNAPSHOT_SIZE.into()));
+            ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::pos2(0.0, 0.0)));
+        }
+        let elapsed = self.started.elapsed();
+        let period = self.s.graph_period.max(60) as f64 + 3.0;
+        let graph_full = self.shared.snapshot.lock().unwrap().running.values().all(|l| l.observed_secs() >= period);
+        if elapsed > Duration::from_secs(6) && (graph_full || elapsed > SNAPSHOT_TIMEOUT) {
             ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(Default::default()));
             self.started += Duration::from_secs(3600);
         }
@@ -1020,6 +1065,7 @@ impl eframe::App for App {
         }
         self.handle_close(ctx);
         self.track_window(ctx);
+        self.sync_zoom(ctx);
 
         let mut actions = Vec::new();
         {
@@ -1197,6 +1243,17 @@ fn menu_bar(ui: &mut Ui, s: &mut Settings, autostart: Option<bool>, lang_dir: &s
             ui.checkbox(&mut v.details, tr("view.details"));
             ui.separator();
             ui.checkbox(&mut v.log, tr("view.log"));
+            ui.separator();
+            ui.menu_button(trf("view.scale", &[&format!("{:.0}", s.ui_scale * 100.0)]), |ui| {
+                for scale in SCALES {
+                    if ui.radio((s.ui_scale - scale).abs() < 0.01, format!("{:.0} %", scale * 100.0)).clicked() {
+                        s.ui_scale = scale;
+                        ui.close_menu();
+                    }
+                }
+                ui.separator();
+                ui.weak(tr("view.scale_keys"));
+            });
         });
         ui.menu_button(tr("menu.settings"), |ui| {
             ui.checkbox(&mut s.multiple, tr("set.multiple"));
@@ -1205,6 +1262,7 @@ fn menu_bar(ui: &mut Ui, s: &mut Settings, autostart: Option<bool>, lang_dir: &s
                 ui.checkbox(&mut s.notify, tr("set.notify"));
                 ui.checkbox(&mut s.close_to_tray, tr("set.close_to_tray"));
             });
+            ui.checkbox(&mut s.taskbar, tr("set.taskbar"));
             if let Some(on) = autostart {
                 let mut want = on;
                 if ui.checkbox(&mut want, tr("set.autostart")).changed() {
@@ -1298,6 +1356,8 @@ fn status_bar(
 fn event_log(ui: &mut Ui, shared: &Shared) {
     ui.add_space(4.0);
     ui.strong(tr("log.title"));
+    // Черта отделяет заголовок от строк, прокрученных наполовину.
+    ui.separator();
     egui::ScrollArea::vertical().auto_shrink([false, false]).stick_to_bottom(true).show(ui, |ui| {
         let events = shared.events.lock().unwrap();
         if events.items.is_empty() {
@@ -2216,6 +2276,8 @@ fn graph(ui: &mut Ui, live: &Live, ping: Option<&PingState>, s: &mut Settings) {
     let series = live.rate_series(period);
     let points = bucket_max(&series, rect.width() as usize);
     let max = points.iter().map(|(r, t)| r.max(*t)).fold(1.0, f64::max);
+    // Запас сверху, чтобы пик не упирался в подпись.
+    let scale = max * GRAPH_HEADROOM;
     // Замер раз в секунду; после сжатия одна точка покрывает `per_point` секунд.
     let per_point = if series.len() > points.len() { series.len().div_ceil(points.len().max(1)) } else { 1 };
     let step = rect.width() / period as f32 * per_point as f32;
@@ -2224,7 +2286,7 @@ fn graph(ui: &mut Ui, live: &Live, ping: Option<&PingState>, s: &mut Settings) {
             .iter()
             .rev()
             .enumerate()
-            .map(|(i, p)| Pos2::new(rect.right() - i as f32 * step, rect.bottom() - 4.0 - (pick(p) / max) as f32 * (rect.height() - 8.0)))
+            .map(|(i, p)| Pos2::new(rect.right() - i as f32 * step, rect.bottom() - 4.0 - (pick(p) / scale) as f32 * (rect.height() - 8.0)))
             .collect()
     };
     if points.len() >= 2 {
@@ -2244,7 +2306,7 @@ fn graph(ui: &mut Ui, live: &Live, ping: Option<&PingState>, s: &mut Settings) {
         if let Some(i) = nearest_from_right(rect.right() - pos.x, step, points.len()) {
             let p = points[points.len() - 1 - i];
             let x = rect.right() - i as f32 * step;
-            let y = |v: f64| rect.bottom() - 4.0 - (v / max) as f32 * (rect.height() - 8.0);
+            let y = |v: f64| rect.bottom() - 4.0 - (v / scale) as f32 * (rect.height() - 8.0);
             painter.vline(x, rect.y_range(), Stroke::new(1.0, ui.visuals().weak_text_color()));
             painter.circle_filled(Pos2::new(x, y(p.0)), 3.5, GREEN);
             painter.circle_filled(Pos2::new(x, y(p.1)), 3.5, BLUE);
@@ -2297,7 +2359,7 @@ fn ping_strip(ui: &mut Ui, ping: &PingState, period: f64) {
         let x = rect.right() - (*age / period) as f32 * rect.width();
         match ms {
             Some(ms) => {
-                let y = rect.bottom() - 4.0 - (*ms as f32 / max) * (rect.height() - 8.0);
+                let y = rect.bottom() - 4.0 - (*ms as f32 / max) * (rect.height() - 4.0 - LEGEND_H);
                 painter.circle_filled(Pos2::new(x, y), 2.5, VIOLET);
             }
             None => {

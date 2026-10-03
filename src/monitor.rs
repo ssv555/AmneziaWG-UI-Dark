@@ -84,6 +84,8 @@ pub struct Options {
     pub ping_host: String,
     pub notify: bool,
     pub tray: bool,
+    /// Точка состояния на значке окна.
+    pub taskbar: bool,
 }
 
 /// Общее состояние окна и фоновых потоков. Порядок захвата: snapshot → pending → ping → остальное.
@@ -187,9 +189,9 @@ fn react(shared: &Shared, prev: &mut Option<BTreeMap<String, Level>>, levels: &B
         p.insert(n, level);
     }
 
+    let worst = levels.values().map(|h| h.level).max_by_key(|l| severity_rank(*l)).unwrap_or(Level::Off);
     if options.tray {
         let active: Vec<(&String, &Health)> = levels.iter().filter(|(_, h)| h.level != Level::Off).collect();
-        let worst = active.iter().map(|(_, h)| h.level).max_by_key(|l| severity_rank(*l)).unwrap_or(Level::Off);
         let tip = if active.is_empty() {
             crate::i18n::tr("tray.none")
         } else {
@@ -197,6 +199,7 @@ fn react(shared: &Shared, prev: &mut Option<BTreeMap<String, Level>>, levels: &B
         };
         tray::set_state(worst, &tip);
     }
+    tray::set_window_state(options.taskbar.then_some(worst));
 }
 
 fn severity_rank(level: Level) -> u8 {

@@ -54,9 +54,37 @@ pub fn local_time(unix: u64, format: &str) -> String {
     chrono::Local.timestamp_opt(unix as i64, 0).single().map(|t| t.format(format).to_string()).unwrap_or_default()
 }
 
+/// Путь для показа: начало из %TEMP% или %USERPROFILE% заменено именем переменной,
+/// чтобы на снимках окна не было имени учётной записи.
+pub fn short_path(path: &std::path::Path) -> String {
+    let text = path.display().to_string();
+    ["TEMP", "USERPROFILE"]
+        .iter()
+        .find_map(|var| with_var(&text, var, &std::env::var(var).ok()?))
+        .unwrap_or(text)
+}
+
+/// `text`, начинающийся с `base` (без учёта регистра, по границе папки), → `%var%` + остаток.
+fn with_var(text: &str, var: &str, base: &str) -> Option<String> {
+    let base = base.trim_end_matches('\\');
+    let rest = text.get(base.len()..)?;
+    let head = text.get(..base.len())?;
+    (!base.is_empty() && head.eq_ignore_ascii_case(base) && (rest.is_empty() || rest.starts_with('\\')))
+        .then(|| format!("%{var}%{rest}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn path_prefix_becomes_variable() {
+        let base = r"C:\Users\Someone\AppData\Local\Temp";
+        assert_eq!(with_var(r"c:\users\someone\appdata\local\temp\demo", "TEMP", base).as_deref(), Some(r"%TEMP%\demo"));
+        assert_eq!(with_var(r"C:\Users\Someone", "USERPROFILE", r"C:\Users\Someone\").as_deref(), Some("%USERPROFILE%"));
+        assert_eq!(with_var(r"C:\Users\SomeoneElse\x", "USERPROFILE", r"C:\Users\Someone"), None, "только целая папка");
+        assert_eq!(with_var(r"D:\Tools\app", "TEMP", base), None);
+    }
 
     // Тесты идут на языке по умолчанию (английский): глобальный язык в тестах не переключается.
     #[test]

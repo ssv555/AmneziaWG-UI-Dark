@@ -6,6 +6,9 @@ use crate::ini::Ini;
 
 pub const DEFAULT_PING_HOST: &str = "1.1.1.1";
 pub const DEFAULT_LOG_DIR: &str = "logs";
+/// Пределы множителя масштаба интерфейса.
+pub const MIN_SCALE: f32 = 0.5;
+pub const MAX_SCALE: f32 = 3.0;
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub struct WindowRect {
@@ -94,6 +97,8 @@ pub struct Settings {
     pub maximized: bool,
     pub left_width: f32,
     pub log_height: f32,
+    /// Множитель масштаба интерфейса поверх масштаба Windows (1.0 = как в системе).
+    pub ui_scale: f32,
     pub graph_height: f32,
     /// Период графика, секунд.
     pub graph_period: u32,
@@ -104,6 +109,8 @@ pub struct Settings {
     pub multiple: bool,
     pub tray: bool,
     pub notify: bool,
+    /// Точка состояния на значке окна (панель задач, заголовок).
+    pub taskbar: bool,
     pub close_to_tray: bool,
     pub ping_host: String,
     /// Код языка ISO 639-2 (eng, rus, …).
@@ -128,6 +135,7 @@ impl Default for Settings {
             maximized: false,
             left_width: 520.0,
             log_height: 140.0,
+            ui_scale: 1.0,
             graph_height: 140.0,
             graph_period: 120,
             columns: Columns::default(),
@@ -137,6 +145,7 @@ impl Default for Settings {
             multiple: false,
             tray: true,
             notify: true,
+            taskbar: true,
             close_to_tray: true,
             ping_host: DEFAULT_PING_HOST.to_string(),
             language: crate::i18n::DEFAULT.to_string(),
@@ -169,6 +178,7 @@ impl Settings {
             maximized: ini.get_bool("window", "maximized", false),
             left_width: ini.get_or("layout", "left_width", d.left_width),
             log_height: ini.get_or("layout", "log_height", d.log_height),
+            ui_scale: ini.get_or("layout", "ui_scale", d.ui_scale).clamp(MIN_SCALE, MAX_SCALE),
             graph_height: ini.get_or("layout", "graph_height", d.graph_height),
             graph_period: ini.get_or("layout", "graph_period", d.graph_period),
             columns: Columns {
@@ -196,6 +206,7 @@ impl Settings {
             multiple: ini.get_bool("options", "multiple", d.multiple),
             tray: ini.get_bool("options", "tray", d.tray),
             notify: ini.get_bool("options", "notify", d.notify),
+            taskbar: ini.get_bool("options", "taskbar_state", d.taskbar),
             close_to_tray: ini.get_bool("options", "close_to_tray", d.close_to_tray),
             ping_host: ini.get("options", "ping_host").filter(|h| !h.is_empty()).unwrap_or(DEFAULT_PING_HOST).to_string(),
             language: ini.get("options", "language").filter(|c| crate::i18n::is_code(c)).unwrap_or(crate::i18n::DEFAULT).to_string(),
@@ -220,6 +231,7 @@ impl Settings {
         ini.set_bool("window", "maximized", self.maximized);
         ini.set("layout", "left_width", self.left_width.round());
         ini.set("layout", "log_height", self.log_height.round());
+        ini.set("layout", "ui_scale", (self.ui_scale * 100.0).round() / 100.0);
         ini.set("layout", "graph_height", self.graph_height.round());
         ini.set("layout", "graph_period", self.graph_period);
         ini.set("columns", "rx", self.columns.rx.round());
@@ -248,6 +260,7 @@ impl Settings {
         ini.set_bool("options", "multiple", self.multiple);
         ini.set_bool("options", "tray", self.tray);
         ini.set_bool("options", "notify", self.notify);
+        ini.set_bool("options", "taskbar_state", self.taskbar);
         ini.set_bool("options", "close_to_tray", self.close_to_tray);
         ini.set("options", "ping_host", &self.ping_host);
         ini.set("options", "language", &self.language);

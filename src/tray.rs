@@ -1,5 +1,6 @@
 //! Значок в трее (Shell_NotifyIcon) и уведомления Windows через него.
 //! Сообщения значка ловим подклассом главного окна; цвет точки в углу иконки = состояние туннелей.
+//! Та же точка — на значке окна в панели задач (`set_window_state`).
 //! Функции можно звать из любого потока; до `install` они ничего не делают.
 
 use std::ffi::c_void;
@@ -18,8 +19,8 @@ use windows_sys::Win32::UI::Shell::{
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreateIconIndirect, CreatePopupMenu, DestroyMenu, GetCursorPos, GetSystemMetrics, IsIconic,
     PostMessageW, RegisterWindowMessageW, SetForegroundWindow, ShowWindow, TrackPopupMenu, ICONINFO, MF_SEPARATOR,
-    MF_STRING, SM_CXSMICON, SW_HIDE, SW_RESTORE, SW_SHOW, TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTBUTTON, WM_APP,
-    WM_LBUTTONDBLCLK, WM_LBUTTONUP, WM_NULL, WM_RBUTTONUP,
+    MF_STRING, ICON_BIG, ICON_SMALL, SM_CXICON, SM_CXSMICON, SW_HIDE, SW_RESTORE, SW_SHOW, TPM_NONOTIFY, TPM_RETURNCMD,
+    TPM_RIGHTBUTTON, WM_APP, WM_LBUTTONDBLCLK, WM_LBUTTONUP, WM_NULL, WM_RBUTTONUP, WM_SETICON,
 };
 
 use crate::health::Level;
@@ -35,6 +36,8 @@ struct Tray {
     hwnd: isize,
     /// Серый, зелёный, жёлтый, красный.
     icons: [isize; 4],
+    /// Значки окна [большой, малый]: без точки, затем с точкой тех же четырёх цветов.
+    window_icons: [[isize; 2]; 5],
     taskbar_created: u32,
     ctx: egui::Context,
     on_exit: Box<dyn Fn() + Send + Sync>,
@@ -45,6 +48,8 @@ struct State {
     visible: bool,
     level: Level,
     tip: String,
+    /// Индекс в `window_icons`, выставленный окну.
+    window_icon: usize,
 }
 
 static TRAY: OnceLock<Tray> = OnceLock::new();
@@ -52,15 +57,22 @@ static TRAY: OnceLock<Tray> = OnceLock::new();
 /// Подключить трей к окну. `on_exit` вызывается пунктом «Выход».
 pub fn install(hwnd: isize, ctx: egui::Context, visible: bool, on_exit: Box<dyn Fn() + Send + Sync>) {
     let size = unsafe { GetSystemMetrics(SM_CXSMICON) }.max(16) as u32;
-    let icons = [icon::GRAY, icon::GREEN, icon::YELLOW, icon::RED].map(|c| make_icon(size, &icon::rgba_with_dot(size, c)));
+    let dots = [icon::GRAY, icon::GREEN, icon::YELLOW, icon::RED];
+    let icons = dots.map(|c| make_icon(size, &icon::rgba_with_dot(size, c)));
+    let window_sizes = unsafe { [GetSystemMetrics(SM_CXICON), GetSystemMetrics(SM_CXSMICON)] }.map(|s| s.max(16) as u32);
+    let mut window_icons = [window_sizes.map(|s| make_icon(s, &icon::rgba(s))); 5];
+    for (i, c) in dots.into_iter().enumerate() {
+        window_icons[i + 1] = window_sizes.map(|s| make_icon(s, &icon::rgba_with_dot(s, c)));
+    }
     let taskbar_created = unsafe { RegisterWindowMessageW(wide("TaskbarCreated").as_ptr()) };
     let tray = Tray {
         hwnd,
         icons,
+        window_icons,
         taskbar_created,
         ctx,
         on_exit,
-        state: Mutex::new(State { visible: false, level: Level::Off, tip: crate::APP_TITLE.to_string() }),
+        state: Mutex::new(State { visible: false, level: Level::Off, tip: crate::APP_TITLE.to_string(), window_icon: 0 }),
     };
     if TRAY.set(tray).is_err() {
         return;
@@ -101,6 +113,23 @@ pub fn set_state(level: Level, tip: &str) {
         let mut data = base(t);
         fill_icon(t, &st, &mut data);
         unsafe { Shell_NotifyIconW(NIM_MODIFY, &data) };
+    }
+}
+
+/// Точка состояния на значке окна (панель задач и заголовок); `None` — обычный значок.
+pub fn set_window_state(level: Option<Level>) {
+    let Some(t) = TRAY.get() else { return };
+    let index = level.map_or(0, |l| dot_index(l) + 1);
+    let mut st = t.state.lock().unwrap();
+    if st.window_icon == index {
+        return;
+    }
+    st.window_icon = index;
+    let [big, small] = t.window_icons[index];
+    // PostMessage: зовут из фонового потока, ждать окно незачем.
+    unsafe {
+        PostMessageW(t.hwnd as HWND, WM_SETICON, ICON_BIG as WPARAM, big);
+        PostMessageW(t.hwnd as HWND, WM_SETICON, ICON_SMALL as WPARAM, small);
     }
 }
 
@@ -145,14 +174,18 @@ fn base(t: &Tray) -> NOTIFYICONDATAW {
 fn fill_icon(t: &Tray, st: &State, data: &mut NOTIFYICONDATAW) {
     data.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
     data.uCallbackMessage = WM_TRAY;
-    let i = match st.level {
+    data.hIcon = t.icons[dot_index(st.level)] as _;
+    copy(&mut data.szTip, &st.tip);
+}
+
+/// Цвет точки по состоянию: серый, зелёный, жёлтый, красный.
+fn dot_index(level: Level) -> usize {
+    match level {
         Level::Off => 0,
         Level::Ok => 1,
         Level::Busy | Level::Warn => 2,
         Level::Bad => 3,
-    };
-    data.hIcon = t.icons[i] as _;
-    copy(&mut data.szTip, &st.tip);
+    }
 }
 
 unsafe extern "system" fn subclass_proc(

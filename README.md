@@ -38,9 +38,12 @@
 - Event log: connections, disconnections, lost and restored links.
 
 **Convenience**
-- Tray icon whose colour shows the state; Windows notifications when a link drops or comes back.
+- A coloured dot on the tray icon and on the taskbar button shows the state; Windows notifications when a link
+  drops or comes back.
 - Autostart at sign-in **without a UAC prompt** (via a scheduled task) and a desktop shortcut that also skips UAC.
 - Every panel can be switched on or off in the **View** menu; behaviour is configured in **Settings**.
+- Sharp on any screen: the interface follows the Windows display scale of each monitor (Full HD, 2K, 4K, 8K) and
+  can be made larger or smaller on top of it with **View -> Interface scale** or `Ctrl+Plus` / `Ctrl+Minus`.
 - Dark theme with a dark title bar. English by default, Russian built in, easy to add your own language.
 
 **Config editing**
@@ -109,6 +112,7 @@ Start `awg-ui.exe`. Select a tunnel and use **Connect / Disconnect** (or **Recon
 | `F2` | Rename the selected group |
 | `Delete` | Delete the selected group or tunnel (with confirmation) |
 | `Ctrl+S` | Save in the built-in config editor |
+| `Ctrl+Plus` / `Ctrl+Minus` / `Ctrl+0` | Larger / smaller interface / back to 100 % |
 | `Enter` / `Esc` in dialogs | Primary button / cancel |
 
 ### Groups
@@ -156,7 +160,7 @@ Everything is stored **next to the exe**, so the app is fully portable:
 
 | Path | Purpose |
 |------|---------|
-| `Settings.ini` | Window position and size, panel and column widths, graph height, View / Settings switches, groups, tunnel source links. Saved 0.3 s after the last change. |
+| `Settings.ini` | Window position and size, interface scale, panel and column widths, graph height, View / Settings switches, groups, tunnel source links. Saved 0.3 s after the last change. |
 | `Stats.ini` | Accumulated per-tunnel statistics, written every 15 s and on exit. WireGuard counters reset when a tunnel service restarts; the UI notices this and keeps adding up correctly. |
 | `logs\events.log` | Event log, rotated to `events.1.log` at 1 MiB. The folder can be changed with `log_dir` in the `[options]` section of `Settings.ini`. |
 | `lang\*.lng` | Additional interface languages. |
@@ -170,7 +174,7 @@ Time connected is counted while the UI is running - that is why autostart is rec
 | `--tray` | Start hidden in the tray (this is what autostart uses) |
 | `--demo` | Invented tunnels and statistics; no AmneziaWG, no administrator rights. Demo settings live in `%TEMP%\awg-ui-demo` |
 | `--about` | Open the About window at start |
-| `--snapshot <file.png>` | Save a screenshot of the window after a few seconds and exit (used for the images in this README) |
+| `--snapshot <file.png>` | Once the speed graph covers its whole period (about 2 minutes), save a screenshot of a 1600×1100-point window at the Windows display scale and exit (used for the images in this README) |
 | `--status` | No window: print the tunnel list and the state of the running ones |
 | `--autostart on\|off` | Enable or disable autostart |
 | `--launch-task` | Create only the `awg-ui-launch` task (start without UAC) |

@@ -124,6 +124,7 @@ fn main() {
         ping_host: settings.ping_host.clone(),
         notify: settings.notify,
         tray: settings.tray,
+        taskbar: settings.taskbar,
     };
     let backend = if demo { Backend::Demo(Arc::new(Demo::new())) } else { Backend::Real(Real::new()) };
     let events_path = (!demo).then(|| dir.join(&settings.log_dir).join("events.log"));
@@ -174,8 +175,29 @@ fn seed_demo_groups(s: &mut Settings) {
     }
 }
 
+/// Демо: несколько прошлых событий, чтобы журнал не был пустым.
+fn seed_demo_events(shared: &Shared) {
+    use events::{Event, Severity};
+    use i18n::{tr, trf};
+    let now = monitor::unix_now();
+    let items = [
+        (5400, "office.gw-primary", Severity::Info, tr("ev.connected")),
+        (4100, "office.gw-primary", Severity::Warn, trf("health.stale", &["3 min"])),
+        (4040, "office.gw-primary", Severity::Info, tr("ev.restored")),
+        (2700, "office.gw-primary", Severity::Info, tr("ev.disconnected")),
+        (1500, "travel.fi-hel.v4", Severity::Info, tr("ev.connected")),
+        (900, "travel.fi-hel.v4", Severity::Bad, tr("ev.dropped")),
+        (30, "home.nl-ams.full", Severity::Info, tr("ev.connected")),
+    ];
+    let mut log = shared.events.lock().unwrap();
+    for (ago, tunnel, severity, text) in items {
+        log.push(Event::new(now - ago, tunnel, severity, &text, false));
+    }
+}
+
 /// Демо: правдоподобная статистика, чтобы было видно колонки.
 fn seed_demo(shared: &Shared) {
+    seed_demo_events(shared);
     let mut stats = shared.stats.lock().unwrap();
     if !stats.is_empty() {
         return;
@@ -198,7 +220,7 @@ fn seed_demo(shared: &Shared) {
 
 /// Проверка без окна: то же, что видит интерфейс, текстом. Статистику не трогает.
 fn print_status() -> i32 {
-    let options = Options { ping: false, ping_host: String::new(), notify: false, tray: false };
+    let options = Options { ping: false, ping_host: String::new(), notify: false, tray: false, taskbar: false };
     let shared = Shared::new(Backend::Real(Real::new()), options, None, None);
     monitor::poll(&shared);
     let snap = shared.snapshot.lock().unwrap();
