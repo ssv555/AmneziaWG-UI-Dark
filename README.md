@@ -49,6 +49,8 @@
 - **The VPN does not depend on the window**: tunnels, statistics and the event log live in the core service; close the
   window and everything keeps working. The window needs no administrator rights - no UAC prompts after the core is
   installed.
+- **Tunnels come back after a reboot, power loss or a drop**: the core reconnects a tunnel you left connected
+  every 10 s for 3 minutes, every minute up to 10 minutes, then every 10 minutes, and at once when the network changes.
 - **Exit asks about the VPN** when tunnels are connected: disconnect and exit, or exit and keep the VPN running. The
   choice can be remembered; **Settings → Show hidden dialogs again** brings the question back.
 - **Updates and rollbacks** (**Help → Check for updates…**): the original AmneziaWG client, the built-in engine and

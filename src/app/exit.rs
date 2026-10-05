@@ -95,8 +95,13 @@ impl App {
         });
     }
 
+    /// Подключённые и те, что ядро переподключает: «выйти с отключением» снимает и желание держать их подключёнными,
+    /// иначе ядро продолжало бы поднимать их без окна.
     fn running_tunnels(&self) -> Vec<String> {
-        self.shared.running_names()
+        let mut names = self.shared.running_names();
+        let retrying: Vec<String> = self.shared.retrying_names().into_iter().filter(|t| !names.contains(t)).collect();
+        names.extend(retrying);
+        names
     }
 
     /// Настройки и счётчики — на диск перед выходом. Сбой записи настроек уходит в журнал окна: `ErrorSink` пишет

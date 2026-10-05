@@ -3,19 +3,22 @@
 //! вместо неё `fake::FakeService`, поэтому логика «поднять туннель», «остановить ядро», «перезапустить ядро после
 //! обновления» проверяется без службы и без прав администратора.
 //!
-//! Создание службы (`CreateServiceW`, настройка) сюда не входит: оно нужно двум местам и не повторяется.
+//! Создание службы (`CreateServiceW`) сюда не входит: у ядра и туннелей оно разное. Общая настройка обоих —
+//! действия при сбое (`set_failure_actions`).
 
-use std::ptr::null;
+use std::ptr::{null, null_mut};
 use std::time::{Duration, Instant};
 
 use windows_sys::Win32::Foundation::{
-    GetLastError, ERROR_SERVICE_ALREADY_RUNNING, ERROR_SERVICE_CANNOT_ACCEPT_CTRL, ERROR_SERVICE_DOES_NOT_EXIST,
+    GetLastError, TRUE, ERROR_SERVICE_ALREADY_RUNNING, ERROR_SERVICE_CANNOT_ACCEPT_CTRL, ERROR_SERVICE_DOES_NOT_EXIST,
     ERROR_SERVICE_MARKED_FOR_DELETE, ERROR_SERVICE_NOT_ACTIVE,
 };
 use windows_sys::Win32::System::Services::{
-    CloseServiceHandle, ControlService, DeleteService, OpenSCManagerW, OpenServiceW, QueryServiceStatus, StartServiceW,
-    SC_HANDLE, SC_MANAGER_ALL_ACCESS, SC_MANAGER_CONNECT, SERVICE_CONTROL_STOP, SERVICE_RUNNING, SERVICE_START_PENDING,
-    SERVICE_STATUS, SERVICE_STOPPED, SERVICE_STOP_PENDING,
+    ChangeServiceConfig2W, CloseServiceHandle, ControlService, DeleteService, OpenSCManagerW, OpenServiceW,
+    QueryServiceStatus, StartServiceW, SC_ACTION, SC_ACTION_NONE, SC_HANDLE, SC_MANAGER_ALL_ACCESS, SC_MANAGER_CONNECT,
+    SERVICE_CONFIG_FAILURE_ACTIONS, SERVICE_CONFIG_FAILURE_ACTIONS_FLAG, SERVICE_CONTROL_STOP, SERVICE_FAILURE_ACTIONSW,
+    SERVICE_FAILURE_ACTIONS_FLAG, SERVICE_RUNNING, SERVICE_START_PENDING, SERVICE_STATUS, SERVICE_STOPPED,
+    SERVICE_STOP_PENDING,
 };
 
 use crate::win::wide;
@@ -78,6 +81,8 @@ pub(crate) trait ServiceControl {
     /// Пометить на удаление (удалится, когда закроются все дескрипторы). Уже помечена — не ошибка.
     fn delete(&self) -> Result<(), String>;
     fn query(&self) -> Result<Status, String>;
+    /// Убрать действия диспетчера при сбое (перезапуск и прочее). Повторы туннелей ведёт ядро (`daemon::retry`).
+    fn clear_failure_actions(&self) -> Result<(), String>;
 
     /// Ждать состояния `want`; служба остановилась раньше (при ожидании не-остановки) или вышло время — последнее
     /// известное состояние: из него видны коды завершения.
@@ -255,6 +260,51 @@ impl ServiceControl for Service {
             Ok(Status::from_raw(&st))
         }
     }
+
+    fn clear_failure_actions(&self) -> Result<(), String> {
+        let mut placeholder = [SC_ACTION { Type: SC_ACTION_NONE, Delay: 0 }];
+        let none = no_failure_actions(&mut placeholder);
+        unsafe {
+            if ChangeServiceConfig2W(self.handle.0, SERVICE_CONFIG_FAILURE_ACTIONS, (&none as *const SERVICE_FAILURE_ACTIONSW).cast()) == 0 {
+                return Err(self.fail("clear failure actions"));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Действия диспетчера при сбое службы: `actions` по очереди (после последнего повторяется последнее), счётчик сбоев
+/// сбрасывается через `reset_period` секунд без сбоев. Сбой — и когда служба сама остановилась с ненулевым кодом, а не
+/// только когда процесс упал. Общее для ядра и служб туннелей.
+pub(crate) fn set_failure_actions(svc: &Service, reset_period: u32, actions: &mut [SC_ACTION]) -> Result<(), String> {
+    let failure = SERVICE_FAILURE_ACTIONSW {
+        dwResetPeriod: reset_period,
+        lpRebootMsg: null_mut(),
+        lpCommand: null_mut(),
+        cActions: actions.len() as u32,
+        lpsaActions: actions.as_mut_ptr(),
+    };
+    unsafe {
+        if ChangeServiceConfig2W(svc.raw(), SERVICE_CONFIG_FAILURE_ACTIONS, (&failure as *const SERVICE_FAILURE_ACTIONSW).cast()) == 0 {
+            return Err(svc.fail("failure actions"));
+        }
+        let flag = non_crash_failures();
+        if ChangeServiceConfig2W(svc.raw(), SERVICE_CONFIG_FAILURE_ACTIONS_FLAG, (&flag as *const SERVICE_FAILURE_ACTIONS_FLAG).cast()) == 0 {
+            return Err(svc.fail("failure actions flag"));
+        }
+    }
+    Ok(())
+}
+
+/// Описание «действий при сбое нет»: `cActions = 0` при ненулевом `lpsaActions` — так `ChangeServiceConfig2` удаляет и
+/// действия, и период сброса; с нулевым указателем он оставил бы прежние как есть.
+fn no_failure_actions(placeholder: &mut [SC_ACTION; 1]) -> SERVICE_FAILURE_ACTIONSW {
+    SERVICE_FAILURE_ACTIONSW { dwResetPeriod: 0, lpRebootMsg: null_mut(), lpCommand: null_mut(), cActions: 0, lpsaActions: placeholder.as_mut_ptr() }
+}
+
+/// Действия при сбое — и когда служба сама остановилась с ненулевым кодом, а не только когда процесс упал.
+fn non_crash_failures() -> SERVICE_FAILURE_ACTIONS_FLAG {
+    SERVICE_FAILURE_ACTIONS_FLAG { fFailureActionsOnNonCrashFailures: TRUE }
 }
 
 #[cfg(test)]
@@ -355,6 +405,11 @@ pub(crate) mod fake {
         fn wait_state(&self, want: State, timeout: Duration) -> Result<(), Status> {
             wait_for(self, want, timeout, Duration::from_millis(1))
         }
+
+        fn clear_failure_actions(&self) -> Result<(), String> {
+            self.calls.borrow_mut().push("clear_failure_actions");
+            Ok(())
+        }
     }
 }
 
@@ -364,6 +419,20 @@ mod tests {
     use super::*;
 
     const SHORT: Duration = Duration::from_millis(30);
+
+    #[test]
+    fn no_failure_actions_deletes_them_rather_than_keeping_the_old_ones() {
+        let mut placeholder = [SC_ACTION { Type: SC_ACTION_NONE, Delay: 0 }];
+        let none = no_failure_actions(&mut placeholder);
+        assert_eq!(none.cActions, 0);
+        assert!(!none.lpsaActions.is_null(), "нулевой указатель оставил бы прежние действия");
+        assert_eq!(none.dwResetPeriod, 0);
+    }
+
+    #[test]
+    fn failure_actions_on_non_crash_failures() {
+        assert_eq!(non_crash_failures().fFailureActionsOnNonCrashFailures, TRUE);
+    }
 
     #[test]
     fn wait_sees_the_state_after_a_few_polls() {

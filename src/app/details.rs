@@ -25,6 +25,8 @@ pub(super) struct Detail<'a> {
     /// Сведения о конфиге из источника или родного окна и откуда они.
     pub(super) info: Option<&'a (TunnelInfo, String)>,
     pub(super) info_loading: bool,
+    /// Ядро не смогло подключить туннель за 10 минут и пробует раз в 10 минут: можно повторить сразу.
+    pub(super) retry_slow: bool,
 }
 
 /// Подключённый туннель: сведения из службы (UAPI), адреса/DNS/MTU — из конфига, если он известен.
@@ -90,6 +92,12 @@ pub(super) fn details(ui: &mut Ui, d: &Detail, s: &mut Settings, actions: &mut V
                 if ui.add_enabled(!d.busy, main).clicked() {
                     let plan = if running { Plan::Disconnect } else { Plan::Connect };
                     actions.push(Action::Switch(d.name.to_string(), plan));
+                }
+                if d.retry_slow {
+                    let retry = egui::Button::new(RichText::new(tr("act.retry")).size(16.0)).min_size(Vec2::new(140.0, 32.0));
+                    if ui.add_enabled(!d.busy, retry).clicked() {
+                        actions.push(Action::Retry(d.name.to_string()));
+                    }
                 }
                 if s.view.reconnect && running {
                     let re = egui::Button::new(RichText::new(tr("act.reconnect")).size(16.0)).min_size(Vec2::new(150.0, 32.0));

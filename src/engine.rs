@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use windows_sys::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryExW, LOAD_WITH_ALTERED_SEARCH_PATH};
 use windows_sys::Win32::System::Services::{
-    ChangeServiceConfig2W, CreateServiceW, SERVICE_ALL_ACCESS, SERVICE_AUTO_START, SERVICE_CONFIG_DESCRIPTION,
+    ChangeServiceConfig2W, CreateServiceW, SERVICE_ALL_ACCESS, SERVICE_AUTO_START, SERVICE_CHANGE_CONFIG, SERVICE_CONFIG_DESCRIPTION,
     SERVICE_CONFIG_SERVICE_SID_INFO, SERVICE_DESCRIPTIONW, SERVICE_ERROR_NORMAL, SERVICE_QUERY_STATUS, SERVICE_SID_INFO,
     SERVICE_SID_TYPE_UNRESTRICTED, SERVICE_WIN32_OWN_PROCESS,
 };
@@ -107,8 +107,9 @@ pub fn deploy() -> Result<PathBuf, String> {
         if std::fs::read(&to).is_ok_and(|have| have == data) {
             continue;
         }
-        // Занят файл — значит, работает туннель этого режима со старой версией.
-        std::fs::write(&to, &data).map_err(|e| format!("{}: {e} — {}", to.display(), tr("eng.busy")))?;
+        // Занят файл — значит, работает туннель этого режима со старой версией. Атомарно: пропадание питания
+        // посреди копирования не оставит службе туннеля обрезанную DLL.
+        crate::fsutil::write_atomic(&to, &data).map_err(|e| format!("{}: {e} — {}", to.display(), tr("eng.busy")))?;
     }
     Ok(dst.join(FILES[0]))
 }
@@ -140,6 +141,11 @@ pub fn is_foreign(tunnel: &str) -> bool {
     owner(tunnel) == Owner::Foreign
 }
 
+/// Служба туннеля — наша и есть (в каком бы состоянии она ни была).
+pub fn has_service(tunnel: &str) -> bool {
+    owner(tunnel) == Owner::Ours
+}
+
 /// Туннель поднят нашей службой (канал с тем же именем может принадлежать и оригинальному AmneziaWG).
 pub fn is_running(tunnel: &str) -> bool {
     if owner(tunnel) != Owner::Ours {
@@ -147,6 +153,20 @@ pub fn is_running(tunnel: &str) -> bool {
     }
     // Не открылась — для опроса «поднят ли» это «нет»: монитор спрашивает по кругу, ошибка прозвучит при действии.
     Handle::scm_connect().and_then(|scm| Service::open(&scm, tunnel, SERVICE_QUERY_STATUS)).is_ok_and(|svc| svc.is_running())
+}
+
+/// Наша служба туннеля стоит с кодом ошибки: текст с кодами завершения (для журнала надзора). Иначе `None`.
+pub fn stop_reason(tunnel: &str) -> Option<String> {
+    if owner(tunnel) != Owner::Ours {
+        return None;
+    }
+    let st = Handle::scm_connect().and_then(|scm| Service::open(&scm, tunnel, SERVICE_QUERY_STATUS)).and_then(|svc| svc.query()).ok()?;
+    exit_text(tunnel, &st)
+}
+
+fn exit_text(tunnel: &str, st: &crate::scm::Status) -> Option<String> {
+    (st.state == State::Stopped && (st.win32_exit != 0 || st.specific_exit != 0))
+        .then(|| trf("eng.start_failed", &[tunnel, &st.win32_exit.to_string(), &st.specific_exit.to_string()]))
 }
 
 /// Имя туннеля, которое примет движок: `^[a-zA-Z0-9_=+.-]{1,32}$`, не зарезервированное имя устройства.
@@ -224,6 +244,12 @@ pub fn connect(conf: &Path) -> Result<(), String> {
         let mut text = wide(&tr("eng.service_desc"));
         let desc = SERVICE_DESCRIPTIONW { lpDescription: text.as_mut_ptr() };
         ChangeServiceConfig2W(svc.raw(), SERVICE_CONFIG_DESCRIPTION, (&desc as *const SERVICE_DESCRIPTIONW).cast());
+        // Действий при сбое у службы нет: не поднявшийся при загрузке или упавший туннель поднимает надзор ядра
+        // (`daemon::retry`) — один хозяин повторов, а не два наперегонки. Первый запуск после грязной остановки
+        // (питание, снятый процесс службы) и запуск в начале загрузки движок может сорвать сам: «работает» уже
+        // сообщено, а настройка адресов интерфейса падает с «Element not found» (1168) — внутри `tunnel.dll`, его
+        // наблюдатель интерфейса, исправить отсюда нельзя (DLL закреплена суммой). Такой запуск надзор считает
+        // неудачной попыткой (`retry::CONFIRM_FOR`), следующая проходит.
         start_or_remove(&svc, &tunnel, START_TIMEOUT)
     }
 }
@@ -252,6 +278,22 @@ fn stop_and_delete(svc: &dyn ServiceControl, tunnel: &str, timeout: Duration) ->
     // Не остановилась — это важнее, чем исход удаления.
     stopped.map_err(|_| trf("eng.stop_failed", &[tunnel]))?;
     deleted
+}
+
+/// Службы туннелей прежних версий Windows перезапускала при сбое (через 2, 5 и 10 с). Теперь повторы ведёт только
+/// надзор ядра (`daemon::retry`): у всех своих служб эти действия убираются при запуске ядра. Возвращает ошибки по
+/// туннелям (пустое имя — не прочитался список хранилища).
+pub fn clear_restart_on_failure() -> Vec<(String, String)> {
+    let tunnels = match crate::store::list() {
+        Ok(tunnels) => tunnels,
+        Err(e) => return vec![(String::new(), e.to_string())],
+    };
+    clear_each(&tunnels, |t| has_service(t).then(|| Handle::scm_connect().and_then(|scm| Service::open(&scm, t, SERVICE_CHANGE_CONFIG))))
+}
+
+/// `open` — служба туннеля, `None` — своей службы у него нет.
+fn clear_each<S: ServiceControl>(tunnels: &[String], open: impl Fn(&str) -> Option<Result<S, String>>) -> Vec<(String, String)> {
+    tunnels.iter().filter_map(|t| open(t)?.and_then(|svc| svc.clear_failure_actions()).err().map(|e| (t.clone(), e))).collect()
 }
 
 /// Опустить туннель: остановить и удалить службу. Чужие службы не трогаются.
@@ -341,6 +383,30 @@ mod tests {
 
     const SHORT: Duration = Duration::from_millis(30);
 
+    /// Служба, созданная прежней версией с перезапуском при сбое: при запуске ядра действия убираются у каждой своей
+    /// службы; туннель без службы не трогается, ошибка одного не мешает другим.
+    #[test]
+    fn existing_services_lose_their_failure_actions() {
+        let opened = std::cell::RefCell::new(Vec::new());
+        let tunnels = ["old".to_string(), "no-service".to_string(), "denied".to_string(), "new".to_string()];
+        let errors = clear_each(&tunnels, |t| {
+            opened.borrow_mut().push(t.to_string());
+            match t {
+                "no-service" => None,
+                "denied" => Some(Err("OpenService denied: access denied".to_string())),
+                _ => {
+                    let svc = FakeService::in_state(State::Stopped);
+                    Some(Ok(svc))
+                }
+            }
+        });
+        assert_eq!(errors, [("denied".to_string(), "OpenService denied: access denied".to_string())]);
+        assert_eq!(*opened.borrow(), tunnels);
+        let svc = FakeService::in_state(State::Running);
+        svc.clear_failure_actions().unwrap();
+        assert_eq!(svc.calls(), ["clear_failure_actions"], "работающая служба не останавливается");
+    }
+
     #[test]
     fn connect_keeps_a_service_that_reached_running() {
         let svc = FakeService::in_state(State::Stopped);
@@ -374,6 +440,15 @@ mod tests {
         let e = start_or_remove(&svc, "office", Duration::from_secs(5)).unwrap_err();
         assert!(e.contains("1066") && e.contains('7'), "{e}");
         assert_eq!(svc.calls(), ["start", "stop", "delete"]);
+    }
+
+    #[test]
+    fn stop_reason_names_the_exit_codes_of_a_stopped_service_only() {
+        let st = |state, win32_exit, specific_exit| Status { state, win32_exit, specific_exit };
+        let text = exit_text("office", &st(State::Stopped, 1168, 0)).expect("встала с ошибкой");
+        assert!(text.contains("office") && text.contains("1168"), "{text}");
+        assert_eq!(exit_text("office", &st(State::Stopped, 0, 0)), None, "остановлена штатно");
+        assert_eq!(exit_text("office", &st(State::Running, 0, 0)), None);
     }
 
     #[test]

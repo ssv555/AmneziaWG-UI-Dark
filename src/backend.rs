@@ -27,6 +27,17 @@ pub trait TunnelHost: Send + Sync {
         false
     }
 
+    /// Служба туннеля есть (работает она или нет): после перезапуска ядра её стоит подождать — Windows поднимает
+    /// службы туннелей сама. Не знаем — «есть»: подождать дольше лучше, чем пересоздать поднимающуюся службу.
+    fn service_exists(&self, _tunnel: &str) -> bool {
+        true
+    }
+
+    /// Почему служба туннеля остановилась (коды завершения), для журнала надзора. `None` — не знаем.
+    fn stop_reason(&self, _tunnel: &str) -> Option<String> {
+        None
+    }
+
     /// Задержка до узла, мс (пинг «трафик проходит»).
     fn ping_ms(&self, host: &str) -> Result<u32, String> {
         crate::ping::measure(host)
@@ -65,7 +76,14 @@ impl TunnelHost for Real {
     fn native_services(&self) -> bool {
         true
     }
+
+    fn service_exists(&self, tunnel: &str) -> bool {
+        crate::win::service_command(&format!("{NATIVE_TUNNEL_SERVICE}{tunnel}")).is_some()
+    }
 }
+
+/// Имя службы туннеля AmneziaWG — префикс и имя туннеля (`services/names.go` amneziawg-windows).
+const NATIVE_TUNNEL_SERVICE: &str = "AmneziaWGTunnel$";
 
 /// Режим 2 (в ядре): свой движок (`tunnel.dll` в службе) и своё хранилище конфигов.
 pub struct EngineHost;
@@ -102,6 +120,14 @@ impl TunnelHost for EngineHost {
 
     fn disconnect(&self, tunnel: &str) -> Result<(), String> {
         crate::engine::disconnect(tunnel)
+    }
+
+    fn service_exists(&self, tunnel: &str) -> bool {
+        crate::engine::has_service(tunnel)
+    }
+
+    fn stop_reason(&self, tunnel: &str) -> Option<String> {
+        crate::engine::stop_reason(tunnel)
     }
 }
 

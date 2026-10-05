@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 use super::helper::{self, Op, Out};
 use super::pipe::Server;
 use super::proto::{CoreState, NativeOp, Plan, Request, Response};
+use super::retry::{self, Note, Retries, Seen};
 use super::{data_dir, Config, CoreApi, DATA_SDDL};
 use crate::backend::{EngineHost, Real, TunnelHost, MANAGER_SERVICE};
 use crate::crash::lock;
@@ -36,6 +37,15 @@ pub struct Core {
     details: Mutex<HashMap<String, crate::conf::TunnelInfo>>,
     /// Обновления и откаты компонентов.
     updates: Arc<Manager>,
+    /// Надзор за желаемыми туннелями — единственный, кто их переподключает. Берётся после `switching`, не наоборот.
+    retries: Mutex<Retries>,
+}
+
+/// Кто переключает туннель: пользователь (команда окна) или надзор ядра, поднимая желаемый туннель (`retry`).
+#[derive(Clone, Copy, PartialEq)]
+enum Origin {
+    User,
+    Retry,
 }
 
 /// Сколько ждём после старта, пока канал ядра ответит на собственный запрос; не ответил — ядро не поднялось.
@@ -98,11 +108,17 @@ pub fn run(stop: &AtomicBool, ready: impl FnOnce()) -> Result<(), RunError> {
             helper_lock: Mutex::new(()),
             connections: Arc::default(),
             details: Mutex::default(),
+            retries: Mutex::default(),
         }
     });
     core.prepare_mode();
     crate::monitor::spawn(core.shared.clone(), Box::new(|| {}));
     crate::ping::spawn(core.shared.clone());
+    // Надзор за желаемыми туннелями: его первый такт — восстановление после запуска ядра.
+    let net_core = core.clone();
+    super::netwatch::spawn(move |severity, text| net_core.shared.log("", severity, text));
+    let supervisor = core.clone();
+    crate::crash::spawn_named("retry", move || supervisor.supervise());
 
     let server_core = core.clone();
     let taken = Arc::new(AtomicBool::new(false));
@@ -300,6 +316,10 @@ impl Core {
                 if let Err(e) = store::startup() {
                     self.shared.log("", Severity::Bad, &e);
                 }
+                // Службы прежних версий перезапускались Windows при сбое — теперь повторы только у надзора (`retry`).
+                for (tunnel, e) in crate::engine::clear_restart_on_failure() {
+                    self.shared.log(&tunnel, Severity::Warn, &trf("core.failure_actions_left", &[&e]));
+                }
                 self.shared.set_service(String::new());
             }
             Mode::Overlay => {
@@ -343,6 +363,7 @@ impl Core {
             Request::SetMode(mode) => done(self.set_mode(mode)),
             Request::SetPing { enabled, host } => done(self.set_ping(enabled, host)),
             Request::SetLanguage(code) => done(self.set_language(code)),
+            Request::Retry(tunnel) => done(self.retry(&tunnel)),
             // Обновления — вне блокировки режима: загрузка идёт минутами.
             Request::Updates(op) => {
                 if let Err(e) = updates_allowed(&op, elevated) {
@@ -421,6 +442,7 @@ impl Core {
             // Разобраны в `handle`.
             Request::Hello | Request::State { .. } | Request::Switch { .. } | Request::SetMode(_) | Request::SetPing { .. }
             | Request::SetLanguage(_)
+            | Request::Retry(_)
             | Request::Updates(_) => {
                 Response::Err("core: unexpected".into())
             }
@@ -473,22 +495,51 @@ impl Core {
     /// с кем он вместе работать не может. Пока идёт команда, туннель помечен занятым — отключение по команде не
     /// считается аварией.
     fn switch(&self, name: &str, plan: Plan, multiple: bool) -> Result<(), String> {
+        self.switch_from(Origin::User, name, plan, multiple).map(drop)
+    }
+
+    /// Переключение по команде пользователя (запоминает желаемый набор и снимает с туннеля надзор) или попытка надзора
+    /// (подключает, только если туннель всё ещё желаемый и не работает). `Ok(false)` — делать было нечего.
+    fn switch_from(&self, origin: Origin, name: &str, plan: Plan, multiple: bool) -> Result<bool, String> {
         // Повторное нажатие, пока туннель ещё переключается, — ничего не делать.
         if self.shared.is_pending(name) {
-            return Ok(());
+            return Ok(false);
         }
         let _guard = lock(&self.switching);
         // Список запущенных — у служб, а не из снимка опроса: только что подключённый туннель в снимок ещё не попал.
         let found = self.host().and_then(|b| b.running().map(|r| (b, r)).map_err(|e| e.to_string()));
         let (b, running) = match found {
             Ok(found) => found,
-            // Ответ `Err` на `Switch` окно не показывает — оно ждёт эту ошибку в журнале ядра.
+            // Ответ `Err` на `Switch` окно не показывает — оно ждёт эту ошибку в журнале ядра. Ошибку попытки надзора
+            // пишет сам надзор (`supervise_tick`) по своему расписанию журнала.
             Err(e) => {
-                self.shared.log(name, Severity::Bad, &e);
+                if origin == Origin::User {
+                    self.shared.log(name, Severity::Bad, &e);
+                }
                 return Err(e);
             }
         };
+        // Под той же блокировкой, что и команды пользователя: отключённый им за время ожидания не поднимается обратно.
+        if origin == Origin::Retry && (running.iter().any(|r| r == name) || !self.is_desired(name)) {
+            return Ok(false);
+        }
         let others = to_replace(name, plan, multiple, &running, |n| self.footprint(n));
+        if origin == Origin::User {
+            self.update_desired(name, |config| {
+                config.tunnels = Some(super::restore::after_switch(config.tunnels.as_deref().unwrap_or_default(), name, plan, &others));
+                if plan != Plan::Disconnect {
+                    config.multiple = multiple;
+                }
+            });
+            let mut retries = lock(&self.retries);
+            std::iter::once(name).chain(others.iter().map(String::as_str)).for_each(|t| retries.forget(t));
+            drop(retries);
+            // Отключение того, что не работает и службы не имеет (переподключался, выход с отключением): снять
+            // желание — и всё, отключать нечего (`/uninstalltunnelservice` на несуществующую службу дал бы ошибку).
+            if plan == Plan::Disconnect && !running.iter().any(|r| r == name) && !b.service_exists(name) {
+                return Ok(true);
+            }
+        }
         if multiple {
             for o in &others {
                 self.shared.log(o, Severity::Info, &trf("core.replaced", &[name]));
@@ -502,10 +553,127 @@ impl Core {
         // Отключаемые попутно — тоже «по команде», а не авария.
         let _busy = self.shared.pending_guard(std::iter::once((name.to_string(), label)).chain(others.iter().map(|o| (o.clone(), "busy.disconnect"))));
         let result = run_switch(b.as_ref(), name, plan, &others);
-        if let Err(e) = &result {
+        if let (Origin::User, Err(e)) = (origin, &result) {
             self.shared.log(name, Severity::Bad, e);
         }
-        result
+        result.map(|()| true)
+    }
+
+    /// Изменить желаемый набор туннелей и сохранить его. Не записался — набор в памяти всё равно новый (до перезапуска
+    /// ядра он верен), а в журнале предупреждение: после перезагрузки поднимется прежний набор.
+    fn update_desired(&self, tunnel: &str, change: impl FnOnce(&mut Config)) {
+        let mut config = lock(&self.config);
+        let mut next = config.clone();
+        change(&mut next);
+        if next == *config {
+            return;
+        }
+        let saved = next.save();
+        *config = next;
+        drop(config);
+        if let Err(e) = saved {
+            self.shared.log(tunnel, Severity::Warn, &trf("core.desired_unsaved", &[&e]));
+        }
+    }
+
+    fn is_desired(&self, name: &str) -> bool {
+        lock(&self.config).tunnels.iter().flatten().any(|t| t == name)
+    }
+
+    /// Надзор за желаемыми туннелями (`retry`), такт раз в секунду, пока живёт ядро. Первый такт — восстановление после
+    /// запуска. Набор неизвестен (обновление с версии без него) — сначала он берётся из работающих.
+    fn supervise(&self) {
+        if lock(&self.config).tunnels.is_none() {
+            match self.host() {
+                Ok(host) => self.adopt_running(host.as_ref()),
+                Err(e) => self.shared.log("", Severity::Bad, &e),
+            }
+        }
+        let mut net_seen = super::netwatch::changes();
+        loop {
+            let net = super::netwatch::changes();
+            self.supervise_tick(Instant::now(), net != net_seen);
+            net_seen = net;
+            std::thread::sleep(retry::TICK);
+        }
+    }
+
+    /// Один такт надзора: решения `Retries::tick`, попытки — обычным переключением, исходы — в журнал и окну.
+    fn supervise_tick(&self, now: Instant, network_changed: bool) {
+        let (desired, multiple) = {
+            let config = lock(&self.config);
+            (config.tunnels.clone().unwrap_or_default(), config.multiple)
+        };
+        // Хоста нет только при ошибке в программе: её уже пишет любой запрос окна (`host`), такт просто ждёт.
+        let Ok(host) = self.host() else { return };
+        let running = host.running().ok();
+        let tick = lock(&self.retries).tick(
+            now,
+            &Seen {
+                desired: &desired,
+                running: running.as_deref(),
+                pending: &|t| self.shared.is_pending(t),
+                service_exists: &|t| host.service_exists(t),
+                stop_reason: &|t| host.stop_reason(t),
+                native_services: host.native_services(),
+                network_changed,
+            },
+        );
+        for t in &tick.outside {
+            self.update_desired(t, |config| config.tunnels.iter_mut().for_each(|tunnels| tunnels.retain(|d| d != t)));
+            self.shared.log(t, Severity::Info, &trf("core.retry_outside", &[t]));
+        }
+        for (t, note) in tick.notes {
+            self.log_note(&t, note);
+        }
+        for t in &tick.due {
+            let result = self.switch_from(Origin::Retry, t, Plan::Connect, multiple);
+            let note = lock(&self.retries).outcome(t, Instant::now(), result);
+            if let Some(note) = note {
+                self.log_note(t, note);
+            }
+        }
+        self.shared.set_retries(lock(&self.retries).view(Instant::now()));
+    }
+
+    /// Запись надзора в журнал. «Подключён» о туннеле под надзором пишет только он (`monitor` о нём молчит).
+    fn log_note(&self, t: &str, note: Note) {
+        match note {
+            Note::Failed { attempt, error } => self.shared.log(t, Severity::Warn, &trf("core.retry_failed", &[t, &attempt.to_string(), &error])),
+            Note::Slow { error } => self.shared.notify(t, Severity::Bad, &trf("core.retry_slow", &[t, &error])),
+            Note::Connected { attempts: 0 } => self.shared.log(t, Severity::Info, &tr("ev.connected")),
+            Note::Connected { attempts } => self.shared.log(t, Severity::Info, &trf("core.retry_connected", &[t, &attempts.to_string()])),
+        }
+    }
+
+    /// «Повторить» из окна: расписание туннеля с начала, первая попытка — на ближайшем такте.
+    fn retry(&self, name: &str) -> Result<(), String> {
+        if !self.is_desired(name) {
+            return Err(trf("core.retry_not_desired", &[name]));
+        }
+        lock(&self.retries).restart(name, Instant::now());
+        self.shared.log(name, Severity::Info, &trf("core.retry_restarted", &[name]));
+        Ok(())
+    }
+
+    /// Первый запуск после обновления с версии, которая набор не помнила (ключа `tunnels` в `core.ini` нет): желаемыми
+    /// становятся туннели, работающие по истечении `ADOPT_AFTER` (службы успели подняться), иначе они не вернулись бы
+    /// после первого же пропадания питания. Явно пустой набор сюда не попадает: он остаётся пустым.
+    fn adopt_running(&self, host: &dyn TunnelHost) {
+        std::thread::sleep(super::restore::ADOPT_AFTER);
+        let _guard = lock(&self.switching);
+        let running = match host.running() {
+            Ok(running) => running,
+            Err(e) => return self.shared.log("", Severity::Bad, &trf("core.desired_unsaved", &[&e.to_string()])),
+        };
+        let mut adopted = None;
+        self.update_desired("", |config| {
+            // Пользователь успел переключить туннель за время ожидания — набор уже его.
+            adopted = super::restore::adopt(config, running);
+        });
+        if let Some(list) = adopted {
+            self.shared.log("", Severity::Info, &trf("core.desired_adopted", &[&list.join(", ")]));
+        }
     }
 
     /// Сменить режим: туннели прежнего режима отключаются, ядро берёт другой бэкенд; окно не перезапускается.
@@ -527,8 +695,11 @@ impl Core {
         disconnected?;
         let mut config = lock(&self.config).clone();
         config.mode = mode;
+        // Туннели прежнего режима отключены по команде — восстанавливать после перезапуска нечего.
+        config.tunnels = Some(Vec::new());
         config.save()?;
         *lock(&self.config) = config;
+        lock(&self.retries).clear();
         self.shared.set_host(host_for(mode));
         self.shared.reset_snapshot();
         self.prepare_mode();
@@ -598,14 +769,17 @@ impl Core {
                 stats.insert(new.to_string(), st);
             }
         });
+        // Желаемый, но упавший сам туннель после перезапуска поднимается под новым именем.
+        self.update_desired(new, |config| config.tunnels.iter_mut().flatten().filter(|t| *t == old).for_each(|t| *t = new.to_string()));
         Ok(())
     }
 
-    /// Удалённый туннель — и его статистика.
+    /// Удалённый туннель — и его статистика, и место в желаемом наборе.
     fn forget(&self, tunnel: &str) {
         self.shared.update_stats(|stats| {
             stats.remove(tunnel);
         });
+        self.update_desired(tunnel, |config| config.tunnels.iter_mut().for_each(|tunnels| tunnels.retain(|t| t != tunnel)));
     }
 
     /// «Забрать всё из AmneziaWG»: родной экспорт (помощник в сеансе пользователя) во временный архив в защищённой
@@ -699,7 +873,7 @@ fn native_helper_request(mode: Mode, req: &Request) -> bool {
 fn names_in(req: &Request) -> Vec<&str> {
     match req {
         Request::Switch { tunnel, .. } | Request::Write { tunnel, .. } => vec![tunnel],
-        Request::Read(t) | Request::Delete(t) | Request::Details(t) | Request::NewTunnel(t) => vec![t],
+        Request::Read(t) | Request::Delete(t) | Request::Details(t) | Request::NewTunnel(t) | Request::Retry(t) => vec![t],
         Request::Rename { old, new } => vec![old, new],
         Request::Native(NativeOp::Edit(t)) => vec![t],
         _ => vec![],

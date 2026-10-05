@@ -300,6 +300,11 @@ pub(super) fn tunnel_row(
             actions.push(Action::Switch(name.clone(), Plan::Reconnect));
             ui.close_menu();
         }
+        // Ядро не подключило туннель за 10 минут и пробует раз в 10 минут — повторить сразу, расписание с начала.
+        if l.snap.retries.get(name).is_some_and(|r| r.slow) && ui.add_enabled(!busy, egui::Button::new(tr("act.retry"))).clicked() {
+            actions.push(Action::Retry(name.clone()));
+            ui.close_menu();
+        }
         ui.menu_button(tr("act.to_group"), |ui| {
             group_menu(ui, s, None, name, actions);
             if s.book.has_groups() {

@@ -48,6 +48,8 @@ pub enum Request {
     Native(NativeOp),
     /// Окно «Обновления и откаты».
     Updates(crate::update::UpdateOp),
+    /// «Повторить»: переподключение желаемого туннеля по расписанию с начала (`retry`).
+    Retry(String),
 }
 
 /// Действия в родном окне AmneziaWG; выполняет помощник с повышенными правами в сеансе пользователя.
@@ -100,6 +102,19 @@ pub struct CoreState {
     pub service: String,
     /// Туннели, которые ядро сейчас переключает.
     pub busy: Vec<String>,
+    /// Желаемые туннели, которые ядро переподключает (`retry`). Ядро прежней версии поля не шлёт — пусто.
+    #[serde(default)]
+    pub retries: BTreeMap<String, RetryState>,
+}
+
+/// Переподключение туннеля: сколько попыток сделано, через сколько секунд следующая, последняя ошибка; `slow` — первые
+/// 10 минут не помогли, дальше попытка раз в 10 минут.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct RetryState {
+    pub attempt: u32,
+    pub next_in_s: u64,
+    pub last_error: String,
+    pub slow: bool,
 }
 
 /// Пинг без `Instant`: возраст замеров в секундах.
@@ -162,5 +177,33 @@ mod tests {
             Response::State(s) => assert_eq!((s.events_instance, s.events_loaded), (0, 0)),
             other => panic!("{other:?}"),
         }
+    }
+
+    /// Новое окно со старым ядром (поля нет) и старое окно с новым ядром (лишнее поле) понимают друг друга.
+    #[test]
+    fn retry_state_is_backward_compatible() {
+        let mut state = CoreState::default();
+        let retry = RetryState { attempt: 5, next_in_s: 7, last_error: "Element not found".into(), slow: false };
+        state.retries.insert("office".into(), retry.clone());
+        let line = serde_json::to_string(&Response::State(Box::new(state))).unwrap();
+        match serde_json::from_str::<Response>(&line).unwrap() {
+            Response::State(s) => assert_eq!(s.retries["office"], retry),
+            other => panic!("{other:?}"),
+        }
+        let old_core = serde_json::to_string(&Response::State(Box::default())).unwrap().replace(",\"retries\":{}", "");
+        assert!(!old_core.contains("retries"), "{old_core}");
+        match serde_json::from_str::<Response>(&old_core).unwrap() {
+            Response::State(s) => assert!(s.retries.is_empty()),
+            other => panic!("{other:?}"),
+        }
+        // Старое окно: та же структура без поля `retries` — serde пропускает незнакомые поля.
+        #[derive(Deserialize)]
+        #[allow(dead_code)]
+        struct OldState {
+            tunnels: Vec<String>,
+            busy: Vec<String>,
+        }
+        let json = serde_json::to_value(CoreState { retries: [("a".to_string(), RetryState { attempt: 1, next_in_s: 1, last_error: String::new(), slow: true })].into(), ..Default::default() }).unwrap();
+        assert!(serde_json::from_value::<OldState>(json).is_ok());
     }
 }

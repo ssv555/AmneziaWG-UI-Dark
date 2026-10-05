@@ -6,11 +6,9 @@ use std::path::Path;
 use std::ptr::{null, null_mut};
 use std::time::Duration;
 
-use windows_sys::Win32::Foundation::TRUE;
 use windows_sys::Win32::System::Services::{
     ChangeServiceConfig2W, ChangeServiceConfigW, CreateServiceW, SC_ACTION, SC_ACTION_RESTART, SERVICE_ALL_ACCESS,
-    SERVICE_AUTO_START, SERVICE_CONFIG_DESCRIPTION, SERVICE_CONFIG_FAILURE_ACTIONS, SERVICE_CONFIG_FAILURE_ACTIONS_FLAG,
-    SERVICE_DESCRIPTIONW, SERVICE_ERROR_NORMAL, SERVICE_FAILURE_ACTIONSW, SERVICE_FAILURE_ACTIONS_FLAG, SERVICE_NO_CHANGE,
+    SERVICE_AUTO_START, SERVICE_CONFIG_DESCRIPTION, SERVICE_DESCRIPTIONW, SERVICE_ERROR_NORMAL, SERVICE_NO_CHANGE,
     SERVICE_WIN32_OWN_PROCESS,
 };
 
@@ -180,24 +178,9 @@ fn create_service(exe: &Path) -> Result<(), String> {
         let mut text = wide(&tr("core.service_desc"));
         let desc = SERVICE_DESCRIPTIONW { lpDescription: text.as_mut_ptr() };
         ChangeServiceConfig2W(svc.raw(), SERVICE_CONFIG_DESCRIPTION, (&desc as *const SERVICE_DESCRIPTIONW).cast());
-        // Упало — Windows поднимет снова через 5 секунд (сбросом счётчика раз в сутки).
-        let mut actions = failure_actions();
-        let failure = SERVICE_FAILURE_ACTIONSW {
-            dwResetPeriod: RESET_PERIOD,
-            lpRebootMsg: null_mut(),
-            lpCommand: null_mut(),
-            cActions: actions.len() as u32,
-            lpsaActions: actions.as_mut_ptr(),
-        };
-        if ChangeServiceConfig2W(svc.raw(), SERVICE_CONFIG_FAILURE_ACTIONS,(&failure as *const SERVICE_FAILURE_ACTIONSW).cast()) == 0 {
-            return Err(format!("failure actions {SERVICE}: {}", std::io::Error::last_os_error()));
-        }
-        // И не только при падении процесса: ядро, которое не поднялось и остановилось с ошибкой (например, новая
-        // версия после обновления), тоже перезапускается.
-        let flag = non_crash_failures();
-        if ChangeServiceConfig2W(svc.raw(), SERVICE_CONFIG_FAILURE_ACTIONS_FLAG, (&flag as *const SERVICE_FAILURE_ACTIONS_FLAG).cast()) == 0 {
-            return Err(format!("failure actions flag {SERVICE}: {}", std::io::Error::last_os_error()));
-        }
+        // Упало — Windows поднимет снова через 5 секунд (сбросом счётчика раз в сутки). И не только при падении
+        // процесса: ядро, которое не поднялось и остановилось с ошибкой (например, новая версия после обновления), тоже.
+        crate::scm::set_failure_actions(&svc, RESET_PERIOD, &mut failure_actions())?;
         start_core(&svc, WAIT)
     }
 }
@@ -216,11 +199,6 @@ fn failure_actions() -> [SC_ACTION; 3] {
     [SC_ACTION { Type: SC_ACTION_RESTART, Delay: 5000 }; 3]
 }
 
-/// Действия при сбое — и когда служба сама остановилась с ненулевым кодом, а не только когда процесс упал.
-fn non_crash_failures() -> SERVICE_FAILURE_ACTIONS_FLAG {
-    SERVICE_FAILURE_ACTIONS_FLAG { fFailureActionsOnNonCrashFailures: TRUE }
-}
-
 /// Записать файл; занят (его держит работающая служба туннеля) — отодвинуть занятый под другим именем
 /// (работающий exe переименовать можно) и положить новый. Отодвинутые убираются при следующей установке.
 fn place(path: &Path, data: &[u8]) -> Result<(), String> {
@@ -228,12 +206,12 @@ fn place(path: &Path, data: &[u8]) -> Result<(), String> {
         return Ok(());
     }
     // Не записалось (файл занят службой) — не ошибка: ниже его отодвигают и пишут заново, и ошибки идут уже оттуда.
-    if std::fs::write(path, data).is_ok() {
+    if crate::fsutil::write_atomic(path, data).is_ok() {
         return Ok(());
     }
     let aside = path.with_file_name(format!("{}.old-{}", path.file_name().unwrap_or_default().to_string_lossy(), crate::store::random_hex()));
     std::fs::rename(path, &aside).map_err(|e| crate::fsutil::io_ctx(&path, e))?;
-    std::fs::write(path, data).map_err(|e| crate::fsutil::io_ctx(&path, e))
+    crate::fsutil::write_atomic(path, data).map_err(|e| crate::fsutil::io_ctx(&path, e))
 }
 
 pub(crate) fn remove_old_copies(dir: &Path) {
@@ -294,11 +272,6 @@ mod tests {
             assert_eq!(a.Delay, 5000);
         }
         assert_eq!(RESET_PERIOD, 86_400);
-    }
-
-    #[test]
-    fn failure_actions_on_non_crash_failures() {
-        assert_eq!(non_crash_failures().fFailureActionsOnNonCrashFailures, TRUE);
     }
 
     use crate::scm::fake::{FakeService, Reaction};

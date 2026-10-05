@@ -6,6 +6,9 @@ pub mod helper;
 pub mod install;
 pub mod pipe;
 pub mod proto;
+mod netwatch;
+pub(crate) mod restore;
+pub(crate) mod retry;
 pub mod server;
 pub mod service;
 pub mod session;
@@ -46,6 +49,12 @@ pub struct Config {
     pub language: String,
     /// SID учётной записи владельца: ей (кроме SYSTEM и администраторов) открыт канал ядра.
     pub owner_sid: String,
+    /// Туннели, которые пользователь оставил подключёнными (режима `mode`): после перезапуска ядра они поднимаются
+    /// снова (`restore`). Меняются только командами пользователя — не тем, что туннель упал сам или Windows выключается.
+    /// `None` — `core.ini` прежней версии, где набора ещё не было: при запуске ядро берёт работающие туннели.
+    pub tunnels: Option<Vec<String>>,
+    /// «Несколько туннелей одновременно» последнего подключения: по нему восстановление решает, кого заменить.
+    pub multiple: bool,
 }
 
 impl Config {
@@ -77,17 +86,28 @@ impl Config {
             ping_host: ini.get("core", "ping_host").filter(|h| !h.is_empty()).unwrap_or(crate::settings::DEFAULT_PING_HOST).to_string(),
             owner_sid: ini.get("core", "owner_sid").unwrap_or_default().to_string(),
             language: ini.get("core", "language").filter(|c| crate::i18n::is_code(c)).unwrap_or(crate::i18n::DEFAULT).to_string(),
+            // Имя туннеля уходит в пути и командные строки — только допустимые (запятой в них нет).
+            tunnels: ini.get("core", "tunnels").map(|v| v.split(',').filter(|t| crate::engine::valid_name(t)).map(str::to_string).collect()),
+            multiple: ini.get_bool("core", "multiple", false),
         }
     }
 
     pub fn save(&self) -> Result<(), String> {
+        self.save_to(&Self::path())
+    }
+
+    fn save_to(&self, path: &std::path::Path) -> Result<(), String> {
         let mut ini = Ini::default();
         ini.set("core", "mode", self.mode.as_str());
         ini.set_bool("core", "ping", self.ping);
         ini.set("core", "ping_host", &self.ping_host);
         ini.set("core", "owner_sid", &self.owner_sid);
         ini.set("core", "language", &self.language);
-        ini.save(&Self::path()).map_err(|e| crate::fsutil::io_ctx(Self::path(), e))
+        if let Some(tunnels) = &self.tunnels {
+            ini.set("core", "tunnels", tunnels.join(","));
+        }
+        ini.set_bool("core", "multiple", self.multiple);
+        ini.save(path).map_err(|e| crate::fsutil::io_ctx(path, e))
     }
 }
 
@@ -184,6 +204,11 @@ pub trait CoreApi: Send + Sync {
         self.ok(Request::Native(op))
     }
 
+    /// «Повторить»: переподключение туннеля по расписанию с начала.
+    fn retry_tunnel(&self, tunnel: &str) -> Result<(), String> {
+        self.ok(Request::Retry(tunnel.into()))
+    }
+
     /// Родное окно: импорт туннеля из файла (с `file` — диалог сразу на нём).
     fn import_in_native(&self, file: Option<&std::path::Path>) -> Result<(), String> {
         self.native(NativeOp::Import(file.map(|f| f.display().to_string())))
@@ -235,6 +260,21 @@ mod tests {
         let (config, problem) = Config::load_guarded_from(&path);
         assert!(problem.is_none());
         assert_eq!((config.mode, config.ping, config.owner_sid.as_str()), (Mode::Engine, false, "S-1-5-21-1"));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn desired_tunnels_survive_a_save_and_load() {
+        let dir = dir("desired");
+        let path = dir.join("core.ini");
+        std::fs::write(&path, "[core]\r\nmode=engine\r\ntunnels=a.v4,b_2,bad name,\r\nmultiple=1\r\n").unwrap();
+        let (config, _) = Config::load_guarded_from(&path);
+        assert_eq!(config.tunnels.as_deref(), Some(&["a.v4".to_string(), "b_2".to_string()][..]), "недопустимое имя и пустое отброшены");
+        assert!(config.multiple);
+        let mut ini = Ini::default();
+        ini.set("core", "tunnels", "");
+        assert_eq!(Config::from_ini(&ini).tunnels, Some(vec![]), "пустой набор — не «неизвестен»");
+        assert_eq!(Config::from_ini(&Ini::default()).tunnels, None, "core.ini прежней версии — набор неизвестен");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

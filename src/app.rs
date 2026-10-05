@@ -76,6 +76,8 @@ pub struct Start {
 enum Action {
     Select(String),
     Switch(String, Plan),
+    /// «Повторить»: ядро переподключает туннель по расписанию с начала.
+    Retry(String),
     Assign(String, Option<String>),
     MoveGroup(String, isize),
     /// Группа к новому родителю (`None` — верхний уровень).
@@ -277,6 +279,7 @@ impl App {
         match action {
             Action::Select(name) => s.book.select_tunnel(&name),
             Action::Switch(name, plan) => self.switch(name, plan),
+            Action::Retry(name) => self.retry(name),
             Action::Assign(tunnel, group) => {
                 if let Err(groups::NoSuchGroup(g)) = s.book.assign(&tunnel, group.as_deref()) {
                     self.action_error.push(trf("grp.err_missing", &[&g]));
@@ -478,6 +481,15 @@ impl App {
         });
     }
 
+    /// «Повторить» у туннеля, который ядро переподключает раз в 10 минут: расписание с начала, попытка сразу.
+    fn retry(&self, name: String) {
+        let (core, error, ctx) = (self.core.clone(), self.action_error.clone(), self.ctx.clone());
+        std::thread::spawn(move || {
+            retry_through_core(core.as_ref(), &name, &error);
+            ctx.request_repaint();
+        });
+    }
+
 }
 
 impl eframe::App for App {
@@ -560,6 +572,7 @@ impl eframe::App for App {
                         stats: &stats,
                         info: infos.get(&name),
                         info_loading: info_loading.contains(&name),
+                        retry_slow: snap.retries.get(&name).is_some_and(|r| r.slow),
                     };
                     details(ui, &ctx, &mut self.s, &mut actions)
                 }
@@ -606,6 +619,13 @@ type Core = Arc<dyn CoreApi>;
 fn switch_through_core(core: &dyn CoreApi, name: &str, plan: Plan, multiple: bool, error: &ErrorSink) {
     let reply = core.call(Request::Switch { tunnel: name.to_string(), plan, multiple });
     if let Some(e) = switch_transport_error(reply) {
+        error.push_for(name, e);
+    }
+}
+
+/// «Повторить» через ядро. Отказ ядра в журнал ядра не попадает — его записывает окно, под именем туннеля.
+fn retry_through_core(core: &dyn CoreApi, name: &str, error: &ErrorSink) {
+    if let Err(e) = core.retry_tunnel(name) {
         error.push_for(name, e);
     }
 }
@@ -675,6 +695,18 @@ mod tests {
         assert_eq!(switch_transport_error(Ok(Response::Err("no".into()))), None);
         assert_eq!(switch_transport_error(Ok(Response::Ok)), None);
         assert_eq!(switch_transport_error(Ok(Response::Refused("busy".into()))).as_deref(), Some("busy"));
+    }
+
+    #[test]
+    fn retry_click_goes_to_the_core_and_a_refusal_is_logged_under_the_tunnel() {
+        let core = FakeCore::new(|_| Ok(Response::Ok));
+        let (shared, error) = sink();
+        retry_through_core(&core, "office", &error);
+        assert_eq!(core.requests(), [r#"Retry("office")"#]);
+        assert!(errors(&shared).is_empty());
+        let core = FakeCore::new(|_| Ok(Response::Err("office is not among the tunnels".into())));
+        retry_through_core(&core, "office", &error);
+        assert_eq!(errors(&shared), [("office".to_string(), "office is not among the tunnels".to_string())]);
     }
 
     #[test]

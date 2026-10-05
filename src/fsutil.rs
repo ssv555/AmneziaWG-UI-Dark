@@ -14,9 +14,10 @@ fn temp_name(path: &Path) -> PathBuf {
     PathBuf::from(name)
 }
 
-/// Записать `bytes` в `path` так, чтобы читатель видел либо прежнее содержимое, либо новое целиком: данные идут во
-/// временный файл рядом, сбрасываются на диск и переименовываются поверх. Сбой на любом шаге — временный файл
-/// убирается, прежний `path` не тронут. Папка `path` должна существовать.
+/// Записать `bytes` в `path` так, чтобы читатель видел либо прежнее содержимое, либо новое целиком — и после
+/// внезапного пропадания питания тоже: данные идут во временный файл рядом, сбрасываются на диск
+/// (`FlushFileBuffers`) и переименовываются поверх с `MOVEFILE_WRITE_THROUGH`. Сбой на любом шаге — временный
+/// файл убирается, прежний `path` не тронут. Папка `path` должна существовать.
 pub fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     let tmp = temp_name(path);
     let written = (|| {
@@ -24,7 +25,7 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
         file.write_all(bytes)?;
         file.sync_all()?;
         drop(file);
-        std::fs::rename(&tmp, path)
+        replace_durably(&tmp, path)
     })();
     if written.is_err() {
         // Вернуть нужно первую ошибку; не удалось убрать и сам временный файл — она ничего не добавляет: файл
@@ -32,6 +33,19 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
         let _ = std::fs::remove_file(&tmp);
     }
     written
+}
+
+/// Переименовать `from` поверх `to` и вернуться, только когда переименование уже на диске. Обычный `rename` NTFS
+/// может отложить: после пропадания питания на месте `to` остался бы прежний файл, а при иной очерёдности записи —
+/// пустой (так теряется, например, набор туннелей, которые надо поднять после перезагрузки).
+fn replace_durably(from: &Path, to: &Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH};
+    let wide = |p: &Path| p.as_os_str().encode_wide().chain(Some(0)).collect::<Vec<u16>>();
+    if unsafe { MoveFileExW(wide(from).as_ptr(), wide(to).as_ptr(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) } == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 /// Текст ошибки операции над файлом: `<путь>: <причина>`.
@@ -85,6 +99,21 @@ mod tests {
         write_atomic(&f, b"two").unwrap();
         assert_eq!(std::fs::read(&f).unwrap(), b"two");
         assert!(!d.join("a.conf.dpapi.tmp").exists());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn durable_replace_overwrites_and_reports_failures() {
+        let d = dir("durable");
+        let (from, to) = (d.join("new"), d.join("cur"));
+        std::fs::write(&to, b"old").unwrap();
+        std::fs::write(&from, b"new").unwrap();
+        replace_durably(&from, &to).unwrap();
+        assert_eq!(std::fs::read(&to).unwrap(), b"new", "существующий файл заменён");
+        assert!(!from.exists());
+        let e = replace_durably(&d.join("absent"), &to).unwrap_err();
+        assert_eq!(e.kind(), std::io::ErrorKind::NotFound, "{e}");
+        assert_eq!(std::fs::read(&to).unwrap(), b"new", "сбой не трогает цель");
         let _ = std::fs::remove_dir_all(&d);
     }
 

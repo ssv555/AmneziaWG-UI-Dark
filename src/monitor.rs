@@ -8,7 +8,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::backend::TunnelHost;
 use crate::crash::lock;
-use crate::daemon::proto::CoreState;
+use crate::daemon::proto::{CoreState, RetryState};
 use crate::events::{self, Event, EventLog, Severity};
 use crate::health::{self, Health, Level};
 use crate::i18n::{tr, trf};
@@ -87,6 +87,8 @@ pub struct Snapshot {
     pub polls: u64,
     /// Окно потеряло связь с ядром: что с туннелями — неизвестно (а не «все отключены»).
     pub core_lost: bool,
+    /// Желаемые туннели, которые ядро переподключает (`daemon::retry`).
+    pub retries: BTreeMap<String, RetryState>,
 }
 
 impl Snapshot {
@@ -95,7 +97,11 @@ impl Snapshot {
         if self.core_lost {
             return Health { level: Level::Warn, text: tr("health.core_lost") };
         }
-        health::health(self.running.get(name), pending, ping)
+        let live = self.running.get(name);
+        if let (None, None, Some(retry)) = (live, pending, self.retries.get(name)) {
+            return health::retrying(retry);
+        }
+        health::health(live, pending, ping)
     }
 }
 
@@ -245,11 +251,26 @@ impl Shared {
         lock(&self.events).push(Event::new(unix_now(), tunnel, severity, text, false));
     }
 
+    /// Событие, которое окно покажет и уведомлением Windows.
+    pub fn notify(&self, tunnel: &str, severity: Severity, text: &str) {
+        lock(&self.events).push(Event::new(unix_now(), tunnel, severity, text, true));
+    }
+
+    /// Ядро: состояние надзора за туннелями для окна.
+    pub fn set_retries(&self, retries: BTreeMap<String, RetryState>) {
+        lock(&self.snapshot).retries = retries;
+    }
+
     // --- снимок опроса
 
     /// Имена запущенных туннелей.
     pub fn running_names(&self) -> Vec<String> {
         lock(&self.snapshot).running.keys().cloned().collect()
+    }
+
+    /// Туннели, которые ядро переподключает.
+    pub fn retrying_names(&self) -> Vec<String> {
+        lock(&self.snapshot).retries.keys().cloned().collect()
     }
 
     pub fn is_running(&self, name: &str) -> bool {
@@ -290,6 +311,7 @@ impl Shared {
         let mut snap = lock(&self.snapshot);
         snap.tunnels.clear();
         snap.running.clear();
+        snap.retries.clear();
     }
 
     /// Кадр окна: см. `FrameView`.
@@ -328,6 +350,7 @@ impl Shared {
             events_loaded,
             service: lock(&self.service).clone(),
             busy,
+            retries: snap.retries.clone(),
         }
     }
 
@@ -415,15 +438,16 @@ impl Shared {
         *lock(&self.core_mode)
     }
 
-    /// Состояние каждого известного туннеля.
-    fn levels(&self) -> (BTreeMap<String, Health>, BTreeSet<String>) {
+    /// Состояние каждого известного туннеля, переключаемые командой и туннели под надзором ядра (работает ли).
+    fn levels(&self) -> (BTreeMap<String, Health>, BTreeSet<String>, BTreeMap<String, bool>) {
         let snap = lock(&self.snapshot);
+        let supervised = snap.retries.keys().map(|t| (t.clone(), snap.running.contains_key(t))).collect();
         let pending = lock(&self.pending).clone();
         // Настройка читается отдельно: `options` — «остальное», его не берут, пока удержан `ping`.
         let want_ping = lock(&self.options).ping;
         let ping = want_ping.then(|| lock(&self.ping).clone());
         let map = snap.tunnels.iter().map(|t| (t.clone(), snap.health(t, pending.get(t).copied(), ping.as_ref()))).collect();
-        (map, pending.into_keys().collect())
+        (map, pending.into_keys().collect(), supervised)
     }
 }
 
@@ -431,7 +455,7 @@ impl Shared {
 /// здесь только история для графика и трей. Ядро и демо-режим опрашивают сами и сами пишут события.
 pub fn spawn(shared: Arc<Shared>, on_update: Box<dyn Fn() + Send>) {
     crate::crash::spawn_named("monitor", move || {
-        let mut prev: Option<BTreeMap<String, Level>> = None;
+        let mut watch = Watch::default();
         let mut last_save = Instant::now();
         let mut link = CoreLink::default();
         loop {
@@ -440,8 +464,8 @@ pub fn spawn(shared: Arc<Shared>, on_update: Box<dyn Fn() + Send>) {
                 Some(host) => poll(&shared, host.as_ref()),
                 None => mirror_core(&shared, &mut link),
             }
-            let (levels, user) = shared.levels();
-            react(&shared, &mut prev, &levels, &user, host.is_some());
+            let (levels, user, supervised) = shared.levels();
+            react(&shared, &mut watch, &levels, &user, &supervised, host.is_some());
             if last_save.elapsed() >= STATS_SAVE_EVERY {
                 shared.save_stats();
                 last_save = Instant::now();
@@ -452,24 +476,65 @@ pub fn spawn(shared: Arc<Shared>, on_update: Box<dyn Fn() + Send>) {
     });
 }
 
+/// Уровни туннелей между опросами → события журнала.
+#[derive(Default)]
+struct Watch {
+    /// Прошлые уровни; `None` — опросов ещё не было.
+    prev: Option<BTreeMap<String, Level>>,
+    /// Работает, но «подключён» о нём не писали: поднял надзор ядра, и о подключении пишет он сам.
+    quiet: BTreeSet<String>,
+}
+
+impl Watch {
+    /// События очередного опроса. `supervised` — туннели под надзором ядра (`daemon::retry`) и работает ли каждый.
+    /// О них переходы молчат: жёлтое «переподключение» — не подключение, а подключение надзор подтверждает и пишет сам
+    /// («подключён после N попыток», когда туннель проработал) — вторая строка «Подключён» была бы о том же. Пропажу
+    /// туннеля, который работал не по надзору, пишут как обычно.
+    fn step(&mut self, levels: &BTreeMap<String, Health>, supervised: &BTreeMap<String, bool>, user: &BTreeSet<String>, now: u64) -> Vec<Event> {
+        let mut settled = BTreeMap::new();
+        let mut silent = Vec::new();
+        for (n, h) in levels {
+            match supervised.get(n) {
+                Some(true) => {
+                    self.quiet.insert(n.clone());
+                    silent.push((n.clone(), Level::Ok));
+                }
+                Some(false) if self.quiet.remove(n) => silent.push((n.clone(), Level::Off)),
+                Some(false) => {
+                    settled.insert(n.clone(), (Level::Off, h.text.clone()));
+                }
+                None => {
+                    self.quiet.remove(n);
+                    // «Занят» (переключение, ожидание рукопожатия) — промежуточное состояние, событий не даёт.
+                    if h.level != Level::Busy {
+                        settled.insert(n.clone(), (h.level, h.text.clone()));
+                    }
+                }
+            }
+        }
+        // Первый опрос — точка отсчёта: туннель, уже поднятый при старте, не событие.
+        let fresh = self.prev.as_ref().map(|prev| events::transitions(prev, &settled, user, now)).unwrap_or_default();
+        let p = self.prev.get_or_insert_with(BTreeMap::new);
+        p.extend(settled.into_iter().map(|(n, (level, _))| (n, level)));
+        p.extend(silent);
+        fresh
+    }
+}
+
 /// События, уведомления и значок в трее по новым уровням.
 /// `make_events` — события по переходам пишет тот, кто опрашивает сам (ядро, демо); окно-зеркало получает их от ядра.
-fn react(shared: &Shared, prev: &mut Option<BTreeMap<String, Level>>, levels: &BTreeMap<String, Health>, user: &BTreeSet<String>, make_events: bool) {
-    // «Занят» (переключение, ожидание рукопожатия) — промежуточное состояние, событий не даёт.
-    let settled: BTreeMap<String, (Level, String)> = levels
-        .iter()
-        .filter(|(_, h)| h.level != Level::Busy)
-        .map(|(n, h)| (n.clone(), (h.level, h.text.clone())))
-        .collect();
+fn react(
+    shared: &Shared,
+    watch: &mut Watch,
+    levels: &BTreeMap<String, Health>,
+    user: &BTreeSet<String>,
+    supervised: &BTreeMap<String, bool>,
+    make_events: bool,
+) {
     let options = lock(&shared.options).clone();
-    // Первый опрос — точка отсчёта: туннель, уже поднятый при старте, не событие.
-    if let (Some(prev), true) = (prev.as_ref(), make_events) {
-        let fresh = events::transitions(prev, &settled, user, unix_now());
+    let fresh = watch.step(levels, supervised, user, unix_now());
+    if make_events {
         record_and_notify(&shared.events, fresh, options.notify && options.tray, &mut |e| toast(e));
-    }
-    let p = prev.get_or_insert_with(BTreeMap::new);
-    for (n, (level, _)) in settled {
-        p.insert(n, level);
     }
 
     let core_lost = lock(&shared.snapshot).core_lost;
@@ -582,6 +647,7 @@ fn mirror_core(shared: &Shared, link: &mut CoreLink) {
         snap.core_lost = false;
         snap.error = state.error;
         snap.tunnels = state.tunnels.into_iter().collect();
+        snap.retries = state.retries;
         let mut next = BTreeMap::new();
         for (name, result) in state.running {
             let mut live = snap.running.remove(&name).unwrap_or_default();
@@ -673,6 +739,34 @@ mod tests {
 
     fn event(text: &str, notify: bool) -> Event {
         Event::new(1, "a", Severity::Warn, text, notify)
+    }
+
+    /// Живой прогон пропадания питания: ядро поднялось, туннель под надзором — в журнале было «Подключён», пока служба
+    /// стояла (жёлтое «переподключение» считалось подключением), и ещё раз — рядом со строкой надзора об успехе.
+    #[test]
+    fn supervised_reconnect_has_no_connected_line_of_its_own_but_a_real_drop_is_still_logged() {
+        let one = |level| BTreeMap::from([("a".to_string(), Health { level, text: "t".into() })]);
+        let none = BTreeMap::new();
+        let sup = |live| BTreeMap::from([("a".to_string(), live)]);
+        let user = BTreeSet::new();
+        let texts = |ev: Vec<Event>| ev.into_iter().map(|e| e.text).collect::<Vec<_>>();
+        let mut w = Watch::default();
+        assert!(w.step(&one(Level::Off), &none, &user, 1).is_empty(), "точка отсчёта");
+        // Под надзором и не работает: «переподключение», попытка, неудача — не «Подключён».
+        for level in [Level::Warn, Level::Busy, Level::Warn] {
+            assert_eq!(texts(w.step(&one(level), &sup(false), &user, 2)), Vec::<String>::new(), "{level:?}");
+        }
+        // Вторая попытка подняла, надзор подтверждает и пишет сам; после снятия надзора монитор тоже молчит.
+        for (level, s) in [(Level::Busy, sup(true)), (Level::Busy, none.clone()), (Level::Ok, none.clone())] {
+            assert_eq!(texts(w.step(&one(level), &s, &user, 3)), Vec::<String>::new(), "{level:?}");
+        }
+        // Упал сам — «Туннель отключился», даже если надзор взял его раньше этого опроса.
+        assert_eq!(texts(w.step(&one(Level::Warn), &sup(false), &user, 4)), [tr("ev.dropped")]);
+        // Поднят попыткой и встал до подтверждения: это неудачная попытка в строке надзора, не падение.
+        assert!(w.step(&one(Level::Busy), &sup(true), &user, 5).is_empty());
+        assert!(w.step(&one(Level::Warn), &sup(false), &user, 6).is_empty());
+        // Без надзора — как прежде.
+        assert_eq!(texts(w.step(&one(Level::Ok), &none, &user, 7)), [tr("ev.connected")]);
     }
 
     #[test]
@@ -856,5 +950,25 @@ mod tests {
         assert_eq!(state.busy, ["a"]);
         assert_eq!(state.events.len(), 1);
         assert!(state.running.contains_key("a"));
+    }
+
+    /// Переподключаемый туннель: строка и карточка показывают попытку, а не «отключён»; команда пользователя
+    /// («Подключение…») и работающий туннель важнее; состояние уходит окну и попадает в выход с отключением.
+    #[test]
+    fn retrying_tunnel_is_shown_and_mirrored() {
+        let shared = shared();
+        *lock(&shared.snapshot) = snapshot_with_running();
+        let retry = |slow| RetryState { attempt: 3, next_in_s: 10, last_error: "Element not found".into(), slow };
+        shared.set_retries([("b".to_string(), retry(false)), ("c".to_string(), retry(true))].into());
+        let snap = shared.snapshot_clone();
+        assert_eq!(snap.health("b", None, None).text, trf("health.retrying", &["3", "10"]));
+        assert_eq!(snap.health("b", None, None).level, Level::Warn);
+        assert_eq!(snap.health("c", None, None).level, Level::Bad, "10 минут не помогли — ошибка с причиной");
+        assert_eq!(snap.health("b", Some("busy.connect"), None).text, tr("busy.connect"), "идёт попытка — «Подключение…»");
+        assert_eq!(snap.health("x", None, None).level, Level::Off);
+        assert_eq!(shared.retrying_names(), ["b", "c"]);
+        assert_eq!(shared.core_state(Mode::Engine, 0).retries["c"], retry(true));
+        shared.reset_snapshot();
+        assert!(shared.retrying_names().is_empty(), "смена режима — переподключать нечего");
     }
 }

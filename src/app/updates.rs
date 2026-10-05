@@ -1412,7 +1412,8 @@ mod core_tests {
 
     #[test]
     fn poll_waits_for_the_answer_and_for_a_second() {
-        let now = Instant::now();
+        // Отсчёт от будущего: `Instant` не уходит раньше загрузки Windows, а машина может работать меньше получаса.
+        let now = Instant::now() + Duration::from_secs(3600);
         let ago = |s| now.checked_sub(Duration::from_secs(s)).unwrap();
         assert!(poll_due(false, None, now), "первый опрос — сразу");
         assert!(!poll_due(true, None, now), "прошлый ответ ещё не пришёл");
@@ -1423,7 +1424,8 @@ mod core_tests {
 
     #[test]
     fn badge_check_needs_closed_window_a_core_and_half_an_hour() {
-        let now = Instant::now();
+        // Отсчёт от будущего: `Instant` не уходит раньше загрузки Windows, а машина может работать меньше получаса.
+        let now = Instant::now() + Duration::from_secs(3600);
         let ago = |s| now.checked_sub(Duration::from_secs(s)).unwrap();
         assert!(badge_due(false, true, None, now), "при запуске — сразу");
         assert!(!badge_due(true, true, None, now), "пока окно открыто, отметку ведёт его опрос");

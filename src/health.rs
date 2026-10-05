@@ -1,5 +1,6 @@
 //! Итоговое состояние туннеля: уровень (цвет точки, значок в трее, события) и текст для человека.
 
+use crate::daemon::proto::RetryState;
 use crate::fmt;
 use crate::i18n::{tr, trf};
 use crate::monitor::{unix_now, Live};
@@ -61,6 +62,18 @@ pub fn health(live: Option<&Live>, pending: Option<&str>, ping: Option<&PingStat
     }
 }
 
+/// Желаемый туннель не работает, ядро его переподключает (`daemon::retry`). Первые 10 минут — «переподключение»,
+/// дальше — «не удалось» с причиной: попытки идут раз в 10 минут, пользователь может повторить сразу.
+pub fn retrying(r: &RetryState) -> Health {
+    if r.slow {
+        let minutes = r.next_in_s.div_ceil(60).max(1);
+        return Health { level: Level::Bad, text: trf("health.retry_slow", &[&r.last_error, &minutes.to_string()]) };
+    }
+    let next = r.next_in_s.to_string();
+    let text = if r.attempt == 0 { trf("health.retry_wait", &[&next]) } else { trf("health.retrying", &[&r.attempt.to_string(), &next]) };
+    Health { level: Level::Warn, text }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -97,5 +110,18 @@ mod tests {
         let ping = PingState { host: "1.1.1.1".into(), fails: 3, ..Default::default() };
         assert_eq!(health(Some(&live(Some(5), &[0, 1])), None, Some(&ping)).level, Level::Warn);
         assert_eq!(health(Some(&live(Some(400), &[0, 1])), None, Some(&ping)).level, Level::Bad);
+    }
+
+    #[test]
+    fn retrying_tunnel_shows_attempt_and_wait_then_the_reason() {
+        let r = |attempt, next_in_s, slow| RetryState { attempt, next_in_s, last_error: "Element not found".into(), slow };
+        let h = retrying(&r(5, 7, false));
+        assert_eq!(h.level, Level::Warn);
+        assert_eq!(h.text, trf("health.retrying", &["5", "7"]));
+        assert_eq!(retrying(&r(0, 10, false)).text, trf("health.retry_wait", &["10"]));
+        let h = retrying(&r(30, 540, true));
+        assert_eq!(h.level, Level::Bad);
+        assert_eq!(h.text, trf("health.retry_slow", &["Element not found", "9"]));
+        assert_eq!(retrying(&r(30, 0, true)).text, trf("health.retry_slow", &["Element not found", "1"]), "«через 0 мин» не бывает");
     }
 }
