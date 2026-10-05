@@ -230,17 +230,17 @@ mod tests {
         // Работа до сбоя: пользователь подключил туннель, ядро записало набор; остановки не было.
         let (mut before, _) = Config::load_guarded_from(&path);
         before.mode = crate::settings::Mode::Engine;
-        before.tunnels = Some(after_switch(&[], "pc-sky.full.v4", Plan::Connect, &[]));
+        before.tunnels = Some(after_switch(&[], "home.full.v4", Plan::Connect, &[]));
         before.save_to(&path).unwrap();
 
         // Новый запуск ядра после загрузки: служба есть, но движок упал («Element not found»).
         let (after, problem) = Config::load_guarded_from(&path);
         assert!(problem.is_none());
-        let host = Boot::with_services(&["pc-sky.full.v4"]);
+        let host = Boot::with_services(&["home.full.v4"]);
         let desired: Vec<&str> = after.tunnels.iter().flatten().map(String::as_str).collect();
         let log = restore_on(&host, &desired, after.multiple, |_| None);
-        assert_eq!(log, [("pc-sky.full.v4".to_string(), Ok(()))]);
-        assert_eq!(*lock(&host.running), ["pc-sky.full.v4"]);
+        assert_eq!(log, [("home.full.v4".to_string(), Ok(()))]);
+        assert_eq!(*lock(&host.running), ["home.full.v4"]);
 
         // Файл испорчен (не UTF-8): отодвигается, набор неизвестен — подключать нечего.
         std::fs::write(&path, [b't', b'u', b'n', 0xff, 0xfe, b'\n']).unwrap();
