@@ -15,7 +15,7 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "std"
 # Импорт туннелей из zip и резервная копия с паролем (AES-256).
 zip = { version = "8.6", default-features = false, features = ["aes-crypto", "deflate"] }
 # Проверка файлов движка перед копированием для службы SYSTEM.
-sha2 = "0.10"
+sha2 = "0.11"
 # Обмен окна с ядром (служба) по именованному каналу.
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -69,4 +69,4 @@ strip = true
 
 [build-dependencies]
 winresource = "0.1"
-sha2 = "0.10"
+sha2 = "0.11"
