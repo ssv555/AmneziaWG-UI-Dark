@@ -38,6 +38,13 @@ window for a pull request: `awg-ui.exe --demo --snapshot out.png` (add `--about`
 committing images, compress them losslessly with [oxipng](https://github.com/shssoichiro/oxipng):
 `oxipng -o max -Z --strip safe img/*.png` (the screenshots in `img/` shrink by about two thirds).
 
+The built-in engine (working mode 2) is built separately: run `.\engine\build.ps1` **before** `cargo build`. It
+downloads Go, llvm-mingw and wintun (checked by SHA-256), builds `tunnel.dll` from a pinned
+[amneziawg-windows](https://github.com/amnezia-vpn/amneziawg-windows) tag and puts the files into `engine\out`.
+`build.rs` embeds the SHA-256 of both DLLs into `awg-ui.exe`; the app copies only DLLs with these checksums for the
+tunnel service, and a build made without `engine\out` simply has no built-in engine. Put `tunnel.dll` and `wintun.dll`
+next to `awg-ui.exe` to use the mode.
+
 ## Testing
 
 Run the unit tests before every pull request:
@@ -111,6 +118,45 @@ Every push and pull request is checked by the CI workflow: tests and a warning-f
 2. Add a row on top of the table in `CHANGELOG.md` and `CHANGELOG.ru.md`: version, date, changes separated by `<br>`.
 3. Push a tag `vX.Y.Z`. The release workflow checks that the tag matches `Cargo.toml`, runs the tests, builds
    `awg-ui.exe` and publishes a GitHub Release with the exe, a zip, checksums and notes taken from the changelog rows.
+   The release also carries `tunnel.dll`, `wintun.dll` and the signed update manifest (see below).
+
+## Upstream updates
+
+The `Upstream` workflow runs daily and compares the pins in `engine/build.ps1` with upstream: the newest stable
+amneziawg-windows tag, the amneziawg-go version that tag asks for in its `go.mod`, wintun and the latest patch of the
+pinned Go minor line. For every outdated item it opens one issue titled `Upstream update: <item> <version>`; the same
+title is never opened twice (a closed issue counts too, so close it only once you have decided about that version).
+A failed check (network, rate limit, unexpected page) turns the job red instead of passing silently. The same
+workflow runs `cargo audit` on `Cargo.lock` every Monday, and Dependabot proposes weekly updates of Cargo
+dependencies and GitHub Actions.
+
+To bump a pin:
+
+1. Edit the pins in `engine/build.ps1`: `$EngineTag` and `$EngineCommit` (`git rev-parse <tag>^{commit}` in the
+   amneziawg-windows clone), and the `Url` / `Sha` of Go or wintun (take the checksum from the publisher's page, not
+   from the file you just downloaded). Also update the wintun version in the `ENGINE.txt` line of the same script.
+2. Run `.\engine\build.ps1` and then `cargo test --release`; the script fails if a hash or the commit does not match.
+3. Check the engine on a test machine (connect in mode 2), then release as described in *Releases*: the new
+   `tunnel.dll` / `wintun.dll` hashes go into the signed update manifest automatically.
+
+Check the pins by hand: `powershell -File engine\check-upstream.ps1` prints a JSON report; exit code 0 means fresh,
+10 outdated, 2 the check failed. llvm-mingw is not tracked by default (its pin mirrors the official client's build);
+add `-IncludeLlvmMingw` to see it.
+
+## Update signing key
+
+The app updates itself and its engine only from releases with a valid signature. The release workflow writes
+`update-manifest.json` (versions, sizes and SHA-256 of `awg-ui.exe`, `tunnel.dll` and `wintun.dll`) and signs it with
+`ssh-keygen -Y sign -n awg-ui-update` into `update-manifest.json.sig`. The app checks the signature against the public
+key `UPDATE_KEY` in `src/update/sign.rs`, then checks every downloaded file against the manifest.
+
+- The private key is the repository secret `UPDATE_SIGNING_KEY`: the full contents of an OpenSSH ed25519 private
+  key file without a passphrase. A release fails if the secret is empty. Never commit the private key.
+- Forks build their own releases: generate your own key pair and put your public key into `UPDATE_KEY`.
+- Rotation: create a new key pair (`ssh-keygen -t ed25519 -N "" -C awg-ui-update -f awg-ui-update`), put the new
+  public key into `UPDATE_KEY` and publish that build as a release **signed with the old key**; only after that
+  replace the secret with the new private key. Builds released before the switch accept only the old key, so
+  without that intermediate release they would stop accepting updates.
 
 ## License of contributions
 
@@ -125,5 +171,7 @@ The project is free for non-commercial use; commercial use requires the author's
 `cargo fmt`; комментарии в коде русские, английские тоже подходят; тексты интерфейса - только через таблицу
 `src/i18n.rs`. Сообщения коммитов - короткая строка в повелительном наклонении. Перевод - файл
 `lang\<код ISO 639-2>.lng` (меню «Язык -> Добавить язык...»). В issue не публикуйте приватные ключи и полные
-конфиги. Для крупных изменений сначала откройте issue. Вклад распространяется на тех же условиях, что и проект
+конфиги. Для крупных изменений сначала откройте issue. Манифест обновлений подписывается ключом из секрета
+`UPDATE_SIGNING_KEY`, открытый ключ - `UPDATE_KEY` в `src/update/sign.rs` (смена ключа - в разделе
+«Update signing key»). Вклад распространяется на тех же условиях, что и проект
 (бесплатно для некоммерческого использования, коммерческое - с письменного разрешения автора).

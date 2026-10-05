@@ -1,6 +1,6 @@
 [package]
 name = "awg-ui"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
 description = "Окно управления туннелями AmneziaWG поверх штатного amneziawg.exe"
 
@@ -12,15 +12,35 @@ raw-window-handle = "0.6"
 x25519-dalek = { version = "2", features = ["static_secrets"] }
 png = "0.17"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+# Импорт туннелей из zip и резервная копия с паролем (AES-256).
+zip = { version = "8.6", default-features = false, features = ["aes-crypto", "deflate"] }
+# Проверка файлов движка перед копированием для службы SYSTEM.
+sha2 = "0.10"
+# Обмен окна с ядром (служба) по именованному каналу.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Подпись манифеста наших релизов (обновление программы и движка): проверка Ed25519.
+ed25519-dalek = "2"
 windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
     "Win32_Graphics_Dwm",
     "Win32_Graphics_Gdi",
     "Win32_NetworkManagement_IpHelper",
+    "Win32_Networking_WinHttp",
     "Win32_Networking_WinSock",
     "Win32_Security",
     "Win32_Security_Authorization",
+    "Win32_Security_Cryptography",
+    "Win32_Security_WinTrust",
+    "Win32_Storage_FileSystem",
+    "Win32_System_ApplicationInstallationAndServicing",
+    "Win32_System_Com",
     "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_Environment",
+    "Win32_System_IO",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Pipes",
+    "Win32_System_Registry",
     "Win32_System_RemoteDesktop",
     "Win32_System_Services",
     "Win32_System_Threading",
@@ -31,10 +51,14 @@ windows-sys = { version = "0.59", features = [
 # UI Automation (COM) — управление родным окном AmneziaWG; та же версия, что уже тянет wgpu.
 windows = { version = "0.58", features = [
     "Win32_Foundation",
+    "Win32_Storage_EnhancedStorage",
     "Win32_System_Com",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_Variant",
     "Win32_UI_Accessibility",
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_Shell",
+    "Win32_UI_Shell_PropertiesSystem",
     "Win32_UI_WindowsAndMessaging",
 ] }
 
@@ -45,3 +69,4 @@ strip = true
 
 [build-dependencies]
 winresource = "0.1"
+sha2 = "0.10"

@@ -1,7 +1,8 @@
 //! Значок в трее (Shell_NotifyIcon) и уведомления Windows через него.
 //! Сообщения значка ловим подклассом главного окна; цвет точки в углу иконки = состояние туннелей.
-//! Та же точка — на значке окна в панели задач (`set_window_state`).
-//! Функции можно звать из любого потока; до `install` они ничего не делают.
+//! Та же точка — поверх кнопки окна в панели задач (`set_window_state`, см. `taskbar`).
+//! Функции можно звать из любого потока; до `install` они ничего не делают. Вызовы COM панели задач делает
+//! поток окна: остальные потоки шлют окну `WM_TASKBAR`.
 
 use std::ffi::c_void;
 use std::ptr::{null, null_mut};
@@ -17,39 +18,60 @@ use windows_sys::Win32::UI::Shell::{
     NIIF_WARNING, NIM_ADD, NIM_DELETE, NIM_MODIFY, NOTIFYICONDATAW,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    AppendMenuW, CreateIconIndirect, CreatePopupMenu, DestroyMenu, GetCursorPos, GetSystemMetrics, IsIconic,
-    PostMessageW, RegisterWindowMessageW, SetForegroundWindow, ShowWindow, TrackPopupMenu, ICONINFO, MF_SEPARATOR,
-    MF_STRING, ICON_BIG, ICON_SMALL, SM_CXICON, SM_CXSMICON, SW_HIDE, SW_RESTORE, SW_SHOW, TPM_NONOTIFY, TPM_RETURNCMD,
-    TPM_RIGHTBUTTON, WM_APP, WM_LBUTTONDBLCLK, WM_LBUTTONUP, WM_NULL, WM_RBUTTONUP, WM_SETICON,
+    AppendMenuW, ChangeWindowMessageFilterEx, CreateIconIndirect, CreatePopupMenu, DestroyMenu, GetCursorPos,
+    GetSystemMetrics, IsIconic, IsWindowVisible, PostMessageW, RegisterWindowMessageW, SetForegroundWindow, ShowWindow,
+    TrackPopupMenu, ICONINFO, MF_SEPARATOR, MF_STRING, ICON_BIG, ICON_SMALL, MSGFLT_ALLOW, SM_CXICON, SM_CXSMICON,
+    SW_HIDE, SW_RESTORE, SW_SHOW, TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTBUTTON, WM_APP, WM_DESTROY, WM_LBUTTONDBLCLK,
+    WM_LBUTTONUP, WM_NULL, WM_RBUTTONUP, WM_SETICON,
 };
 
 use crate::health::Level;
 use crate::i18n::tr;
 use crate::icon;
+use crate::taskbar;
+use crate::win::wide;
 
 const WM_TRAY: u32 = WM_APP + 1;
+/// Применить к кнопке в панели задач то, что указано флагами в wParam (в потоке окна).
+const WM_TASKBAR: u32 = WM_APP + 2;
+const TASKBAR_OVERLAY: usize = 1;
+const TASKBAR_IDENTITY: usize = 2;
+/// Кнопка в панели задач (пере)создана: взять новый объект панели задач и применить всё заново.
+const TASKBAR_BUTTON: usize = 4;
 const SUBCLASS_ID: usize = 0x4157_4755; // "AWGU"
 const CMD_OPEN: usize = 1;
 const CMD_EXIT: usize = 2;
 
 struct Tray {
     hwnd: isize,
-    /// Серый, зелёный, жёлтый, красный.
-    icons: [isize; 4],
-    /// Значки окна [большой, малый]: без точки, затем с точкой тех же четырёх цветов.
-    window_icons: [[isize; 2]; 5],
+    /// По режиму (0 — поверх AmneziaWG, 1 — встроенный движок): серый, зелёный, жёлтый, красный.
+    icons: [[isize; 4]; 2],
+    /// Значки окна (заголовок, Alt+Tab) по режиму, [большой, малый]; без точки — она поверх кнопки в панели задач.
+    window_icons: [[isize; 2]; 2],
+    /// Точки поверх кнопки в панели задач: серая, зелёная, жёлтая, красная.
+    overlay_icons: [isize; 4],
     taskbar_created: u32,
+    taskbar_button_created: u32,
     ctx: egui::Context,
     on_exit: Box<dyn Fn() + Send + Sync>,
     state: Mutex<State>,
+    /// Один вызов `Shell_NotifyIconW` за раз: решение, вызов и запись результата идут как одно целое. Без этого два
+    /// потока оба решили бы «добавить», и неудача второго (значок уже есть) сбросила бы `visible` у живого значка.
+    shell: Mutex<()>,
 }
 
 struct State {
+    /// Пользователь хочет значок в трее (настройка).
+    wanted: bool,
+    /// Значок реально добавлен в Explorer. Может быть `false` при `wanted`: добавление не удалось (Explorer ещё
+    /// поднимается после перезапуска) — `set_state` повторяет его на каждом тике.
     visible: bool,
     level: Level,
     tip: String,
-    /// Индекс в `window_icons`, выставленный окну.
-    window_icon: usize,
+    /// Индекс в `overlay_icons` — точка поверх кнопки в панели задач; `None` — без точки.
+    overlay: Option<usize>,
+    /// Режим 2 — иконки жёлтые; `None` — ещё не выставлен (значок окна задан при запуске).
+    engine: Option<bool>,
 }
 
 static TRAY: OnceLock<Tray> = OnceLock::new();
@@ -58,42 +80,107 @@ static TRAY: OnceLock<Tray> = OnceLock::new();
 pub fn install(hwnd: isize, ctx: egui::Context, visible: bool, on_exit: Box<dyn Fn() + Send + Sync>) {
     let size = unsafe { GetSystemMetrics(SM_CXSMICON) }.max(16) as u32;
     let dots = [icon::GRAY, icon::GREEN, icon::YELLOW, icon::RED];
-    let icons = dots.map(|c| make_icon(size, &icon::rgba_with_dot(size, c)));
+    let icons = [false, true].map(|engine| dots.map(|c| make_icon(size, &icon::rgba_with_dot(size, engine, c))));
     let window_sizes = unsafe { [GetSystemMetrics(SM_CXICON), GetSystemMetrics(SM_CXSMICON)] }.map(|s| s.max(16) as u32);
-    let mut window_icons = [window_sizes.map(|s| make_icon(s, &icon::rgba(s))); 5];
-    for (i, c) in dots.into_iter().enumerate() {
-        window_icons[i + 1] = window_sizes.map(|s| make_icon(s, &icon::rgba_with_dot(s, c)));
-    }
+    let window_icons = [false, true].map(|engine| window_sizes.map(|s| make_icon(s, &icon::themed(s, engine))));
+    let overlay_icons = dots.map(|c| make_icon(size, &icon::dot_icon(size, c)));
     let taskbar_created = unsafe { RegisterWindowMessageW(wide("TaskbarCreated").as_ptr()) };
+    let taskbar_button_created = unsafe { RegisterWindowMessageW(wide("TaskbarButtonCreated").as_ptr()) };
     let tray = Tray {
         hwnd,
         icons,
         window_icons,
+        overlay_icons,
         taskbar_created,
+        taskbar_button_created,
         ctx,
         on_exit,
-        state: Mutex::new(State { visible: false, level: Level::Off, tip: crate::APP_TITLE.to_string(), window_icon: 0 }),
+        state: Mutex::new(State { wanted: false, visible: false, level: Level::Off, tip: crate::APP_TITLE.to_string(), overlay: None, engine: None }),
+        shell: Mutex::new(()),
     };
     if TRAY.set(tray).is_err() {
         return;
     }
-    unsafe { SetWindowSubclass(hwnd as HWND, Some(subclass_proc), SUBCLASS_ID, 0) };
+    unsafe {
+        SetWindowSubclass(hwnd as HWND, Some(subclass_proc), SUBCLASS_ID, 0);
+        // Окно с правами администратора иначе не получит эти сообщения от Explorer (UIPI).
+        for msg in [taskbar_created, taskbar_button_created] {
+            ChangeWindowMessageFilterEx(hwnd as HWND, msg, MSGFLT_ALLOW, null_mut());
+        }
+        // Окно уже видно — его кнопка могла появиться до подкласса, и «кнопка создана» мы пропустили.
+        if IsWindowVisible(hwnd as HWND) != 0 {
+            PostMessageW(hwnd as HWND, WM_TASKBAR, TASKBAR_BUTTON | TASKBAR_IDENTITY | TASKBAR_OVERLAY, 0);
+        }
+    }
     set_visible(visible);
 }
 
 pub fn set_visible(visible: bool) {
     let Some(t) = TRAY.get() else { return };
-    let mut st = t.state.lock().unwrap();
-    if st.visible == visible {
-        return;
-    }
-    st.visible = visible;
-    let mut data = base(t);
-    if visible {
-        fill_icon(t, &st, &mut data);
-        unsafe { Shell_NotifyIconW(NIM_ADD, &data) };
+    step(t, |st| {
+        st.wanted = visible;
+        plan_icon(st, false)
+    });
+}
+
+/// Что сделать со значком в Explorer.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Call {
+    Add,
+    Modify,
+    Delete,
+}
+
+/// Привести значок в Explorer к желаемому: добавить (при отказе — повтор на следующем тике), убрать или, если
+/// значок есть и его вид изменился (`changed`), обновить. Только решение — вызов делает `step`.
+fn plan_icon(st: &mut State, changed: bool) -> Option<Call> {
+    if st.wanted && !st.visible {
+        Some(Call::Add)
+    } else if !st.wanted && st.visible {
+        st.visible = false;
+        Some(Call::Delete)
+    } else if st.visible && changed {
+        Some(Call::Modify)
     } else {
-        unsafe { Shell_NotifyIconW(NIM_DELETE, &data) };
+        None
+    }
+}
+
+/// Одна операция над значком в трее. Решение принимается под блокировкой состояния, а `Shell_NotifyIconW` вызывается
+/// уже без неё: Explorer может отвечать долго, а состояние читают поток окна и монитор. Итог вызова записывается
+/// обратно отдельно; порядок шагов держит `Tray::shell`.
+fn step(t: &Tray, plan: impl FnOnce(&mut State) -> Option<Call>) {
+    let _one_at_a_time = t.shell.lock().unwrap();
+    let (call, data) = {
+        let mut st = t.state.lock().unwrap();
+        let Some(call) = plan(&mut st) else { return };
+        let mut data = base(t);
+        if call != Call::Delete {
+            fill_icon(t, &st, &mut data);
+        }
+        (call, data)
+    };
+    let message = match call {
+        Call::Add => NIM_ADD,
+        Call::Modify => NIM_MODIFY,
+        Call::Delete => NIM_DELETE,
+    };
+    let done = unsafe { Shell_NotifyIconW(message, &data) } != 0;
+    let mut st = t.state.lock().unwrap();
+    match call {
+        // NIM_ADD в момент старта Explorer нередко отказывает; `visible` остаётся false, добавление повторится.
+        Call::Add => {
+            st.visible = done;
+            if !done {
+                eprintln!("трей: не удалось добавить значок, повтор на следующем тике");
+            }
+        }
+        // Отказ (значка в Explorer уже нет) — снова считаем его не добавленным.
+        Call::Modify if !done => {
+            st.visible = false;
+            eprintln!("трей: значок не обновился, будет добавлен заново");
+        }
+        Call::Modify | Call::Delete => {}
     }
 }
 
@@ -103,39 +190,95 @@ pub fn remove() {
 
 pub fn set_state(level: Level, tip: &str) {
     let Some(t) = TRAY.get() else { return };
-    let mut st = t.state.lock().unwrap();
-    if st.level == level && st.tip == tip {
-        return;
-    }
-    st.level = level;
-    st.tip = tip.to_string();
-    if st.visible {
-        let mut data = base(t);
-        fill_icon(t, &st, &mut data);
-        unsafe { Shell_NotifyIconW(NIM_MODIFY, &data) };
+    let mut announce = false;
+    step(t, |st| {
+        let changed = st.level != level || st.tip != tip;
+        announce = st.tip != tip && st.overlay.is_some();
+        st.level = level;
+        st.tip = tip.to_string();
+        plan_icon(st, changed)
+    });
+    if announce {
+        // Подпись точки для экранного диктора — та же, что подсказка значка в трее.
+        post_taskbar(t, TASKBAR_OVERLAY);
     }
 }
 
-/// Точка состояния на значке окна (панель задач и заголовок); `None` — обычный значок.
+/// Точка состояния поверх кнопки окна в панели задач; `None` — без точки.
 pub fn set_window_state(level: Option<Level>) {
     let Some(t) = TRAY.get() else { return };
-    let index = level.map_or(0, |l| dot_index(l) + 1);
+    let index = level.map(dot_index);
     let mut st = t.state.lock().unwrap();
-    if st.window_icon == index {
+    if st.overlay == index {
         return;
     }
-    st.window_icon = index;
-    let [big, small] = t.window_icons[index];
-    // PostMessage: зовут из фонового потока, ждать окно незачем.
+    st.overlay = index;
+    post_taskbar(t, TASKBAR_OVERLAY);
+}
+
+/// Цвет иконок по режиму работы: в режиме 2 (встроенный движок) — жёлтые, в трее, панели задач и заголовке.
+pub fn set_engine(engine: bool) {
+    let Some(t) = TRAY.get() else { return };
+    let mut changed = false;
+    step(t, |st| {
+        if st.engine == Some(engine) {
+            return None;
+        }
+        st.engine = Some(engine);
+        changed = true;
+        plan_icon(st, true)
+    });
+    if !changed {
+        return;
+    }
+    let [big, small] = t.window_icons[engine as usize];
+    // PostMessage: могут звать не из потока окна, ждать окно незачем.
     unsafe {
         PostMessageW(t.hwnd as HWND, WM_SETICON, ICON_BIG as WPARAM, big);
         PostMessageW(t.hwnd as HWND, WM_SETICON, ICON_SMALL as WPARAM, small);
+    }
+    post_taskbar(t, TASKBAR_IDENTITY);
+}
+
+/// Попросить поток окна применить к кнопке в панели задач то, что в `what`.
+fn post_taskbar(t: &Tray, what: usize) {
+    unsafe { PostMessageW(t.hwnd as HWND, WM_TASKBAR, what, 0) };
+}
+
+/// Применить к кнопке в панели задач текущее состояние (только в потоке окна). Блокировка состояния на время
+/// вызовов COM не держится: они могут ждать Explorer.
+fn apply_taskbar(t: &Tray, what: usize) {
+    let (engine, overlay, tip) = {
+        let st = t.state.lock().unwrap();
+        (st.engine, st.overlay, st.tip.clone())
+    };
+    let report = |r: Result<(), String>| {
+        if let Err(e) = r {
+            eprintln!("панель задач: {e}");
+        }
+    };
+    if what & TASKBAR_BUTTON != 0 {
+        report(taskbar::button_created());
+    }
+    if what & TASKBAR_IDENTITY != 0 {
+        if let Some(engine) = engine {
+            report(taskbar::set_identity(t.hwnd, engine));
+            // Ярлык с прошлой версии мог остаться без AppUserModelID — поправить один раз за запуск.
+            static SHORTCUT_CHECKED: std::sync::Once = std::sync::Once::new();
+            SHORTCUT_CHECKED.call_once(|| report(crate::shortcut::repair_desktop_app_id(crate::APP_TITLE).map(drop)));
+        }
+    }
+    if what & (TASKBAR_OVERLAY | TASKBAR_BUTTON) != 0 {
+        report(taskbar::set_overlay(t.hwnd, overlay.map_or(0, |i| t.overlay_icons[i]), &tip));
     }
 }
 
 /// Всплывающее уведомление Windows (в Windows 10/11 показывается как toast).
 pub fn notify(title: &str, text: &str, warning: bool) {
     let Some(t) = TRAY.get() else { return };
+    // Тот же порядок вызовов оболочки, что у `step`: уведомление не вклинивается между его решением и вызовом.
+    // Состояние — только прочитать; вызывающий не должен держать чужих блокировок (`monitor::record_and_notify`).
+    let _one_at_a_time = t.shell.lock().unwrap();
     if !t.state.lock().unwrap().visible {
         return;
     }
@@ -157,6 +300,13 @@ pub fn show_window() {
     t.ctx.request_repaint();
 }
 
+/// Окно скрыто в трей или свёрнуто: его не видно, всплывающее уведомление уместно.
+pub fn window_hidden() -> bool {
+    let Some(t) = TRAY.get() else { return false };
+    let hwnd = t.hwnd as HWND;
+    unsafe { IsWindowVisible(hwnd) == 0 || IsIconic(hwnd) != 0 }
+}
+
 pub fn hide_window() {
     if let Some(t) = TRAY.get() {
         unsafe { ShowWindow(t.hwnd as HWND, SW_HIDE) };
@@ -174,7 +324,7 @@ fn base(t: &Tray) -> NOTIFYICONDATAW {
 fn fill_icon(t: &Tray, st: &State, data: &mut NOTIFYICONDATAW) {
     data.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
     data.uCallbackMessage = WM_TRAY;
-    data.hIcon = t.icons[dot_index(st.level)] as _;
+    data.hIcon = t.icons[(st.engine == Some(true)) as usize][dot_index(st.level)] as _;
     copy(&mut data.szTip, &st.tip);
 }
 
@@ -205,13 +355,26 @@ unsafe extern "system" fn subclass_proc(
             }
             return 0;
         }
+        if msg == WM_TASKBAR {
+            apply_taskbar(t, wparam);
+            return 0;
+        }
+        if msg == t.taskbar_button_created {
+            // Приходит при каждом (пере)создании кнопки: показ окна после скрытия, перезапуск Explorer.
+            apply_taskbar(t, TASKBAR_BUTTON | TASKBAR_IDENTITY | TASKBAR_OVERLAY);
+        }
+        if msg == WM_DESTROY {
+            taskbar::release();
+            if let Err(e) = taskbar::clear_identity(t.hwnd) {
+                eprintln!("панель задач: {e}");
+            }
+        }
         if msg == t.taskbar_created {
             // Explorer перезапустился — значок надо добавить заново.
-            let visible = {
-                let mut st = t.state.lock().unwrap();
-                std::mem::replace(&mut st.visible, false)
-            };
-            set_visible(visible);
+            step(t, |st| {
+                st.visible = false;
+                plan_icon(st, false)
+            });
         }
     }
     DefSubclassProc(hwnd, msg, wparam, lparam)
@@ -249,6 +412,14 @@ fn make_icon(size: u32, rgba: &[u8]) -> isize {
         let dc = GetDC(null_mut());
         let color = CreateDIBSection(dc, &bmi, DIB_RGB_COLORS, &mut bits, null_mut(), 0);
         ReleaseDC(null_mut(), dc);
+        if color.is_null() || bits.is_null() || rgba.len() as u64 > size as u64 * size as u64 * 4 {
+            // Нехватка GDI-ресурсов: «значка нет» (0), а не обращение по нулевому указателю.
+            eprintln!("трей: CreateDIBSection не удалась, значок {size}x{size} не создан");
+            if !color.is_null() {
+                DeleteObject(color);
+            }
+            return 0;
+        }
         let dst = std::slice::from_raw_parts_mut(bits as *mut u8, rgba.len());
         for (d, s) in dst.chunks_exact_mut(4).zip(rgba.chunks_exact(4)) {
             d.copy_from_slice(&[s[2], s[1], s[0], s[3]]);
@@ -268,12 +439,26 @@ fn copy(dst: &mut [u16], s: &str) {
     dst[units.len()] = 0;
 }
 
-fn wide(s: &str) -> Vec<u16> {
-    s.encode_utf16().chain(Some(0)).collect()
-}
-
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    fn state(wanted: bool, visible: bool) -> State {
+        State { wanted, visible, level: Level::Off, tip: String::new(), overlay: None, engine: None }
+    }
+
+    #[test]
+    fn icon_plan_adds_removes_and_updates() {
+        assert_eq!(plan_icon(&mut state(true, false), false), Some(Call::Add), "значка нет, а он нужен — в том числе повтор после отказа");
+        assert_eq!(plan_icon(&mut state(true, true), false), None);
+        assert_eq!(plan_icon(&mut state(true, true), true), Some(Call::Modify));
+        assert_eq!(plan_icon(&mut state(false, false), true), None, "значка нет и не нужен — обновлять нечего");
+        let mut shown = state(false, true);
+        assert_eq!(plan_icon(&mut shown, true), Some(Call::Delete), "удаление важнее обновления");
+        assert!(!shown.visible, "второе решение подряд не пошлёт удаление повторно");
+        assert_eq!(plan_icon(&mut shown, true), None);
+    }
+
     #[test]
     fn copy_truncates_with_nul() {
         let mut buf = [1u16; 4];

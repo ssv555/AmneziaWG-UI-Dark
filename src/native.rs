@@ -23,6 +23,7 @@ const WINDOW_TIMEOUT: Duration = Duration::from_secs(10);
 const EDIT_NAMES: &[&str] = &["Edit", "Редактировать"];
 const ADD_NAMES: &[&str] = &["Add Tunnel", "Добавить туннель"];
 const REMOVE_NAMES: &[&str] = &["Remove selected tunnel(s)", "Удалить выбранные туннели"];
+const EXPORT_NAMES: &[&str] = &["Export all tunnels to zip", "Экспорт всех туннелей в zip-архив"];
 
 /// Открыть в родном окне редактор туннеля.
 pub fn edit(exe: &Path, tunnel: &str) -> Result<(), String> {
@@ -195,6 +196,7 @@ fn blocking_dialog(main: HWND) -> Option<String> {
         }
         let mut search = Search { pid: 0, main, title: None };
         GetWindowThreadProcessId(main, Some(&mut search.pid));
+        // `Err` здесь — обход остановлен обратным вызовом (нашли окно), а не сбой; результат в `search`.
         let _ = EnumWindows(Some(visit), LPARAM(&mut search as *mut Search as isize));
         Some(search.title.unwrap_or_else(|| "?".into()))
     }
@@ -205,7 +207,7 @@ fn window(exe: &Path) -> Result<HWND, String> {
     if let Some(h) = find_window() {
         return Ok(h);
     }
-    std::process::Command::new(exe).spawn().map_err(|e| format!("{}: {e}", exe.display()))?;
+    std::process::Command::new(exe).spawn().map_err(|e| crate::fsutil::io_ctx(&exe, e))?;
     let deadline = Instant::now() + WINDOW_TIMEOUT;
     while Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(250));
@@ -240,6 +242,7 @@ fn find_window() -> Option<HWND> {
     }
     let mut search = Search { own_pid: std::process::id(), found: None };
     unsafe {
+        // `Err` здесь — обход остановлен обратным вызовом (нашли окно), а не сбой; результат в `search`.
         let _ = EnumWindows(Some(visit), LPARAM(&mut search as *mut Search as isize));
     }
     search.found
@@ -247,52 +250,21 @@ fn find_window() -> Option<HWND> {
 
 /// Диалог выбора файла родного клиента: перейти в папку `file` и выделить его в списке.
 fn preselect(uia: &IUIAutomation, owner: HWND, file: &Path) -> Result<(), String> {
-    use windows::Win32::UI::Accessibility::{
-        IUIAutomationScrollItemPattern, IUIAutomationValuePattern, UIA_AutomationIdPropertyId, UIA_EditControlTypeId,
-        UIA_ScrollItemPatternId, UIA_ValuePatternId,
-    };
+    use windows::Win32::UI::Accessibility::{IUIAutomationScrollItemPattern, UIA_ScrollItemPatternId};
     let dialog = wait_dialog(owner).ok_or_else(|| trf("err.native_dialog", &[]))?;
     let folder = file.parent().map(|p| p.display().to_string()).unwrap_or_default();
     let name = file.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
     let stem = file.file_stem().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
     unsafe {
         let root = uia.ElementFromHandle(dialog).map_err(|e| e.to_string())?;
-        // Поле «Имя файла» стандартного диалога: Edit с AutomationId 1148; кнопка «Открыть» — id 1.
-        let set_file_name = |text: &str| -> Result<(), String> {
-            let cond = uia
-                .CreateAndCondition(
-                    &uia.CreatePropertyCondition(UIA_ControlTypePropertyId, &VARIANT::from(UIA_EditControlTypeId.0)).map_err(|e| e.to_string())?,
-                    &uia.CreatePropertyCondition(UIA_AutomationIdPropertyId, &VARIANT::from(BSTR::from("1148"))).map_err(|e| e.to_string())?,
-                )
-                .map_err(|e| e.to_string())?;
-            // Диалог достраивается не сразу — ждём поле до 5 с.
-            let deadline = Instant::now() + Duration::from_secs(5);
-            let edit = loop {
-                match root.FindFirst(TreeScope_Descendants, &cond) {
-                    Ok(e) => break e,
-                    Err(_) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(250)),
-                    Err(_) => return Err(trf("err.native_dialog", &[])),
-                }
-            };
-            let value: IUIAutomationValuePattern = edit.GetCurrentPatternAs(UIA_ValuePatternId).map_err(|e| e.to_string())?;
-            value.SetValue(&BSTR::from(text)).map_err(|e| e.to_string())
-        };
         // Папка в поле имени + «Открыть» = переход в папку (файл при этом не открывается).
-        set_file_name(&folder)?;
-        // id «1» есть и у строк списка файлов — ищем именно кнопку.
-        let open = uia
-            .CreateAndCondition(
-                &uia.CreatePropertyCondition(UIA_ControlTypePropertyId, &VARIANT::from(UIA_ButtonControlTypeId.0)).map_err(|e| e.to_string())?,
-                &uia.CreatePropertyCondition(UIA_AutomationIdPropertyId, &VARIANT::from(BSTR::from("1"))).map_err(|e| e.to_string())?,
-            )
-            .map_err(|e| e.to_string())?;
-        let button = root.FindFirst(TreeScope_Descendants, &open).map_err(|e| e.to_string())?;
-        let invoke: IUIAutomationInvokePattern = button.GetCurrentPatternAs(UIA_InvokePatternId).map_err(|e| e.to_string())?;
-        invoke.Invoke().map_err(|e| e.to_string())?;
+        set_file_name(uia, &root, &folder)?;
+        press_dialog_button(uia, &root, "1")?;
         std::thread::sleep(Duration::from_millis(900));
         // Выделить файл в списке (с расширением или без — как показывает Проводник).
         for shown in [&name, &stem] {
             if let Some(item) = find_by_name(uia, &root, shown)? {
+                // Прокрутка и выделение — удобство для пользователя; без них файл всё равно вводится в поле имени ниже.
                 if let Ok(scroll) = item.GetCurrentPatternAs::<IUIAutomationScrollItemPattern>(UIA_ScrollItemPatternId) {
                     let _ = scroll.ScrollIntoView();
                 }
@@ -302,7 +274,70 @@ fn preselect(uia: &IUIAutomation, owner: HWND, file: &Path) -> Result<(), String
                 break;
             }
         }
-        set_file_name(&name)
+        set_file_name(uia, &root, &name)
+    }
+}
+
+/// Поле «Имя файла» стандартного диалога: Edit с AutomationId 1148 (открытие) или 1001 (сохранение).
+/// Диалог достраивается не сразу — поле ждём до 5 с.
+unsafe fn set_file_name(uia: &IUIAutomation, root: &IUIAutomationElement, text: &str) -> Result<(), String> {
+    use windows::Win32::UI::Accessibility::{IUIAutomationValuePattern, UIA_AutomationIdPropertyId, UIA_EditControlTypeId, UIA_ValuePatternId};
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        for id in ["1148", "1001"] {
+            let cond = uia
+                .CreateAndCondition(
+                    &uia.CreatePropertyCondition(UIA_ControlTypePropertyId, &VARIANT::from(UIA_EditControlTypeId.0)).map_err(|e| e.to_string())?,
+                    &uia.CreatePropertyCondition(UIA_AutomationIdPropertyId, &VARIANT::from(BSTR::from(id))).map_err(|e| e.to_string())?,
+                )
+                .map_err(|e| e.to_string())?;
+            if let Ok(edit) = root.FindFirst(TreeScope_Descendants, &cond) {
+                let value: IUIAutomationValuePattern = edit.GetCurrentPatternAs(UIA_ValuePatternId).map_err(|e| e.to_string())?;
+                return value.SetValue(&BSTR::from(text)).map_err(|e| e.to_string());
+            }
+        }
+        if Instant::now() >= deadline {
+            return Err(trf("err.native_dialog", &[]));
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+}
+
+/// Кнопка диалога по AutomationId («1» — «Открыть»/«Сохранить»). Тот же id бывает у строк списка
+/// файлов — поэтому ищем именно кнопку.
+unsafe fn press_dialog_button(uia: &IUIAutomation, root: &IUIAutomationElement, id: &str) -> Result<(), String> {
+    use windows::Win32::UI::Accessibility::UIA_AutomationIdPropertyId;
+    let cond = uia
+        .CreateAndCondition(
+            &uia.CreatePropertyCondition(UIA_ControlTypePropertyId, &VARIANT::from(UIA_ButtonControlTypeId.0)).map_err(|e| e.to_string())?,
+            &uia.CreatePropertyCondition(UIA_AutomationIdPropertyId, &VARIANT::from(BSTR::from(id))).map_err(|e| e.to_string())?,
+        )
+        .map_err(|e| e.to_string())?;
+    let button = root.FindFirst(TreeScope_Descendants, &cond).map_err(|e| e.to_string())?;
+    let invoke: IUIAutomationInvokePattern = button.GetCurrentPatternAs(UIA_InvokePatternId).map_err(|e| e.to_string())?;
+    invoke.Invoke().map_err(|e| e.to_string())
+}
+
+/// Родное «Export all tunnels to zip» в файл `zip` (каталог должен существовать, файла быть не должно).
+/// Возвращает, когда архив записан и читается целиком.
+pub fn export_all(exe: &Path, zip: &Path) -> Result<Vec<crate::archive::Entry>, String> {
+    with_window(exe, |uia, root, hwnd| {
+        press(uia, root, EXPORT_NAMES)?;
+        let dialog = wait_dialog(hwnd).ok_or_else(|| trf("err.native_dialog", &[]))?;
+        unsafe {
+            let el = uia.ElementFromHandle(dialog).map_err(|e| e.to_string())?;
+            set_file_name(uia, &el, &zip.display().to_string())?;
+            press_dialog_button(uia, &el, "1")
+        }
+    })?;
+    // Клиент пишет архив сразу после «Сохранить»; ждём, пока он прочитается целиком.
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        match crate::archive::read(zip, None) {
+            Ok(entries) => return Ok(entries),
+            Err(_) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(300)),
+            Err(e) => return Err(format!("{}: {e:?}", zip.display())),
+        }
     }
 }
 
@@ -330,12 +365,8 @@ pub fn write_config(exe: &Path, tunnel: &str, text: &str) -> Result<(), String> 
 }
 
 fn wait_editor_closed(timeout: Duration) -> Result<(), String> {
-    let deadline = Instant::now() + timeout;
-    while Instant::now() < deadline {
-        std::thread::sleep(Duration::from_millis(200));
-        if editor_window().is_none() {
-            return Ok(());
-        }
+    if crate::fsutil::wait_until(timeout, Duration::from_millis(200), || editor_window().is_none()) {
+        return Ok(());
     }
     Err(trf("err.native_dialog", &[]))
 }
@@ -401,6 +432,7 @@ fn editor_window() -> Option<HWND> {
     }
     let mut search = Search { found: None };
     unsafe {
+        // `Err` здесь — обход остановлен обратным вызовом (нашли окно), а не сбой; результат в `search`.
         let _ = EnumWindows(Some(visit), LPARAM(&mut search as *mut Search as isize));
     }
     search.found
@@ -449,6 +481,7 @@ fn wait_dialog(owner: HWND) -> Option<HWND> {
     while Instant::now() < deadline {
         let mut search = Search { pid, found: None };
         unsafe {
+            // `Err` здесь — обход остановлен обратным вызовом (нашли окно), а не сбой; результат в `search`.
             let _ = EnumWindows(Some(visit), LPARAM(&mut search as *mut Search as isize));
         }
         if search.found.is_some() {
@@ -465,6 +498,7 @@ fn find_by_name(uia: &IUIAutomation, root: &IUIAutomationElement, name: &str) ->
         let cond = uia
             .CreatePropertyCondition(UIA_NamePropertyId, &VARIANT::from(BSTR::from(name)))
             .map_err(|e| e.to_string())?;
+        // `FindFirst` отдаёт `Err`, когда элемента нет: для поиска это «не найден», а не сбой.
         Ok(root.FindFirst(TreeScope_Descendants, &cond).ok())
     }
 }

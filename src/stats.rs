@@ -4,7 +4,7 @@
 //! закрыто, храним последние значения счётчиков и порт: тот же порт и счётчики не меньше — та же сессия,
 //! добираем разницу; иначе сессия новая и её счётчики считаются с нуля.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 use std::path::Path;
 
@@ -13,7 +13,11 @@ use crate::ini::Ini;
 /// Больше этого разрыв между замерами — не считаем его временем подключения (сон, пауза опроса).
 const MAX_GAP_SECS: f64 = 5.0;
 
-#[derive(Clone, Default, Debug, PartialEq)]
+/// Статистика туннеля, которого больше нет (удалён или переименован, в том числе в окне самого AmneziaWG, где ядро
+/// об этом не узнаёт), хранится столько дней — на случай, если он вернётся, — и потом убирается.
+pub const KEEP_ABSENT_DAYS: u64 = 90;
+
+#[derive(Clone, Default, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct TunnelStats {
     pub rx: u64,
     pub tx: u64,
@@ -27,6 +31,9 @@ pub struct TunnelStats {
     last_rx: u64,
     last_tx: u64,
     last_port: u16,
+    /// Когда туннель последний раз был в списке туннелей, unix-секунды (0 — неизвестно: файл прежней версии).
+    #[serde(default)]
+    last_seen: u64,
 }
 
 pub type Stats = BTreeMap<String, TunnelStats>;
@@ -61,6 +68,27 @@ pub fn share(stats: &Stats, tunnel: &str) -> f64 {
     }
 }
 
+/// Убрать статистику туннелей, которых нет в `existing` дольше `KEEP_ABSENT_DAYS`. Есть в списке — отметка
+/// `last_seen` обновляется; отметки нет (файл прежней версии) — ставится сейчас, и срок идёт с этого момента, а не
+/// с «никогда». Вызывать только по настоящему списку туннелей: при ошибке чтения списка все туннели выглядели бы
+/// отсутствующими. Возвращает имена убранных.
+pub fn prune(stats: &mut Stats, existing: &BTreeSet<String>, now: u64) -> Vec<String> {
+    let keep_secs = KEEP_ABSENT_DAYS * 24 * 3600;
+    let mut removed = Vec::new();
+    stats.retain(|name, s| {
+        if existing.contains(name) || s.last_seen == 0 {
+            s.last_seen = now;
+            return true;
+        }
+        let stale = now.saturating_sub(s.last_seen) > keep_secs;
+        if stale {
+            removed.push(name.clone());
+        }
+        !stale
+    });
+    removed
+}
+
 pub fn load(path: &Path) -> Stats {
     let ini = Ini::load(path);
     ini.section_names()
@@ -75,6 +103,7 @@ pub fn load(path: &Path) -> Stats {
                 last_rx: ini.get_or(name, "last_rx", 0),
                 last_tx: ini.get_or(name, "last_tx", 0),
                 last_port: ini.get_or(name, "last_port", 0),
+                last_seen: ini.get_or(name, "last_seen", 0),
             };
             (name.to_string(), s)
         })
@@ -93,6 +122,7 @@ pub fn save(path: &Path, stats: &Stats) -> io::Result<()> {
         ini.set(name, "last_rx", s.last_rx);
         ini.set(name, "last_tx", s.last_tx);
         ini.set(name, "last_port", s.last_port);
+        ini.set(name, "last_seen", s.last_seen);
     }
     ini.save(path)
 }
@@ -136,6 +166,50 @@ mod tests {
         s.observe(0, 0, 1, None, 1);
         s.observe(10, 0, 1, Some(60.0), 2);
         assert_eq!(s.seconds, 0.0);
+    }
+
+    const DAY: u64 = 24 * 3600;
+
+    fn with_stats(names: &[&str]) -> Stats {
+        names.iter().map(|n| (n.to_string(), TunnelStats::default())).collect()
+    }
+
+    #[test]
+    fn stats_of_a_tunnel_gone_for_long_are_pruned_and_present_ones_kept() {
+        let mut stats = with_stats(&["live", "gone"]);
+        let live: BTreeSet<String> = ["live".to_string()].into();
+        let t0 = 1_000_000;
+        // Первый проход: «gone» уже нет, но срок начинается только сейчас (отметки не было).
+        assert!(prune(&mut stats, &live, t0).is_empty());
+        assert_eq!(stats["gone"].last_seen, t0, "отметка ставится при первом замеченном отсутствии");
+        assert!(prune(&mut stats, &live, t0 + KEEP_ABSENT_DAYS * DAY).is_empty(), "ровно срок — ещё хранится");
+        assert_eq!(prune(&mut stats, &live, t0 + KEEP_ABSENT_DAYS * DAY + 1), vec!["gone".to_string()]);
+        assert!(stats.contains_key("live") && !stats.contains_key("gone"));
+        assert_eq!(stats["live"].last_seen, t0 + KEEP_ABSENT_DAYS * DAY + 1, "существующий туннель обновляет отметку");
+    }
+
+    #[test]
+    fn tunnel_that_returns_keeps_its_stats() {
+        let mut stats = with_stats(&["t"]);
+        let (none, back): (BTreeSet<String>, BTreeSet<String>) = (BTreeSet::new(), ["t".to_string()].into());
+        prune(&mut stats, &none, 100);
+        prune(&mut stats, &back, 100 + (KEEP_ABSENT_DAYS - 1) * DAY);
+        assert!(prune(&mut stats, &none, 100 + (KEEP_ABSENT_DAYS + 50) * DAY).is_empty(), "срок считается с последней встречи");
+        assert!(stats.contains_key("t"));
+    }
+
+    #[test]
+    fn last_seen_survives_the_file_and_old_files_without_it_load() {
+        let dir = std::env::temp_dir().join(format!("awg-ui-test-seen-{}", std::process::id()));
+        let path = dir.join("Stats.ini");
+        let mut stats = with_stats(&["a"]);
+        prune(&mut stats, &["a".to_string()].into(), 777);
+        save(&path, &stats).unwrap();
+        assert_eq!(load(&path)["a"].last_seen, 777);
+        std::fs::write(&path, "[old]\r\nrx=5\r\n").unwrap();
+        let old = load(&path);
+        assert_eq!((old["old"].rx, old["old"].last_seen), (5, 0));
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

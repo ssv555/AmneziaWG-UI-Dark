@@ -1,0 +1,73 @@
+# Daily: are the pinned engine sources (engine/build.ps1) still the newest upstream? One issue per outdated item and version.
+# Weekly: cargo audit over Cargo.lock.
+name: Upstream
+
+on:
+  schedule:
+    - cron: '17 5 * * *'   # daily: upstream check
+    - cron: '43 5 * * 1'   # Mondays: cargo audit
+  workflow_dispatch:
+
+jobs:
+  upstream:
+    # The Monday schedule is for the audit job only; the daily one covers the upstream check.
+    if: github.event_name != 'schedule' || github.event.schedule == '17 5 * * *'
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+      contents: read
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Check pins against upstream
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          # Exit code of the script: 0 fresh, 10 outdated, anything else = the check itself failed.
+          $json = & ./engine/check-upstream.ps1 | Out-String
+          $code = $LASTEXITCODE
+          $json
+          if ($code -eq 0) { return }
+          if ($code -ne 10) { throw "upstream check failed (exit code $code)" }
+
+          $result = $json | ConvertFrom-Json
+          # Closed issues count too: closing one means "decided for this version", it must not reopen every day.
+          $known = @(gh issue list --state all --limit 500 --json title --jq '.[].title')
+          if ($LASTEXITCODE -ne 0) { throw 'gh issue list failed' }
+          foreach ($item in $result.items) {
+              $title = "Upstream update: $($item.name) $($item.latest)"
+              if ($known -ccontains $title) { "issue exists: $title"; continue }
+              $body = "Pinned in ``engine/build.ps1``: **$($item.ours)**. Latest upstream: **$($item.latest)** - $($item.url)`n`n" +
+                      "How to bump: see *Upstream updates* in ``CONTRIBUTING.md``."
+              gh issue create --title $title --body $body
+              if ($LASTEXITCODE -ne 0) { throw "gh issue create failed: $title" }
+          }
+
+  audit:
+    if: github.event_name != 'schedule' || github.event.schedule == '43 5 * * 1'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      # Fails on any vulnerability in Cargo.lock; unmaintained/yanked crates are warnings and do not fail the job.
+      - name: Audit
+        run: |
+          cargo install cargo-audit --locked
+          cargo audit

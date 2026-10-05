@@ -6,7 +6,6 @@ use std::net::{Ipv4Addr, ToSocketAddrs};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use crate::backend::Backend;
 use crate::monitor::Shared;
 
 const INTERVAL: Duration = Duration::from_secs(10);
@@ -25,6 +24,22 @@ pub struct PingState {
 }
 
 impl PingState {
+    /// Для канала ядра: вместо моментов времени — возраст замеров в секундах.
+    pub fn to_dto(&self) -> crate::daemon::proto::PingDto {
+        crate::daemon::proto::PingDto {
+            host: self.host.clone(),
+            last: self.last.clone(),
+            fails: self.fails,
+            history: self.history.iter().map(|(at, ms)| (at.elapsed().as_secs_f64(), *ms)).collect(),
+        }
+    }
+
+    pub fn from_dto(d: crate::daemon::proto::PingDto) -> PingState {
+        let now = Instant::now();
+        let history = d.history.into_iter().filter_map(|(age, ms)| now.checked_sub(Duration::from_secs_f64(age)).map(|at| (at, ms))).collect();
+        PingState { host: d.host, last: d.last, fails: d.fails, history }
+    }
+
     fn record(&mut self, host: &str, result: Result<u32, String>) {
         if self.host != host {
             *self = PingState { host: host.to_string(), ..Default::default() };
@@ -39,17 +54,17 @@ impl PingState {
 }
 
 pub fn spawn(shared: Arc<Shared>) {
-    std::thread::spawn(move || {
+    crate::crash::spawn_named("ping", move || {
         let mut next = Instant::now();
         loop {
             std::thread::sleep(Duration::from_millis(500));
             let (enabled, host) = {
-                let o = shared.options.lock().unwrap();
-                (o.ping, o.ping_host.clone())
+                let o = shared.options();
+                (o.ping, o.ping_host)
             };
-            let active = !shared.snapshot.lock().unwrap().running.is_empty();
+            let active = shared.any_running();
             if !enabled || !active {
-                *shared.ping.lock().unwrap() = PingState { host, ..Default::default() };
+                shared.update_ping(|p| *p = PingState { host, ..Default::default() });
                 next = Instant::now();
                 continue;
             }
@@ -57,13 +72,17 @@ pub fn spawn(shared: Arc<Shared>) {
                 continue;
             }
             next = Instant::now() + INTERVAL;
-            let result = match &shared.backend {
-                Backend::Demo(d) => Ok(d.ping_ms()),
-                Backend::Real(_) => resolve(&host).and_then(|ip| echo(ip, TIMEOUT_MS)),
-            };
-            shared.ping.lock().unwrap().record(&host, result);
+            // Окно с ядром не пингует само: пинг приходит от ядра (spawn для него не вызывается).
+            let Some(tunnels) = shared.host() else { continue };
+            let result = tunnels.ping_ms(&host);
+            shared.update_ping(|p| p.record(&host, result));
         }
     });
+}
+
+/// Настоящий замер: имя узла → IPv4 → эхо-запрос.
+pub(crate) fn measure(host: &str) -> Result<u32, String> {
+    resolve(host).and_then(|ip| echo(ip, TIMEOUT_MS))
 }
 
 fn resolve(host: &str) -> Result<Ipv4Addr, String> {
@@ -86,7 +105,8 @@ fn echo(ip: Ipv4Addr, timeout_ms: u32) -> Result<u32, String> {
     use windows_sys::Win32::NetworkManagement::IpHelper::{IcmpCloseHandle, IcmpCreateFile, IcmpSendEcho, ICMP_ECHO_REPLY};
 
     let payload = *b"awg-ui-ping-0123456789abcdef";
-    let mut reply = vec![0u8; size_of::<ICMP_ECHO_REPLY>() + payload.len() + 64];
+    // u64, а не u8: ответ читается как ICMP_ECHO_REPLY (в нём указатель), буфер из u8 выровнен только на 1.
+    let mut reply = vec![0u64; (size_of::<ICMP_ECHO_REPLY>() + payload.len() + 64).div_ceil(8)];
     unsafe {
         let handle = IcmpCreateFile();
         if handle == INVALID_HANDLE_VALUE {
@@ -99,7 +119,7 @@ fn echo(ip: Ipv4Addr, timeout_ms: u32) -> Result<u32, String> {
             payload.len() as u16,
             std::ptr::null(),
             reply.as_mut_ptr().cast(),
-            reply.len() as u32,
+            size_of_val(reply.as_slice()) as u32,
             timeout_ms,
         );
         let err = std::io::Error::last_os_error();

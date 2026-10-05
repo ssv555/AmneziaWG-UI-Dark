@@ -1,11 +1,14 @@
 //! Состояние туннеля по UAPI-протоколу WireGuard: именованный канал службы туннеля, запрос `get=1`.
 
+use std::collections::BTreeSet;
 use std::io::{self, BufRead, BufReader, Write};
+use std::sync::{mpsc, Mutex};
+use std::time::Duration;
 
 pub const PIPE_ROOT: &str = r"\\.\pipe\";
 pub const PIPE_PREFIX: &str = r"ProtectedPrefix\Administrators\AmneziaWG\";
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub struct Peer {
     pub public_key: String,
     pub endpoint: String,
@@ -16,7 +19,7 @@ pub struct Peer {
     pub allowed_ips: Vec<String>,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub struct Status {
     pub public_key: String,
     pub listen_port: u16,
@@ -38,7 +41,66 @@ impl Status {
     }
 }
 
+/// Дольше этого служба туннеля на UAPI не отвечает — считаем зависшей (запрос идёт раз в секунду из монитора).
+const QUERY_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Туннели, чей запрос ещё висит в рабочем потоке: новые к ним не шлём, иначе зависшая служба копила бы по потоку в секунду.
+static STUCK: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());
+
+/// Снимает имя из `STUCK`, когда рабочий поток закончил (в том числе паникой).
+struct Release(String);
+
+impl Drop for Release {
+    fn drop(&mut self) {
+        STUCK.lock().unwrap_or_else(|e| e.into_inner()).remove(&self.0);
+    }
+}
+
+/// Запуск рабочего потока; подменяется в тесте, чтобы воспроизвести отказ ОС создать поток.
+type Spawner = fn(Box<dyn FnOnce() + Send>) -> io::Result<()>;
+
+fn spawn_thread(job: Box<dyn FnOnce() + Send>) -> io::Result<()> {
+    // `thread::spawn` при нехватке ресурсов паникует, а запрос идёт из монитора ядра: паника остановила бы службу.
+    std::thread::Builder::new().name("uapi-query".into()).spawn(job).map(drop)
+}
+
+/// Блокирующее чтение канала UAPI нельзя прервать, поэтому оно идёт в потоке, а вызывающий ждёт не дольше `timeout`:
+/// зависшая служба туннеля не должна останавливать опрос всех остальных.
+/// Не удалось создать поток — это ошибка именно этого запроса (строка ошибки у туннеля), процесс живёт дальше.
+fn with_deadline(tunnel: &str, timeout: Duration, work: impl FnOnce() -> io::Result<Status> + Send + 'static) -> io::Result<Status> {
+    with_deadline_using(spawn_thread, tunnel, timeout, work)
+}
+
+fn with_deadline_using(
+    spawn: Spawner,
+    tunnel: &str,
+    timeout: Duration,
+    work: impl FnOnce() -> io::Result<Status> + Send + 'static,
+) -> io::Result<Status> {
+    if !STUCK.lock().unwrap_or_else(|e| e.into_inner()).insert(tunnel.to_string()) {
+        return Err(io::Error::new(io::ErrorKind::TimedOut, format!("UAPI {tunnel}: the previous query is still waiting for an answer")));
+    }
+    let release = Release(tunnel.to_string());
+    let (tx, rx) = mpsc::channel();
+    // При отказе spawn замыкание (а с ним `release`) уничтожается, имя снимается с `STUCK` и следующий опрос пройдёт.
+    spawn(Box::new(move || {
+        let _release = release;
+        // Получатель мог уйти по таймауту — результат тогда никому не нужен.
+        let _ = tx.send(work());
+    }))
+    .map_err(|e| io::Error::new(e.kind(), format!("UAPI {tunnel}: cannot start the query thread: {e}")))?;
+    match rx.recv_timeout(timeout) {
+        Ok(result) => result,
+        Err(_) => Err(io::Error::new(io::ErrorKind::TimedOut, format!("UAPI {tunnel}: no answer in {} s", timeout.as_secs_f32()))),
+    }
+}
+
 pub fn query(tunnel: &str) -> io::Result<Status> {
+    let name = tunnel.to_string();
+    with_deadline(tunnel, QUERY_TIMEOUT, move || query_blocking(&name))
+}
+
+fn query_blocking(tunnel: &str) -> io::Result<Status> {
     let path = format!("{PIPE_ROOT}{PIPE_PREFIX}{tunnel}");
     let mut pipe = std::fs::OpenOptions::new().read(true).write(true).open(path)?;
     pipe.write_all(b"get=1\n\n")?;
@@ -128,6 +190,47 @@ pub fn base64(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stuck_tunnel_times_out_and_is_not_queried_again_until_it_answers() {
+        let (release, hold) = mpsc::channel::<()>();
+        let started = std::time::Instant::now();
+        let err = with_deadline("t-stuck", Duration::from_millis(100), move || {
+            let _ = hold.recv();
+            Ok(Status::default())
+        })
+        .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+        assert!(started.elapsed() < Duration::from_secs(2));
+        // Пока первый запрос висит, второй не стартует (иначе по потоку в секунду).
+        let again = with_deadline("t-stuck", Duration::from_millis(100), || panic!("не должен запускаться")).unwrap_err();
+        assert!(again.to_string().contains("previous query"), "{again}");
+        // Другой туннель опрашивается как обычно.
+        assert!(with_deadline("t-other", Duration::from_secs(5), || Ok(Status::default())).is_ok());
+        // Служба ожила — имя освобождается.
+        drop(release);
+        let mut freed = false;
+        for _ in 0..100 {
+            if with_deadline("t-stuck", Duration::from_secs(5), || Ok(Status::default())).is_ok() {
+                freed = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(freed, "после ответа туннель должен опрашиваться снова");
+    }
+
+    #[test]
+    fn thread_spawn_failure_is_an_error_of_that_query_and_does_not_block_the_next() {
+        fn refuse(_: Box<dyn FnOnce() + Send>) -> io::Result<()> {
+            Err(io::Error::new(io::ErrorKind::OutOfMemory, "no threads"))
+        }
+        let err = with_deadline_using(refuse, "t-nospawn", Duration::from_secs(1), || panic!("не должен запускаться")).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::OutOfMemory);
+        assert!(err.to_string().contains("t-nospawn") && err.to_string().contains("no threads"), "{err}");
+        // Имя не осталось в STUCK: когда потоки снова создаются, туннель опрашивается как обычно.
+        assert!(with_deadline("t-nospawn", Duration::from_secs(5), || Ok(Status::default())).is_ok());
+    }
 
     const SAMPLE: &[&str] = &[
         "private_key=0000000000000000000000000000000000000000000000000000000000000000",

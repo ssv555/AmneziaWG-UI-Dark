@@ -48,10 +48,54 @@ pub fn duration(secs: f64) -> String {
     }
 }
 
-/// Местные дата и время из unix-секунд.
-pub fn local_time(unix: u64, format: &str) -> String {
+// Единственное место, где живут форматы даты и времени (правило владельца): дата везде `ГГГГ.ММ.ДД`, время `ЧЧ:ММ`,
+// секунды только там, где они есть. Формат не зависит от языка интерфейса; охранный тест `dates_only_in_fmt`
+// не пускает другие форматы в остальной код.
+const DATE: &str = "%Y.%m.%d";
+const DATE_TIME: &str = "%Y.%m.%d %H:%M";
+const DATE_TIME_SEC: &str = "%Y.%m.%d %H:%M:%S";
+const TIME_SEC: &str = "%H:%M:%S";
+/// Для имён файлов: без точек и пробелов.
+const FILE_STAMP: &str = "%Y%m%d-%H%M%S";
+/// Прежний формат строк `events.log` (до единого формата): читается, пишется уже новый.
+const LEGACY_DATE_TIME_SEC: &str = "%Y-%m-%d %H:%M:%S";
+
+/// Местные дата и время из unix-секунд; `format` — только константы этого модуля.
+fn local_time(unix: u64, format: &str) -> String {
     use chrono::TimeZone;
     chrono::Local.timestamp_opt(unix as i64, 0).single().map(|t| t.format(format).to_string()).unwrap_or_default()
+}
+
+/// `2026.10.05`.
+pub fn date(unix: u64) -> String {
+    local_time(unix, DATE)
+}
+
+/// `2026.10.05 14:07`.
+pub fn date_time(unix: u64) -> String {
+    local_time(unix, DATE_TIME)
+}
+
+/// `2026.10.05 14:07:33` — там, где секунды есть (журналы).
+pub fn date_time_sec(unix: u64) -> String {
+    local_time(unix, DATE_TIME_SEC)
+}
+
+/// `14:07:33`.
+pub fn time_sec(unix: u64) -> String {
+    local_time(unix, TIME_SEC)
+}
+
+/// `20261005-140733` — часть имени файла.
+pub fn file_stamp(unix: u64) -> String {
+    local_time(unix, FILE_STAMP)
+}
+
+/// Обратное к `date_time_sec`: unix-секунды из строки журнала. Читает и прежний формат с дефисами.
+pub fn parse_date_time_sec(text: &str) -> Option<u64> {
+    use chrono::TimeZone;
+    let naive = [DATE_TIME_SEC, LEGACY_DATE_TIME_SEC].iter().find_map(|f| chrono::NaiveDateTime::parse_from_str(text, f).ok())?;
+    chrono::Local.from_local_datetime(&naive).earliest().map(|t| t.timestamp().max(0) as u64)
 }
 
 /// Путь для показа: начало из %TEMP% или %USERPROFILE% заменено именем переменной,
@@ -95,6 +139,79 @@ mod tests {
         assert_eq!(rate(44_718.0), "43.67 KiB/s");
         assert_eq!(percent(0.345), "34.5 %");
         assert_eq!(percent(1.0), "100.0 %");
+    }
+
+    /// Форма, а не цифры: часовой пояс машины сдвигает число и час.
+    #[test]
+    fn dates_are_year_first_with_dots() {
+        let at = 1_791_209_253; // 2026-10-05 14:07:33 UTC
+        let shape = |s: &str, pattern: &str| {
+            assert_eq!(s.len(), pattern.len(), "{s}");
+            for (c, p) in s.chars().zip(pattern.chars()) {
+                assert!(if p == '9' { c.is_ascii_digit() } else { c == p }, "{s} против {pattern}");
+            }
+        };
+        shape(&date(at), "9999.99.99");
+        shape(&date_time(at), "9999.99.99 99:99");
+        shape(&date_time_sec(at), "9999.99.99 99:99:99");
+        shape(&time_sec(at), "99:99:99");
+        assert!(date(at).starts_with("2026.1"), "{}", date(at));
+        assert_eq!(date_time_sec(at)[..16], date_time(at), "минуты совпадают");
+    }
+
+    #[test]
+    fn log_time_round_trips_and_old_format_is_still_read() {
+        let at = 1_791_209_253;
+        assert_eq!(parse_date_time_sec(&date_time_sec(at)), Some(at));
+        let old = local_time(at, LEGACY_DATE_TIME_SEC);
+        assert!(old.contains('-'), "{old}");
+        assert_eq!(parse_date_time_sec(&old), Some(at), "events.log прежней версии читается");
+        assert_eq!(parse_date_time_sec("not a time"), None);
+    }
+
+    /// Правило владельца: формат даты один. Ни строк `strftime`, ни ручной сборки «число-число-число» вне этого
+    /// файла; `chrono` тоже только здесь (кроме разбора RFC 3339 в `update/feed.rs`). Иглы собраны из частей, чтобы
+    /// тест не нашёл сам себя.
+    #[test]
+    fn dates_only_in_fmt() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut files = Vec::new();
+        collect_rs(&root, &mut files);
+        assert!(files.len() > 10, "src/ not scanned: {}", root.display());
+        let chrono_path = concat!("chro", "no::");
+        let needles = [
+            concat!("%", "Y"), concat!("%", "m"), concat!("%", "d"), concat!("%", "H"), concat!("%", "M"), concat!("%", "S"),
+            concat!("%", "b"), concat!("%", "F"), concat!("%", "T"), concat!("{:02}", ".{:02}"), concat!("{:02}", "-{:02}"),
+            concat!("{:02}", ":{:02}"), concat!("{:04}", "-"), concat!("{:04}", "."), chrono_path,
+        ];
+        let own = std::path::Path::new("fmt.rs");
+        let feed = std::path::Path::new("update").join("feed.rs");
+        let mut bad = Vec::new();
+        for path in &files {
+            let rel = path.strip_prefix(&root).unwrap();
+            if rel == own {
+                continue;
+            }
+            let text = std::fs::read_to_string(path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+            for (n, line) in text.lines().enumerate() {
+                // Разбор RFC 3339 из GitHub ничего не форматирует.
+                for needle in needles.iter().filter(|x| line.contains(*x) && !(rel == feed && **x == chrono_path)) {
+                    bad.push(format!("src/{}:{}: {needle}", rel.display(), n + 1));
+                }
+            }
+        }
+        assert!(bad.is_empty(), "date formats outside fmt.rs (use fmt::date, date_time, date_time_sec, time_sec):\n{}", bad.join("\n"));
+    }
+
+    fn collect_rs(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        for entry in std::fs::read_dir(dir).unwrap_or_else(|e| panic!("{}: {e}", dir.display())) {
+            let path = entry.unwrap_or_else(|e| panic!("{}: {e}", dir.display())).path();
+            if path.is_dir() {
+                collect_rs(&path, out);
+            } else if path.extension().is_some_and(|e| e == "rs") {
+                out.push(path);
+            }
+        }
     }
 
     #[test]

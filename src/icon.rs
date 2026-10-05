@@ -34,9 +34,19 @@ pub fn rgba(size: u32) -> Vec<u8> {
     }
 }
 
-/// Иконка с точкой состояния в правом нижнем углу — значок в трее.
-pub fn rgba_with_dot(size: u32, color: Dot) -> Vec<u8> {
+/// Иконка в цвете режима: обычная (режим 1) или жёлтая (режим 2, встроенный движок) — режим виден в панели
+/// задач, трее и заголовке.
+pub fn themed(size: u32, engine: bool) -> Vec<u8> {
     let mut px = rgba(size);
+    if engine {
+        retint(&mut px, ENGINE_HUE);
+    }
+    px
+}
+
+/// Иконка с точкой состояния в правом нижнем углу — значок в трее и в панели задач.
+pub fn rgba_with_dot(size: u32, engine: bool, color: Dot) -> Vec<u8> {
+    let mut px = themed(size, engine);
     draw_dot(&mut px, size, color);
     px
 }
@@ -83,9 +93,52 @@ fn resample(src: &[u8], from: u32, to: u32) -> Vec<u8> {
     out
 }
 
+/// Оттенок иконки в режиме 2: ярко-жёлтый.
+const ENGINE_HUE: f32 = 50.0;
+
+/// Перекрасить цветные пиксели в оттенок `hue` (градусы), сохранив насыщенность и яркость; серые и тёмные
+/// (фон, обводка) не меняются.
+fn retint(px: &mut [u8], hue: f32) {
+    for p in px.chunks_exact_mut(4) {
+        let [r, g, b] = [p[0], p[1], p[2]].map(|v| v as f32 / 255.0);
+        let max = r.max(g).max(b);
+        let min = r.min(g).min(b);
+        if max <= 0.0 || (max - min) / max < 0.2 {
+            continue;
+        }
+        let c = max - min;
+        let h = hue / 60.0;
+        let x = c * (1.0 - (h % 2.0 - 1.0).abs());
+        let (r1, g1, b1) = match h as u32 {
+            0 => (c, x, 0.0),
+            1 => (x, c, 0.0),
+            2 => (0.0, c, x),
+            3 => (0.0, x, c),
+            4 => (x, 0.0, c),
+            _ => (c, 0.0, x),
+        };
+        for (i, v) in [r1, g1, b1].into_iter().enumerate() {
+            p[i] = ((v + min) * 255.0).round().clamp(0.0, 255.0) as u8;
+        }
+    }
+}
+
+/// Одна точка состояния во весь квадрат `size`×`size` на прозрачном фоне — значок поверх кнопки окна в панели
+/// задач (overlay).
+pub fn dot_icon(size: u32, color: Dot) -> Vec<u8> {
+    let mut px = vec![0; (size * size * 4) as usize];
+    draw_circle(&mut px, size, size, color);
+    px
+}
+
 /// Кружок с обводкой в правом нижнем углу; меняет только пиксели внутри квадрата кружка.
 fn draw_dot(px: &mut [u8], size: u32, color: Dot) {
     let diameter = ((size as f32 * 0.46).round() as u32).max(6).min(size);
+    draw_circle(px, size, diameter, color);
+}
+
+/// Кружок диаметра `diameter` с тёмной обводкой, вписанный в правый нижний угол картинки `size`×`size`.
+fn draw_circle(px: &mut [u8], size: u32, diameter: u32, color: Dot) {
     let r = diameter as f32 / 2.0;
     let c = size as f32 - r; // центр кружка
     let first = (size - diameter) as usize;
@@ -140,7 +193,7 @@ mod tests {
     fn dot_changes_only_bottom_right_corner() {
         for size in [16, 24, 32] {
             let base = rgba(size);
-            let with = rgba_with_dot(size, GREEN);
+            let with = rgba_with_dot(size, false, GREEN);
             let diameter = ((size as f32 * 0.46).round() as u32).max(6);
             let first = size - diameter;
             let mut changed = 0;
@@ -160,12 +213,42 @@ mod tests {
     }
 
     #[test]
+    fn dot_icon_is_colored_center_with_transparent_corners() {
+        for size in [16, 20, 24, 32] {
+            let px = dot_icon(size, RED);
+            assert_eq!(px.len(), (size * size * 4) as usize, "{size}: длина");
+            let at = |x: u32, y: u32| &px[((y * size + x) * 4) as usize..][..4];
+            assert_eq!(at(size / 2, size / 2), &[RED[0], RED[1], RED[2], 255], "{size}: центр — цвет состояния");
+            for (x, y) in [(0, 0), (size - 1, 0), (0, size - 1), (size - 1, size - 1)] {
+                assert_eq!(at(x, y)[3], 0, "{size}: угол ({x}, {y}) прозрачный");
+            }
+            let edge = at(size / 2, 0);
+            assert!(edge[3] > 0 && edge[..3] != RED[..], "{size}: у края — тёмная обводка, а не заливка: {edge:?}");
+        }
+    }
+
+    #[test]
     fn dot_colors_differ() {
-        let all = [GRAY, GREEN, YELLOW, RED].map(|c| rgba_with_dot(16, c));
+        let all = [GRAY, GREEN, YELLOW, RED].map(|c| rgba_with_dot(16, false, c));
         for i in 0..4 {
             for j in i + 1..4 {
                 assert_ne!(all[i], all[j]);
             }
         }
+    }
+
+    #[test]
+    fn engine_icon_is_yellow_and_keeps_shape() {
+        let (base, yellow) = (rgba(64), themed(64, true));
+        assert_eq!(themed(64, false), base, "режим 1 — иконка без изменений");
+        let mut tinted = 0;
+        for (a, b) in base.chunks_exact(4).zip(yellow.chunks_exact(4)) {
+            assert_eq!(a[3], b[3], "прозрачность не меняется");
+            if a != b {
+                tinted += 1;
+                assert!(b[0] >= b[2] && b[1] >= b[2], "перекрашенный пиксель жёлтый: {b:?}");
+            }
+        }
+        assert!(tinted > 100, "розовые пиксели перекрашены: {tinted}");
     }
 }

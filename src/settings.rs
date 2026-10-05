@@ -2,6 +2,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use crate::groups::TunnelBook;
 use crate::ini::Ini;
 
 pub const DEFAULT_PING_HOST: &str = "1.1.1.1";
@@ -16,6 +17,91 @@ pub struct WindowRect {
     pub y: f32,
     pub width: f32,
     pub height: f32,
+}
+
+/// Режим работы программы.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize)]
+pub enum Mode {
+    /// Надстройка над установленным AmneziaWG (по умолчанию).
+    Overlay,
+    /// Встроенный движок: свои службы туннелей и своё хранилище конфигов.
+    Engine,
+}
+
+impl Mode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Mode::Overlay => "overlay",
+            Mode::Engine => "engine",
+        }
+    }
+
+    fn parse(s: &str) -> Option<Mode> {
+        [Mode::Overlay, Mode::Engine].into_iter().find(|m| m.as_str() == s)
+    }
+}
+
+/// Диалог с «Больше не показывать». Имя в `[hidden_dialogs]` — `ini_name`, оно записано в файлах пользователей и
+/// от переводов не зависит: переименование ключа в `i18n` не должно сбрасывать запомненный выбор.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+pub enum DialogId {
+    /// Справка о режиме 1.
+    ModeOverlay,
+    /// Справка о режиме 2.
+    ModeEngine,
+    /// Выход: оставить туннели подключёнными.
+    ExitKeep,
+    /// Выход: отключить туннели.
+    ExitDisconnect,
+}
+
+impl DialogId {
+    const ALL: [DialogId; 4] = [DialogId::ModeOverlay, DialogId::ModeEngine, DialogId::ExitKeep, DialogId::ExitDisconnect];
+
+    /// Имя в INI. Не менять: файлы прежних версий хранят именно эти строки.
+    pub fn ini_name(self) -> &'static str {
+        match self {
+            DialogId::ModeOverlay => "mode.overlay",
+            DialogId::ModeEngine => "mode.engine",
+            DialogId::ExitKeep => "exit.keep",
+            DialogId::ExitDisconnect => "exit.disconnect",
+        }
+    }
+
+    fn parse(name: &str) -> Option<DialogId> {
+        DialogId::ALL.into_iter().find(|d| d.ini_name() == name)
+    }
+
+    /// Справка о переходе в этот режим.
+    pub fn mode_help(mode: Mode) -> DialogId {
+        match mode {
+            Mode::Overlay => DialogId::ModeOverlay,
+            Mode::Engine => DialogId::ModeEngine,
+        }
+    }
+}
+
+/// Ключи `[state]` для выбранного туннеля: (текущего режима, другого режима).
+fn selected_keys(mode: Mode) -> (&'static str, &'static str) {
+    match mode {
+        Mode::Overlay => ("selected", "engine_selected"),
+        Mode::Engine => ("engine_selected", "selected"),
+    }
+}
+
+impl Settings {
+    /// Текущий режим. Меняется только через `switch_mode`: вместе с ним меняется и выбранный туннель.
+    pub fn mode(&self) -> Mode {
+        self.mode
+    }
+
+    /// Перейти в другой режим: выбранный туннель меняется местами с запомненным для того режима.
+    pub fn switch_mode(&mut self, to: Mode) {
+        if self.mode != to {
+            self.mode = to;
+            self.book.swap_mode_selection();
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -112,20 +198,19 @@ pub struct Settings {
     /// Точка состояния на значке окна (панель задач, заголовок).
     pub taskbar: bool,
     pub close_to_tray: bool,
+    /// Режим работы; меняется только с перезапуском программы, и только через `switch_mode`.
+    mode: Mode,
     pub ping_host: String,
     /// Код языка ISO 639-2 (eng, rus, …).
     pub language: String,
     /// Папка журнала событий; относительная — от папки программы.
     pub log_dir: String,
-    pub selected: Option<String>,
-    /// Полные пути групп через «/» («Europe/Amsterdam»); порядок — порядок среди соседей (см. `groups.rs`).
-    pub groups: Vec<String>,
-    /// Свёрнутые группы (пути).
-    pub collapsed: BTreeSet<String>,
-    /// туннель → путь группы
-    pub assignment: BTreeMap<String, String>,
-    /// туннель → незашифрованный .conf-источник пользователя
-    pub sources: BTreeMap<String, String>,
+    /// Группы, назначения, источники и выбор туннеля (по режимам) — см. `groups.rs`.
+    pub book: TunnelBook,
+    /// Диалоги, отмеченные «Больше не показывать».
+    pub hidden_dialogs: BTreeSet<DialogId>,
+    /// О каких версиях обновлений уже сообщали окном: ключ компонента → версия. Новая версия сообщается снова.
+    pub update_notified: BTreeMap<String, String>,
 }
 
 impl Default for Settings {
@@ -147,14 +232,13 @@ impl Default for Settings {
             notify: true,
             taskbar: true,
             close_to_tray: true,
+            mode: Mode::Overlay,
             ping_host: DEFAULT_PING_HOST.to_string(),
             language: crate::i18n::DEFAULT.to_string(),
             log_dir: DEFAULT_LOG_DIR.to_string(),
-            selected: None,
-            groups: Vec::new(),
-            collapsed: BTreeSet::new(),
-            assignment: BTreeMap::new(),
-            sources: BTreeMap::new(),
+            book: TunnelBook::default(),
+            hidden_dialogs: BTreeSet::new(),
+            update_notified: BTreeMap::new(),
         }
     }
 }
@@ -163,6 +247,7 @@ impl Settings {
     pub fn from_ini(ini: &Ini) -> Settings {
         let d = Settings::default();
         let v = View::default();
+        let mode = ini.get("options", "mode").and_then(Mode::parse).unwrap_or(d.mode);
         let window = match (ini.get("window", "x"), ini.get("window", "width")) {
             (Some(_), Some(_)) => Some(WindowRect {
                 x: ini.get_or("window", "x", 0.0),
@@ -208,15 +293,23 @@ impl Settings {
             notify: ini.get_bool("options", "notify", d.notify),
             taskbar: ini.get_bool("options", "taskbar_state", d.taskbar),
             close_to_tray: ini.get_bool("options", "close_to_tray", d.close_to_tray),
+            mode,
             ping_host: ini.get("options", "ping_host").filter(|h| !h.is_empty()).unwrap_or(DEFAULT_PING_HOST).to_string(),
             language: ini.get("options", "language").filter(|c| crate::i18n::is_code(c)).unwrap_or(crate::i18n::DEFAULT).to_string(),
             log_dir: ini.get("options", "log_dir").filter(|d| !d.is_empty()).unwrap_or(DEFAULT_LOG_DIR).to_string(),
-            selected: ini.get("state", "selected").filter(|s| !s.is_empty()).map(str::to_string),
-            // Полные пути через «/»; плоские имена прежних версий — группы верхнего уровня.
-            groups: crate::groups::normalize(&list("groups")),
-            collapsed: list("collapsed").into_iter().collect(),
-            assignment: ini.section("assign").iter().cloned().collect(),
-            sources: ini.section("sources").iter().cloned().collect(),
+            // Полные пути групп через «/»; плоские имена прежних версий — группы верхнего уровня (`from_stored`).
+            book: TunnelBook::from_stored(
+                &list("groups"),
+                list("collapsed").into_iter().collect(),
+                ini.section("assign").iter().cloned().collect(),
+                ini.section("sources").iter().cloned().collect(),
+                ini.get("state", selected_keys(mode).0).filter(|s| !s.is_empty()).map(str::to_string),
+                ini.get("state", selected_keys(mode).1).filter(|s| !s.is_empty()).map(str::to_string),
+            ),
+            // Неизвестное имя (файл новой версии) отбрасывается: показать диалог лишний раз безопаснее, чем держать
+            // выбор, смысл которого эта версия не знает.
+            hidden_dialogs: list("hidden_dialogs").iter().filter_map(|n| DialogId::parse(n)).collect(),
+            update_notified: ini.section("update_notified").iter().cloned().collect(),
         }
     }
 
@@ -262,20 +355,29 @@ impl Settings {
         ini.set_bool("options", "notify", self.notify);
         ini.set_bool("options", "taskbar_state", self.taskbar);
         ini.set_bool("options", "close_to_tray", self.close_to_tray);
+        ini.set("options", "mode", self.mode.as_str());
         ini.set("options", "ping_host", &self.ping_host);
         ini.set("options", "language", &self.language);
         ini.set("options", "log_dir", &self.log_dir);
-        ini.set("state", "selected", self.selected.as_deref().unwrap_or(""));
-        for (i, g) in self.groups.iter().enumerate() {
+        let (mine, other) = selected_keys(self.mode);
+        ini.set("state", mine, self.book.tunnel().unwrap_or(""));
+        ini.set("state", other, self.book.other_tunnel().unwrap_or(""));
+        for (i, g) in self.book.groups().iter().enumerate() {
             ini.set("groups", &(i + 1).to_string(), g);
         }
-        for (i, g) in self.collapsed.iter().enumerate() {
+        for (i, g) in self.book.collapsed().enumerate() {
             ini.set("collapsed", &(i + 1).to_string(), g);
         }
-        for (tunnel, group) in &self.assignment {
+        for (i, d) in self.hidden_dialogs.iter().enumerate() {
+            ini.set("hidden_dialogs", &(i + 1).to_string(), d.ini_name());
+        }
+        for (component, version) in &self.update_notified {
+            ini.set("update_notified", component, version);
+        }
+        for (tunnel, group) in self.book.assignments() {
             ini.set("assign", tunnel, group);
         }
-        for (tunnel, path) in &self.sources {
+        for (tunnel, path) in self.book.sources() {
             ini.set("sources", tunnel, path);
         }
         ini
@@ -286,10 +388,22 @@ impl Settings {
 mod tests {
     use super::*;
 
+    fn strs(items: &[&str]) -> Vec<String> {
+        items.iter().map(|x| x.to_string()).collect()
+    }
+
+    fn pairs(items: &[(&str, &str)]) -> BTreeMap<String, String> {
+        items.iter().map(|(a, b)| (a.to_string(), b.to_string())).collect()
+    }
+
+    fn reload(settings: &Settings) -> Settings {
+        Settings::from_ini(&Ini::parse(&settings.to_ini().to_text()))
+    }
+
     #[test]
     fn default_roundtrip() {
         let s = Settings::default();
-        assert_eq!(Settings::from_ini(&Ini::parse(&s.to_ini().to_text())), s);
+        assert_eq!(reload(&s), s);
     }
 
     #[test]
@@ -306,24 +420,117 @@ mod tests {
         s.ping_host = "8.8.8.8".into();
         s.language = "deu".into();
         s.log_dir = r"D:\logs".into();
-        s.selected = Some("home.nl-ams.full".into());
-        s.groups = vec!["Home".into(), "Office".into()];
-        s.collapsed.insert("Office".into());
-        s.assignment.insert("home.nl-ams.full".into(), "Home".into());
-        s.sources.insert("home.nl-ams.full".into(), r"D:\vpn\home.nl-ams.full.conf".into());
-        assert_eq!(Settings::from_ini(&Ini::parse(&s.to_ini().to_text())), s);
+        s.book = TunnelBook::from_stored(
+            &strs(&["Home", "Office"]),
+            ["Office".to_string()].into(),
+            pairs(&[("home.nl-ams.full", "Home")]),
+            pairs(&[("home.nl-ams.full", r"D:\vpn\home.nl-ams.full.conf")]),
+            Some("home.nl-ams.full".into()),
+            Some("lab.sg.v4".into()),
+        );
+        s.hidden_dialogs.insert(DialogId::ModeEngine);
+        s.update_notified.insert("app".into(), "0.4.0".into());
+        s.update_notified.insert("native".into(), "1.2.3".into());
+        assert_eq!(reload(&s), s);
+    }
+
+    #[test]
+    fn selection_is_kept_per_mode() {
+        let mut s = Settings::default();
+        s.book.select_tunnel("native-a");
+        s.switch_mode(Mode::Engine);
+        assert_eq!(s.book.tunnel(), None, "в режиме 2 своих туннелей ещё не выбирали");
+        s.book.select_tunnel("own-b");
+        let mut back = reload(&s);
+        assert_eq!((back.mode(), back.book.tunnel()), (Mode::Engine, Some("own-b")));
+        back.switch_mode(Mode::Overlay);
+        assert_eq!(back.book.tunnel(), Some("native-a"), "выбор режима 1 вернулся");
+    }
+
+    #[test]
+    fn remembered_dialogs_keep_their_ini_names() {
+        // Файл прежней версии: значения — прежние ключи; лишнее имя не мешает загрузке остального.
+        let old = Settings::from_ini(&Ini::parse("[hidden_dialogs]
+1=exit.keep
+2=mode.engine
+3=from.the.future
+"));
+        assert_eq!(old.hidden_dialogs, BTreeSet::from([DialogId::ExitKeep, DialogId::ModeEngine]));
+        let out = old.to_ini();
+        let mut names: Vec<String> = out.section("hidden_dialogs").iter().map(|(_, v)| v.clone()).collect();
+        names.sort();
+        assert_eq!(names, ["exit.keep", "mode.engine"]);
+        // Имена закреплены: это формат файла, а не ключи перевода.
+        let all: Vec<_> = DialogId::ALL.iter().map(|d| d.ini_name()).collect();
+        assert_eq!(all, ["mode.overlay", "mode.engine", "exit.keep", "exit.disconnect"]);
+        assert_eq!(DialogId::mode_help(Mode::Engine), DialogId::ModeEngine);
     }
 
     #[test]
     fn nested_groups_roundtrip_and_flat_compat() {
         let mut s = Settings::default();
-        s.groups = vec!["Europe".into(), "Europe/Netherlands".into(), "Lab".into()];
-        s.collapsed.insert("Europe/Netherlands".into());
-        s.assignment.insert("nl".into(), "Europe/Netherlands".into());
-        assert_eq!(Settings::from_ini(&Ini::parse(&s.to_ini().to_text())), s);
+        s.book = TunnelBook::from_stored(
+            &strs(&["Europe", "Europe/Netherlands", "Lab"]),
+            ["Europe/Netherlands".to_string()].into(),
+            pairs(&[("nl", "Europe/Netherlands")]),
+            BTreeMap::new(),
+            None,
+            None,
+        );
+        assert_eq!(reload(&s), s);
         // Файл прежней версии с плоскими именами и файл, где предок не записан.
         let old = Settings::from_ini(&Ini::parse("[groups]\n1=Home\n2=Office\n3=Travel/Nordics\n[assign]\nt=Home\n"));
-        assert_eq!(old.groups, ["Home", "Office", "Travel", "Travel/Nordics"]);
-        assert_eq!(old.assignment["t"], "Home");
+        assert_eq!(old.book.groups(), ["Home", "Office", "Travel", "Travel/Nordics"]);
+        assert_eq!(old.book.group_of("t"), Some("Home"));
+    }
+
+    /// Файл, записанный прежней версией (до `TunnelBook`): грузится так же и пишется теми же секциями и ключами.
+    const SAMPLE: &str = r"[options]
+mode=engine
+[state]
+engine_selected=own-b
+selected=native-a
+[groups]
+1=Europe
+2=Europe/Netherlands
+3=Lab
+[collapsed]
+1=Europe/Netherlands
+[assign]
+nl=Europe/Netherlands
+lost=Gone
+own-b=Lab
+[sources]
+nl=D:\vpn\nl.conf
+";
+
+    #[test]
+    fn sample_ini_loads_identically_and_rewrites_the_same_sections() {
+        let loaded = Settings::from_ini(&Ini::parse(SAMPLE));
+        let b = &loaded.book;
+        assert_eq!(loaded.mode(), Mode::Engine);
+        // В режиме 2 текущий выбор — engine_selected, а `selected` — запомненный выбор режима 1.
+        assert_eq!((b.tunnel(), b.other_tunnel()), (Some("own-b"), Some("native-a")));
+        assert_eq!(b.groups(), ["Europe", "Europe/Netherlands", "Lab"]);
+        assert_eq!(b.collapsed().collect::<Vec<_>>(), ["Europe/Netherlands"]);
+        assert_eq!(b.group_of("nl"), Some("Europe/Netherlands"));
+        assert_eq!(b.group_of("own-b"), Some("Lab"));
+        assert_eq!(b.group_of("lost"), None, "группы нет — туннель «Без группы»");
+        assert_eq!(b.source("nl"), Some(r"D:\vpn\nl.conf"));
+
+        // Запись: те же секции и ключи; назначение в исчезнувшую группу не теряется молча.
+        let out = loaded.to_ini();
+        for (section, expected) in [
+            ("groups", vec![("1", "Europe"), ("2", "Europe/Netherlands"), ("3", "Lab")]),
+            ("collapsed", vec![("1", "Europe/Netherlands")]),
+            ("assign", vec![("lost", "Gone"), ("nl", "Europe/Netherlands"), ("own-b", "Lab")]),
+            ("sources", vec![("nl", r"D:\vpn\nl.conf")]),
+            ("state", vec![("engine_selected", "own-b"), ("selected", "native-a")]),
+        ] {
+            let mut got: Vec<(&str, &str)> = out.section(section).iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+            got.sort();
+            assert_eq!(got, expected, "[{section}]");
+        }
+        assert_eq!(reload(&loaded), loaded);
     }
 }

@@ -1,9 +1,11 @@
 //! Сведения о туннеле для показа, когда он не подключён: из файла-источника (.conf) или из родного окна.
 //! Приватный ключ не хранится: из него сразу вычисляется открытый.
 
+use std::collections::BTreeSet;
+
 use crate::uapi;
 
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct PeerInfo {
     pub public_key: String,
     pub preshared: bool,
@@ -12,7 +14,7 @@ pub struct PeerInfo {
     pub keepalive: String,
 }
 
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct TunnelInfo {
     pub public_key: String,
     pub listen_port: String,
@@ -81,6 +83,56 @@ pub fn parse(text: &str) -> TunnelInfo {
     info
 }
 
+
+/// Что туннель занимает в системе: адреса интерфейса и маршрут «весь трафик» (по семействам адресов).
+/// Два туннеля с общим адресом или оба на весь трафик одного семейства вместе не работают.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Footprint {
+    pub addresses: BTreeSet<String>,
+    pub all_v4: bool,
+    pub all_v6: bool,
+}
+
+impl Footprint {
+    pub fn of(info: &TunnelInfo) -> Self {
+        let mut f = Self::routes(info.peers.iter().flat_map(|p| &p.allowed_ips));
+        f.addresses = info.addresses.iter().map(|a| host(a)).collect();
+        f
+    }
+
+    /// Только маршруты — у работающего туннеля их видно по каналу состояния, адреса интерфейса — нет.
+    pub fn of_status(st: &uapi::Status) -> Self {
+        Self::routes(st.peers.iter().flat_map(|p| &p.allowed_ips))
+    }
+
+    fn routes<'a>(ips: impl Iterator<Item = &'a String>) -> Self {
+        let mut f = Self::default();
+        for ip in ips {
+            match ip.replace(' ', "").as_str() {
+                "0.0.0.0/0" => f.all_v4 = true,
+                "::/0" => f.all_v6 = true,
+                _ => {}
+            }
+        }
+        f
+    }
+
+    pub fn merge(&mut self, other: Self) {
+        self.addresses.extend(other.addresses);
+        self.all_v4 |= other.all_v4;
+        self.all_v6 |= other.all_v6;
+    }
+
+    pub fn conflicts(&self, other: &Self) -> bool {
+        (self.all_v4 && other.all_v4) || (self.all_v6 && other.all_v6) || !self.addresses.is_disjoint(&other.addresses)
+    }
+}
+
+/// Адрес без длины префикса: `10.0.0.2/32` → `10.0.0.2`.
+fn host(address: &str) -> String {
+    address.split('/').next().unwrap_or("").trim().to_ascii_lowercase()
+}
+
 fn base64_decode(s: &str) -> Option<Vec<u8>> {
     const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut bits = 0u32;
@@ -137,5 +189,19 @@ mod tests {
     fn base64_roundtrip() {
         let bytes: Vec<u8> = (0..32).collect();
         assert_eq!(base64_decode(&uapi::base64(&bytes)), Some(bytes));
+    }
+
+    fn conf(address: &str, allowed: &str) -> Footprint {
+        Footprint::of(&parse(&format!("[Interface]\nAddress = {address}\n[Peer]\nAllowedIPs = {allowed}\n")))
+    }
+
+    #[test]
+    fn same_address_or_both_full_route_conflict() {
+        // Типичный случай: два варианта одного клиента — общий адрес и оба на весь трафик.
+        assert!(conf("10.255.254.2/32", "0.0.0.0/0").conflicts(&conf("10.255.254.2/32", "0.0.0.0/0")));
+        assert!(conf("10.0.0.2/32", "10.0.0.0/24").conflicts(&conf("10.0.0.2/24", "192.168.5.0/24")), "общий адрес");
+        assert!(conf("10.0.0.2/32", "0.0.0.0/0").conflicts(&conf("10.1.0.2/32", "0.0.0.0/0")), "оба на весь IPv4");
+        assert!(!conf("10.0.0.2/32", "0.0.0.0/0").conflicts(&conf("10.1.0.2/32", "::/0")), "разные семейства");
+        assert!(!conf("10.0.0.2/32", "10.0.0.0/24").conflicts(&conf("10.1.0.2/32", "10.1.0.0/24")), "независимые сети");
     }
 }
