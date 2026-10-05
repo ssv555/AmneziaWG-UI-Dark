@@ -49,7 +49,7 @@ windows-sys = { version = "0.59", features = [
     "Win32_UI_WindowsAndMessaging",
 ] }
 # UI Automation (COM) — управление родным окном AmneziaWG; та же версия, что уже тянет wgpu.
-windows = { version = "0.58", features = [
+windows = { version = "0.62", features = [
     "Win32_Foundation",
     "Win32_Storage_EnhancedStorage",
     "Win32_System_Com",
