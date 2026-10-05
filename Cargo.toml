@@ -7,7 +7,7 @@ description = "Окно управления туннелями AmneziaWG пов
 [dependencies]
 eframe = { version = "0.31", default-features = false, features = ["wgpu", "default_fonts"] }
 # Версия — та же, что у egui-wgpu; без этого в сборку на Windows попадает только GL.
-wgpu = { version = "24", default-features = false, features = ["dx12"] }
+wgpu = { version = "30", default-features = false, features = ["dx12"] }
 raw-window-handle = "0.6"
 x25519-dalek = { version = "2", features = ["static_secrets"] }
 png = "0.17"
