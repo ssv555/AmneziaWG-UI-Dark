@@ -5,7 +5,7 @@ edition = "2021"
 description = "Окно управления туннелями AmneziaWG поверх штатного amneziawg.exe"
 
 [dependencies]
-eframe = { version = "0.31", default-features = false, features = ["wgpu", "default_fonts"] }
+eframe = { version = "0.36", default-features = false, features = ["wgpu", "default_fonts"] }
 # Версия — та же, что у egui-wgpu; без этого в сборку на Windows попадает только GL.
 wgpu = { version = "24", default-features = false, features = ["dx12"] }
 raw-window-handle = "0.6"
