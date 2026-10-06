@@ -1,12 +1,13 @@
 [package]
 name = "awg-ui"
-version = "0.5.0"
+version = "0.5.1"
 edition = "2021"
 description = "Окно управления туннелями AmneziaWG поверх штатного amneziawg.exe"
 
 [dependencies]
 # "links": с eframe 0.36 ссылки (окно «О программе», заметки к выпуску) открываются в браузере только с этой фичей.
-eframe = { version = "0.36", default-features = false, features = ["wgpu_no_default_features", "default_fonts", "links"] }
+# "accesskit": дерево доступности egui уходит в UI Automation Windows — без неё Narrator и NVDA видят пустое окно.
+eframe = { version = "0.36", default-features = false, features = ["wgpu_no_default_features", "default_fonts", "links", "accesskit"] }
 # Версия — та же, что у egui-wgpu. Бэкенд wgpu выбираем сами — только DX12: фича eframe "wgpu" с 0.34 включает
 # все бэкенды wgpu по умолчанию (Vulkan, GL, Metal), поэтому у eframe фича без них, а DX12 включает эта строка.
 wgpu = { version = "30", default-features = false, features = ["dx12"] }

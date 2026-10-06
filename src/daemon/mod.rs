@@ -5,6 +5,7 @@
 pub mod agent;
 pub(crate) mod agent_watch;
 pub(crate) mod budget;
+mod deadwatch;
 pub mod helper;
 pub mod install;
 pub mod pipe;
@@ -328,6 +329,7 @@ mod tests {
         let core_path = [
             ("server.rs", code_of(include_str!("server.rs")), true),
             ("retry.rs", code_of(include_str!("retry.rs")), true),
+            ("deadwatch.rs", code_of(include_str!("deadwatch.rs")), true),
             ("restore.rs", code_of(include_str!("restore.rs")), true),
             ("agent_watch.rs", code_of(include_str!("agent_watch.rs")), true),
             ("netwatch.rs", code_of(include_str!("netwatch.rs")), true),

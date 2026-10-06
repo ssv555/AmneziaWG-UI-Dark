@@ -1,7 +1,7 @@
 //! Таблица туннелей: колонки, заголовок, клавиатура и сама прокручиваемая область.
 //! Отрисовка строк (группа, туннель, перетаскивание) — в `rows`.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use eframe::egui::{self, Align2, FontId, Pos2, Rect, RichText, Sense, Stroke, Ui, Vec2};
 
@@ -9,9 +9,9 @@ use crate::daemon::proto::Plan;
 use crate::fmt;
 use crate::groups::{self, Row, UNGROUPED};
 use crate::health::{Health, Level};
-use crate::i18n::tr;
+use crate::i18n::{tr, trf};
 use crate::monitor::Snapshot;
-use crate::settings::{Mode, Settings, SortKey};
+use crate::settings::{DialogId, Mode, Settings, SortKey};
 use crate::stats::{self, Stats, TunnelStats};
 
 mod rows;
@@ -214,12 +214,6 @@ pub(super) fn tunnel_list(ui: &mut Ui, s: &mut Settings, search: &mut String, l:
     drag_preview(ui.ctx());
 }
 
-/// Что делает «активация» строки (двойной клик, Enter): только подключает. Отключение — кнопкой или пунктом меню:
-/// промах двойным кликом или Enter по подключённому туннелю иначе роняет VPN и пускает трафик в открытую сеть.
-fn activation_plan(level: Level) -> Option<Plan> {
-    (level == Level::Off).then_some(Plan::Connect)
-}
-
 /// Главное действие с туннелем — одно решение для кнопки карточки, меню строки таблицы и меню трея. Карточка
 /// раньше решала сама, по живому интерфейсу: туннель, который ядро переподключает (интерфейса нет, ядро повторяет),
 /// там был «Подключить», а в меню — «Отключить».
@@ -275,6 +269,35 @@ impl Primary {
             "act.connect"
         }
     }
+
+    /// Что делает «активация» строки (двойной клик, Enter): только подключает. Отключение — кнопкой, пунктом меню
+    /// или из трея: промах двойным кликом или Enter по подключённому туннелю иначе роняет VPN и пускает трафик в
+    /// открытую сеть. Неизвестное состояние (нет связи с ядром) не активируется, как и серая кнопка.
+    pub(super) fn activation(self) -> Option<Plan> {
+        self.plan().filter(|p| *p == Plan::Connect)
+    }
+
+    /// Подсказка к «Подключить»: какие туннели подключение снимет. Без «несколько сразу» ядро отключает все остальные
+    /// работающие (`to_replace` в ядре) — их окно знает из снимка и называет. С «несколько сразу» ядро снимает только
+    /// конфликтующие по адресам и маршрутам; сравнивает оно конфиги, которых у окна нет, — тогда общая подсказка.
+    pub(super) fn connect_hint(self, name: &str, multiple: bool, snap: &Snapshot) -> Option<String> {
+        if self != Primary::Connect {
+            return None;
+        }
+        let others: Vec<&str> = snap.running.keys().map(String::as_str).filter(|t| *t != name).collect();
+        match (others.is_empty(), multiple) {
+            (true, _) => None,
+            (false, false) => Some(trf("act.connect_replaces", &[&others.join(", ")])),
+            (false, true) => Some(tr("act.connect_conflicts")),
+        }
+    }
+}
+
+/// Спросить подтверждение до запроса ядру. Отключение рвёт VPN — по кнопке, меню строки и трея сначала вопрос,
+/// пока пользователь не ответил «Больше не спрашивать» (`DialogId::Disconnect`; «Снова показывать скрытые диалоги»
+/// возвращает вопрос). Одно решение для окна и трея.
+pub(super) fn asks_first(plan: Plan, hidden: &BTreeSet<DialogId>) -> bool {
+    plan == Plan::Disconnect && !hidden.contains(&DialogId::Disconnect)
 }
 
 /// Клавиши на выделенной строке: ↑/↓ — соседняя строка, ←/→ — свернуть/раскрыть или к родителю,
@@ -334,7 +357,7 @@ fn list_keys(ui: &Ui, rows: &[Row], s: &Settings, l: &List, actions: &mut Vec<Ac
         }
         Row::Tunnel { name, group, .. } => {
             let level = l.healths.get(name).map_or(Level::Off, |h| h.level);
-            if let Some(plan) = activation_plan(level).filter(|_| enter) {
+            if let Some(plan) = Primary::of(level, l.snap.core_lost).activation().filter(|_| enter) {
                 actions.push(Action::Switch(name.clone(), plan));
             }
             if delete {
@@ -394,10 +417,41 @@ mod tests {
 
     #[test]
     fn activation_only_connects() {
-        assert_eq!(activation_plan(Level::Off), Some(Plan::Connect));
+        assert_eq!(Primary::of(Level::Off, false).activation(), Some(Plan::Connect));
         for running in [Level::Ok, Level::Warn, Level::Bad, Level::Busy] {
-            assert_eq!(activation_plan(running), None, "{running:?}");
+            assert_eq!(Primary::of(running, false).activation(), None, "{running:?}: двойной клик и Enter не отключают");
         }
+        // Нет связи с ядром: «отключён» в снимке ничего не значит — как и серая кнопка, активация ничего не шлёт.
+        assert_eq!(Primary::of(Level::Off, true).activation(), None);
+    }
+
+    #[test]
+    fn disconnect_asks_until_the_answer_is_remembered() {
+        let none = BTreeSet::new();
+        assert!(asks_first(Plan::Disconnect, &none));
+        assert!(!asks_first(Plan::Connect, &none));
+        assert!(!asks_first(Plan::Reconnect, &none), "переподключение VPN не оставляет выключенным");
+        assert!(!asks_first(Plan::Disconnect, &BTreeSet::from([DialogId::Disconnect])), "«Больше не спрашивать»");
+        assert!(asks_first(Plan::Disconnect, &BTreeSet::from([DialogId::ExitKeep])), "чужой скрытый диалог не в счёт");
+    }
+
+    fn running(names: &[&str]) -> Snapshot {
+        let live = |t: &&str| (t.to_string(), crate::monitor::Live::default());
+        Snapshot { tunnels: names.iter().map(|t| t.to_string()).collect(), running: names.iter().map(live).collect(), polls: 1, ..Default::default() }
+    }
+
+    #[test]
+    fn connect_hint_names_the_tunnels_the_core_will_drop() {
+        let snap = running(&["home", "office"]);
+        let connect = Primary::Connect;
+        assert_eq!(connect.connect_hint("lab", false, &snap), Some(trf("act.connect_replaces", &["home, office"])));
+        // С «несколько сразу» ядро снимает только конфликтующие — окно их не знает, подсказка общая.
+        assert_eq!(connect.connect_hint("lab", true, &snap), Some(tr("act.connect_conflicts")));
+        // Сам туннель в список не входит; других подключённых нет — подсказки нет.
+        assert_eq!(connect.connect_hint("home", false, &running(&["home"])), None);
+        assert_eq!(connect.connect_hint("lab", false, &running(&[])), None);
+        // Подсказка — только к «Подключить».
+        assert_eq!(Primary::Disconnect.connect_hint("home", false, &snap), None);
     }
 
     #[test]

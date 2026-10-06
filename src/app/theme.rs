@@ -8,6 +8,8 @@ use eframe::egui::{self, Color32, FontId, RichText, Sense, Ui, Vec2};
 use crate::events::Severity;
 use crate::health::Level;
 
+use super::a11y::{self, Painted};
+
 pub(super) const NUM_FONT: f32 = 13.5;
 pub(super) const GREEN: Color32 = Color32::from_rgb(90, 200, 120);
 pub(super) const YELLOW: Color32 = Color32::from_rgb(230, 185, 70);
@@ -35,9 +37,11 @@ pub(super) fn severity_color(s: Severity) -> Color32 {
     }
 }
 
-pub(super) fn dot(ui: &mut Ui, color: Color32, radius: f32) {
-    let (rect, _) = ui.allocate_exact_size(Vec2::splat(radius * 2.0 + 4.0), Sense::hover());
+/// Цветная точка состояния. `meaning` — её смысл словами для диктора: цвет он не передаёт.
+pub(super) fn dot(ui: &mut Ui, color: Color32, radius: f32, meaning: &str) {
+    let (rect, resp) = ui.allocate_exact_size(Vec2::splat(radius * 2.0 + 4.0), Sense::hover());
     ui.painter().circle_filled(rect.center(), radius, color);
+    a11y::describe(&resp, Painted::Dot { meaning });
 }
 
 pub(super) fn mono(text: impl Into<String>, color: Color32) -> RichText {

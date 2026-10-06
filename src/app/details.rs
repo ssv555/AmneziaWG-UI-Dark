@@ -2,6 +2,7 @@
 
 use eframe::egui::{self, Color32, RichText, Ui, Vec2};
 
+use super::a11y;
 use super::graph::{graph, stale_ping};
 use super::theme::{dot, level_color, mono, BLUE, GRAY, GREEN, RED, VIOLET};
 use super::list::Primary;
@@ -11,7 +12,7 @@ use crate::daemon::proto::Plan;
 use crate::fmt;
 use crate::health::Health;
 use crate::i18n::{tr, trf};
-use crate::monitor::{self, Live};
+use crate::monitor::{self, Live, Snapshot};
 use crate::ping::PingState;
 use crate::settings::{Mode, Settings};
 use crate::stats::{self, Stats};
@@ -32,6 +33,8 @@ pub(super) struct Detail<'a> {
     pub(super) retry_slow: bool,
     /// Нет связи с ядром: состояние туннеля неизвестно, главное действие недоступно.
     pub(super) core_lost: bool,
+    /// Снимок состояния: какие туннели снимет «Подключить» (`Primary::connect_hint`).
+    pub(super) snap: &'a Snapshot,
 }
 
 /// Подключённый туннель: сведения из службы (UAPI), адреса/DNS/MTU — из конфига, если он известен.
@@ -106,6 +109,10 @@ pub(super) fn details(ui: &mut Ui, d: &Detail, s: &mut Settings, actions: &mut V
                     Some(hint) => button.on_disabled_hover_text(tr(hint)),
                     None => button,
                 };
+                let button = match primary.connect_hint(d.name, s.multiple, d.snap) {
+                    Some(hint) => button.on_hover_text(hint),
+                    None => button,
+                };
                 if let (true, Some(plan)) = (button.clicked(), plan) {
                     actions.push(Action::Switch(d.name.to_string(), plan));
                 }
@@ -125,7 +132,7 @@ pub(super) fn details(ui: &mut Ui, d: &Detail, s: &mut Settings, actions: &mut V
         });
         ui.add_space(6.0);
         ui.horizontal(|ui| {
-            dot(ui, level_color(d.health.level), 9.0);
+            dot(ui, level_color(d.health.level), 9.0, &a11y::state_word(Primary::of(d.health.level, d.core_lost)));
             ui.label(RichText::new(&d.health.text).size(22.0).strong().color(level_color(d.health.level)));
         });
         ui.add_space(8.0);

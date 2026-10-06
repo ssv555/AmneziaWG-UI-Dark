@@ -146,7 +146,7 @@ fn lines(ui: &mut Ui, shown: &[&Event]) {
         prev = Some(e);
         let row = ui.horizontal(|ui| {
             ui.label(mono(fmt::date_time_sec(e.at), GRAY));
-            dot(ui, severity_color(e.severity), 4.0);
+            dot(ui, severity_color(e.severity), 4.0, e.severity.as_str());
             if !e.tunnel.is_empty() {
                 ui.strong(&e.tunnel);
             }

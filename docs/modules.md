@@ -11,7 +11,7 @@ The graphs are derived from `crate::...` paths in the code of `src/` (test code 
 ```mermaid
 flowchart TB
   W["Window / app<br/>app/, tray, taskbar, shortcut, icon, groups, settings, elevated"]
-  C["Core daemon<br/>daemon/ (server, retry, restore, netwatch, agent_watch, pipe, proto, install, service),<br/>backend, engine"]
+  C["Core daemon<br/>daemon/ (server, retry, deadwatch, restore, netwatch, agent_watch, pipe, proto, install, service),<br/>backend, engine"]
   A["Agent<br/>daemon/agent/, update/, ping, stats, native"]
   S["Shared libs<br/>monitor, events, health, store, archive, conf, uapi, win, scm,<br/>i18n, ini, fmt, fsutil, crash"]
 
@@ -46,7 +46,7 @@ flowchart LR
   end
 
   subgraph C["Core daemon"]
-    dcore["daemon/<br/>server, retry, restore, netwatch,<br/>agent_watch, pipe, proto, install, service"]
+    dcore["daemon/<br/>server, retry, deadwatch, restore, netwatch,<br/>agent_watch, pipe, proto, install, service"]
     backend
     engine
   end
@@ -177,12 +177,12 @@ Notes on the graph:
 Two tests scan source text (code only, without `#[cfg(test)]` blocks and `//` comment lines) and fail the build on a violation.
 
 1. `core_does_not_reach_into_agent_work`, in `src/daemon/mod.rs`. The core must not depend on the update, ping, statistics or native-helper code, and must not write the event file on live paths.
-   1.1. Scanned: `daemon/server.rs`, `retry.rs`, `restore.rs`, `agent_watch.rs`, `netwatch.rs`, `service.rs`, and the functions `spawn`, `poll` and `core_state` of `src/monitor.rs`.
+   1.1. Scanned: `daemon/server.rs`, `retry.rs`, `deadwatch.rs`, `restore.rs`, `agent_watch.rs`, `netwatch.rs`, `service.rs`, and the functions `spawn`, `poll` and `core_state` of `src/monitor.rs`.
    1.2. Forbidden words: `crate::update`, `update::`, `crate::ping`, `ping::`, `crate::stats`, `stats::`, `TunnelStats`, `crate::native`, `native::`, `helper::`, `run_elevated`.
    1.3. Forbidden on live paths too (every scanned file except `service.rs`): `append_event`, `EventLog::open`, `events_file`. `service.rs` may touch the file, because it runs after the core stopped.
    1.4. Not scanned: `daemon/proto.rs` (its types are shared with older windows), `install.rs`, `helper.rs`, and the tunnel code of `backend.rs` and `engine.rs`. The fence is a text check, not a dependency analysis.
    1.5. `core_fence_sees_code_not_comments_or_tests` checks the checker itself.
-2. `agent_does_not_reach_into_vpn_code`, in `src/daemon/agent/mod.rs`. The agent must not contain VPN code: forbidden are `daemon::server`, `daemon::retry`, `daemon::restore`, `daemon::netwatch`, `crate::backend`, `crate::engine`, `crate::uapi` and `switching`, in all files of `src/daemon/agent/`.
+2. `agent_does_not_reach_into_vpn_code`, in `src/daemon/agent/mod.rs`. The agent must not contain VPN code: forbidden are `daemon::server`, `daemon::retry`, `daemon::deadwatch`, `daemon::restore`, `daemon::netwatch`, `crate::backend`, `crate::engine`, `crate::uapi` and `switching`, in all files of `src/daemon/agent/`.
 
 Behavioral isolation tests in `src/daemon/server.rs`: `isolation_killed_agent_is_respawned_and_the_core_keeps_working` and `isolation_hung_agent_is_killed_and_respawned_without_slowing_the_core`. Waits for the fake agent process to start use a generous budget (`START_BUDGET`, 30 s: the first start of a freshly built exe can be slowed by antivirus scanning); the core checks stay strict (every Switch answered within 1 s, tunnel reconnected on the supervisor schedule). The core under these tests keeps its desired set in memory (`config_file: None`): the durable `core.ini` write flushes the disk twice and under disk load alone takes over 1 s, so the 1 s bound measures the core, not the disk. `isolation_slow_agent_start_is_waited_for_not_taken_for_a_hang` checks the harness itself with an agent that opens its pipe 4 s after start.
 

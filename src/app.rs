@@ -21,6 +21,7 @@ use crate::monitor::{self, FrameView, Shared};
 use crate::settings::{Mode, Settings, SortKey};
 use crate::{tray, win};
 
+mod a11y;
 mod about;
 mod core_ui;
 mod demo_core;
@@ -39,6 +40,7 @@ mod markdown;
 mod menu;
 mod modals;
 mod reminder;
+mod settings_dialog;
 mod sources;
 mod status;
 mod theme;
@@ -131,6 +133,8 @@ enum Action {
     EngineRename(String),
     /// Установить или обновить ядро (запрос UAC).
     InstallCore,
+    /// Меню «Настройки…»: окно со всеми параметрами.
+    OpenSettings,
 }
 
 pub struct App {
@@ -154,6 +158,8 @@ pub struct App {
     log_filter: LogFilter,
     /// Клавиша меню (Apps) -> Shift+F10 для контекстных меню (`menu::context_menu`).
     menu_key: menu::MenuKey,
+    /// Клавиатура строки меню: F10, Alt, мнемоники, стрелки, горячие клавиши команд.
+    menu_nav: menu::MenuNav,
     /// Кадры, скрытый запуск, масштаб, запись настроек, снимок.
     window: WindowState,
     /// Связь с ядром: полоса «установить / обновить», сверка в фоне.
@@ -165,6 +171,8 @@ pub struct App {
     unseen_error: bool,
     /// «Выход» из меню трея ждёт разбора в кадре.
     exit_request: Arc<AtomicBool>,
+    /// Отключение из трея ждёт подтверждения в кадре.
+    disconnect_ask: tray_menu::DisconnectAsk,
     /// Модальные диалоги: стек, Enter и Esc — верхнему.
     modals: Modals,
     /// Окно «Обновления и откаты» и отметка «есть новое» в меню «Справка».
@@ -202,6 +210,7 @@ impl App {
         // egui 0.34 закрывает окно по Ctrl+Q. У нас закрытие — по крестику и из меню, с вопросом про туннели и трей.
         ctx.options_mut(|o| o.quit_shortcuts.clear());
         let exit_request = Arc::new(AtomicBool::new(false));
+        let disconnect_ask = tray_menu::DisconnectAsk::default();
         let hwnd = match cc.window_handle().map(|h| h.as_raw()) {
             Ok(RawWindowHandle::Win32(w)) => w.hwnd.get(),
             _ => 0,
@@ -227,6 +236,11 @@ impl App {
         if let Some(problem) = &start.settings_problem {
             action_error.push(problem.text());
         }
+        if hwnd != 0 {
+            if let Err(e) = menu::install_system_key_filter(hwnd) {
+                action_error.push(e);
+            }
+        }
         // Трей — когда ядро и журнал ошибок готовы: его меню переключает туннели тем же `Switcher`, что и окно.
         let tray_layout: tray_menu::SharedLayout = Arc::new(Mutex::new(tray_menu::Layout::of(&start.settings)));
         if hwnd != 0 {
@@ -234,6 +248,7 @@ impl App {
                 layout: tray_layout.clone(),
                 switcher: Switcher { shared: shared.clone(), core: core.clone(), error: action_error.clone(), ctx: ctx.clone() },
                 exit_request: exit_request.clone(),
+                disconnect_ask: disconnect_ask.clone(),
             };
             tray::install(hwnd, ctx.clone(), start.settings.tray && start.snapshot_file.is_none(), Box::new(hooks));
         }
@@ -276,12 +291,14 @@ impl App {
             search: String::new(),
             log_filter: LogFilter::default(),
             menu_key: menu::MenuKey::default(),
+            menu_nav: menu::MenuNav::default(),
             window: WindowState::new(start.settings_path, saved_text, start.snapshot_file, start_hidden),
             core_link,
             hwnd,
             look: None,
             unseen_error: false,
             exit_request,
+            disconnect_ask,
             modals,
             updates,
             core,
@@ -326,6 +343,8 @@ impl App {
         let s = &mut self.s;
         match action {
             Action::Select(name) => s.book.select_tunnel(&name),
+            // Отключение — сначала вопрос (пока не ответили «Больше не спрашивать»); то же решение у трея.
+            Action::Switch(name, plan) if list::asks_first(plan, &s.hidden_dialogs) => self.modals.open(Modal::Confirm(Confirm::Disconnect(name))),
             Action::Switch(name, plan) => self.switch(name, plan),
             Action::Retry(name) => self.retry(name),
             Action::Assign(tunnel, group) => {
@@ -467,6 +486,7 @@ impl App {
             Action::EngineEdit(t) => self.engine_edit(t),
             Action::EngineRename(t) => self.ask_tunnel_name(Some(t)),
             Action::InstallCore => self.run_core_setup(crate::daemon::install::INSTALL_FLAG),
+            Action::OpenSettings => self.open_settings(),
             Action::OpenConf => {
                 if let Some(path) = win::pick_conf(false, None) {
                     match std::fs::read_to_string(&path) {
@@ -509,6 +529,7 @@ impl App {
             Modal::EditorUnsaved => self.show_editor_unsaved(ctx, turn),
             Modal::EditorInvalid(after) => self.show_editor_invalid(ctx, *after, turn),
             Modal::About => self.show_about(ctx, turn),
+            Modal::Settings(dlg) => self.show_settings(ctx, dlg, turn),
         }
     }
 
@@ -516,6 +537,14 @@ impl App {
     fn switch(&self, name: String, plan: Plan) {
         let switcher = Switcher { shared: self.shared.clone(), core: self.core.clone(), error: self.action_error.clone(), ctx: self.ctx.clone() };
         switcher.switch(name, plan, self.s.multiple);
+    }
+
+    /// Отключение, выбранное в трее, ждёт подтверждения: трей уже поднял окно, вопрос — в этом кадре.
+    fn check_disconnect_ask(&mut self) {
+        let asked = self.disconnect_ask.lock().unwrap().take();
+        if let Some(tunnel) = asked {
+            self.modals.open(Modal::Confirm(Confirm::Disconnect(tunnel)));
+        }
     }
 
     /// «Повторить» у туннеля, который ядро переподключает раз в 10 минут: расписание с начала, попытка сразу.
@@ -547,6 +576,7 @@ impl eframe::App for App {
         self.watch_core();
         self.drain_errors();
         self.check_exit_request();
+        self.check_disconnect_ask();
         self.check_watched();
         // Настройки меняет и ядро (режим) — сохранить, даже если `ui` в этом кадре не позовут.
         self.push_options();
@@ -584,7 +614,9 @@ impl eframe::App for App {
             let keys = table_keys(&self.modals, self.updates.is_open(), self.editor.as_ref(), typing, popup);
 
             let updates_new = self.updates.has_new();
-            egui::Panel::top("menu").show(root, |ui| menu_bar(ui, &mut self.s, self.autostart, &self.base_dir.join("lang"), updates_new, &mut actions));
+            let lang_dir = self.base_dir.join("lang");
+            let bar = menu::MenuBarInput { lang_dir: &lang_dir, updates_new, keyboard: keys.search };
+            egui::Panel::top("menu").show(root, |ui| menu_bar(ui, &mut self.menu_nav, &mut self.s, &bar, &mut actions));
             self.core_banner(root, &mut actions);
             egui::Panel::bottom("status").show(root, |ui| {
                 let bar = StatusBar {
@@ -629,6 +661,7 @@ impl eframe::App for App {
                         info_loading: info_loading.contains(&name),
                         retry_slow: snap.retries.get(&name).is_some_and(|r| r.slow),
                         core_lost: snap.core_lost,
+                        snap: &snap,
                     };
                     details(ui, &ctx, &mut self.s, &mut actions)
                 }

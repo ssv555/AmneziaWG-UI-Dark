@@ -11,6 +11,7 @@
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
+use super::deadwatch::{DeadTick, DeadWatch, Verdict};
 use super::proto::RetryState;
 use crate::i18n::tr;
 
@@ -150,6 +151,9 @@ pub(super) struct Retries {
     after_lease: BTreeMap<String, Instant>,
     /// Первый такт после запуска ядра уже был.
     started: bool,
+    /// Мёртвые туннели: служба работает, связи нет (`deadwatch`). Здесь же, под одним замком: аренда, команда
+    /// пользователя и смена режима снимают и его счёт.
+    pub(super) dead: DeadWatch,
 }
 
 impl Retries {
@@ -246,6 +250,7 @@ impl Retries {
         for t in tunnels {
             self.tracks.remove(t);
             self.after_lease.remove(t);
+            self.dead.forget(t);
             self.holds.insert(t.clone(), until);
         }
     }
@@ -257,6 +262,13 @@ impl Retries {
 
     pub(super) fn is_held(&self, name: &str) -> bool {
         self.holds.contains_key(name)
+    }
+
+    /// Такт сторожа мёртвых туннелей. Не трогает туннели под арендой, под надзором повторов (он их и поднимает) и
+    /// переключаемые по команде (`pending`).
+    pub(super) fn dead_tick(&mut self, now: Instant, desired: &[String], verdicts: &[(String, Verdict)], pending: &dyn Fn(&str) -> bool) -> DeadTick {
+        let (holds, tracks) = (&self.holds, &self.tracks);
+        self.dead.tick(now, desired, verdicts, &|t| holds.contains_key(t) || tracks.contains_key(t) || pending(t))
     }
 
     /// Работающие под надзором: проработал `CONFIRM_FOR` — подключён, надзор снят; поднятый нашей попыткой встал до
@@ -308,12 +320,14 @@ impl Retries {
     pub(super) fn forget(&mut self, name: &str) {
         self.tracks.remove(name);
         self.after_lease.remove(name);
+        self.dead.forget(name);
     }
 
     /// Смена режима или отключение всего: надзор снимается целиком.
     pub(super) fn clear(&mut self) {
         self.tracks.clear();
         self.after_lease.clear();
+        self.dead.clear();
     }
 
     /// «Повторить»: расписание с начала, попытка сразу.

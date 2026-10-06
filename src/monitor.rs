@@ -337,6 +337,11 @@ impl Shared {
         lock(&self.snapshot).running.get(name).and_then(|l| l.status.clone())
     }
 
+    /// Прочитать снимок под замком, без копии часа истории каждого туннеля (сторож ядра смотрит его раз в секунду).
+    pub fn with_snapshot<R>(&self, f: impl FnOnce(&Snapshot) -> R) -> R {
+        f(&lock(&self.snapshot))
+    }
+
     /// Копия снимка опроса — для вывода без окна, где замок держать незачем.
     pub fn snapshot_clone(&self) -> Snapshot {
         lock(&self.snapshot).clone()

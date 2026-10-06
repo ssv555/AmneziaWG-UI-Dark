@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use eframe::egui::{self, Align2, Color32, FontId, Pos2, Rect, RichText, Sense, Stroke, Ui, Vec2};
 
+use crate::app::a11y::{self, Painted};
 use crate::app::theme::{level_color, BLUE, NUM_FONT, RED};
 use crate::app::{menu, Action, Confirm, Dialog};
 use crate::daemon::proto::Plan;
@@ -13,7 +14,7 @@ use crate::i18n::{tr, trf};
 use crate::settings::{Mode, Settings, SortKey};
 use crate::stats::{self, TunnelStats};
 
-use super::{activation_plan, cell_value, cells, scroll_flag, Drag, List, Primary, INDENT, ROW_H};
+use super::{cell_value, cells, scroll_flag, Drag, List, Primary, INDENT, ROW_H};
 
 /// Строка — цель Shift+F10 и клавиши меню: в таблице клавиши — у выделенной строки (как стрелки и Enter), если таблица
 /// их сейчас принимает и фокус egui не стоит на другом элементе (значение в карточке, строка журнала).
@@ -176,6 +177,10 @@ pub(super) fn group_row(ui: &mut Ui, g: &GroupLine, cols: &[(SortKey, &str, f32)
         actions.push(Action::ToggleCollapse(g.key.to_string()));
         actions.push(Action::SelectGroup(g.key.to_string()));
     }
+    a11y::describe(
+        &resp,
+        Painted::Group { name: &shown, expanded: !g.collapsed, active: agg.active, total: agg.total, selected: g.selected },
+    );
     if !real {
         return;
     }
@@ -292,9 +297,10 @@ pub(super) fn tunnel_row(
     let primary = Primary::of(h.level, l.snap.core_lost);
     let running = primary.is_on();
     let busy = h.level == Level::Busy;
-    if let Some(plan) = activation_plan(h.level).filter(|_| resp.double_clicked()) {
+    if let Some(plan) = primary.activation().filter(|_| resp.double_clicked()) {
         actions.push(Action::Switch(name.clone(), plan));
     }
+    a11y::describe(&resp, Painted::Tunnel { name, state: primary, group: group.map(groups::leaf), selected });
     menu::context_menu(&resp, keyboard_target(ui, l, selected, &resp), |ui| {
         let main = egui::Button::new(tr(primary.label()));
         let main = if primary == Primary::Connect { main.shortcut_text("Enter") } else { main };
@@ -302,6 +308,10 @@ pub(super) fn tunnel_row(
         let item = ui.add_enabled(toggle.is_some(), main);
         let item = match primary.hint() {
             Some(hint) => item.on_disabled_hover_text(tr(hint)),
+            None => item,
+        };
+        let item = match primary.connect_hint(name, s.multiple, l.snap) {
+            Some(hint) => item.on_hover_text(hint),
             None => item,
         };
         if let (true, Some(plan)) = (item.clicked(), toggle) {

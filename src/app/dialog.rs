@@ -48,35 +48,74 @@ fn is_top_window(top: Option<egui::LayerId>, id: &str) -> bool {
     top == Some(egui::LayerId::new(egui::Order::Middle, egui::Id::new(id)))
 }
 
-/// Кнопки диалога по правому краю в порядке Windows: главная первой, «Отмена» последней.
-/// Возвращает (главная нажата, отмена нажата).
-pub(super) fn dialog_buttons(ui: &mut Ui, primary: &str, enabled: bool, cancel: Option<&str>) -> (bool, bool) {
-    let (mut ok, mut no) = (false, false);
+/// Кнопка ряда: текст, включена ли, подсказка с клавишей (Enter у главной, Esc у отмены).
+struct RowButton<'a> {
+    text: &'a str,
+    enabled: bool,
+    key_hint: Option<&'static str>,
+}
+
+/// Единственная раскладка кнопок диалога: полоса по правому краю, кнопки слева направо в порядке `buttons`.
+/// Ответы — в том же порядке. Порядок задают вызывающие ниже, по правилу Windows: главная первой, «Отмена» за ней,
+/// «Применить» последней.
+fn button_row(ui: &mut Ui, buttons: &[RowButton]) -> Vec<egui::Response> {
     let size = Vec2::new(88.0, 26.0);
     // Полоса высотой в кнопку: `with_layout` занял бы всю высоту окна.
     let layout = egui::Layout::right_to_left(egui::Align::Center);
-    ui.allocate_ui_with_layout(Vec2::new(ui.available_width(), size.y), layout, |ui| {
-        // Справа налево: сначала «Отмена», левее — главная.
-        if let Some(c) = cancel {
-            no = ui.add(egui::Button::new(c).min_size(size)).on_hover_text("Esc").clicked();
-        }
-        ok = ui.add_enabled(enabled, egui::Button::new(primary).min_size(size)).on_hover_text("Enter").clicked();
-    });
-    (ok, no)
+    let mut responses = ui
+        .allocate_ui_with_layout(Vec2::new(ui.available_width(), size.y), layout, |ui| {
+            // Раскладка справа налево: кнопки добавляются с конца, чтобы на экране стоять в порядке `buttons`.
+            buttons
+                .iter()
+                .rev()
+                .map(|b| {
+                    let resp = ui.add_enabled(b.enabled, egui::Button::new(b.text).min_size(size));
+                    match b.key_hint {
+                        Some(hint) => resp.on_hover_text(hint),
+                        None => resp,
+                    }
+                })
+                .collect::<Vec<_>>()
+        })
+        .inner;
+    responses.reverse();
+    responses
 }
 
-/// Три кнопки по правому краю: главная (Enter), второй вариант, «Отмена» (Esc).
-/// Возвращает (главная, второй вариант, отмена).
-pub(super) fn dialog_choice(ui: &mut Ui, primary: &str, other: &str, cancel: &str) -> (bool, bool, bool) {
-    let (mut ok, mut alt, mut no) = (false, false, false);
-    let size = Vec2::new(88.0, 26.0);
-    let layout = egui::Layout::right_to_left(egui::Align::Center);
-    ui.allocate_ui_with_layout(Vec2::new(ui.available_width(), size.y), layout, |ui| {
-        no = ui.add(egui::Button::new(cancel).min_size(size)).on_hover_text("Esc").clicked();
-        alt = ui.add(egui::Button::new(other).min_size(size)).clicked();
-        ok = ui.add(egui::Button::new(primary).min_size(size)).on_hover_text("Enter").clicked();
-    });
-    (ok, alt, no)
+fn primary<'a>(text: &'a str, enabled: bool) -> RowButton<'a> {
+    RowButton { text, enabled, key_hint: Some("Enter") }
+}
+
+fn cancel(text: &str) -> RowButton<'_> {
+    RowButton { text, enabled: true, key_hint: Some("Esc") }
+}
+
+/// Кнопки диалога по правому краю в порядке Windows: главная первой, «Отмена» последней.
+/// Возвращает (главная нажата, отмена нажата).
+pub(super) fn dialog_buttons(ui: &mut Ui, primary_text: &str, enabled: bool, cancel_text: Option<&str>) -> (bool, bool) {
+    let mut row = vec![primary(primary_text, enabled)];
+    row.extend(cancel_text.map(cancel));
+    let r = button_row(ui, &row);
+    (r[0].clicked(), r.get(1).is_some_and(|c| c.clicked()))
+}
+
+/// Три варианта ответа по правому краю: главный (Enter), второй вариант, «Отмена» (Esc) — как «Сохранить /
+/// Не сохранять / Отмена» в Windows. Возвращает (главная, второй вариант, отмена).
+pub(super) fn dialog_choice(ui: &mut Ui, primary_text: &str, other: &str, cancel_text: &str) -> (bool, bool, bool) {
+    let other = RowButton { text: other, enabled: true, key_hint: None };
+    let r = button_row(ui, &[primary(primary_text, true), other, cancel(cancel_text)]);
+    (r[0].clicked(), r[1].clicked(), r[2].clicked())
+}
+
+/// Кнопки окна свойств в порядке Windows: «ОК» (Enter), «Отмена» (Esc), «Применить». «ОК» и «Применить» выключаются
+/// (неверный ввод, нечего применять); «Отмена» есть всегда. Возвращает (ОК, отмена, применить).
+pub(super) fn dialog_ok_cancel_apply(ui: &mut Ui, ok: (&str, bool), cancel_text: &str, apply: (&str, bool)) -> (bool, bool, bool) {
+    let r = button_row(ui, &ok_cancel_apply_row(ok, cancel_text, apply));
+    (r[0].clicked(), r[1].clicked(), r[2].clicked())
+}
+
+fn ok_cancel_apply_row<'a>(ok: (&'a str, bool), cancel_text: &'a str, apply: (&'a str, bool)) -> [RowButton<'a>; 3] {
+    [primary(ok.0, ok.1), cancel(cancel_text), RowButton { text: apply.0, enabled: apply.1, key_hint: None }]
 }
 
 /// Enter и Esc для верхнего диалога: забираются из ввода, чтобы их не увидели окна под ним.
@@ -126,6 +165,32 @@ pub(super) mod tests {
         ];
         assert!(take_enter(&mut ev));
         assert_eq!(ev.len(), 3);
+    }
+
+    /// Правило 3 стандарта: в окне свойств «ОК» первой, за ней «Отмена», «Применить» последней (а не «ОК, Применить,
+    /// Отмена»). Главная — с подсказкой Enter, отмена — Esc.
+    #[test]
+    fn property_sheet_buttons_are_ok_cancel_apply() {
+        let row = ok_cancel_apply_row(("OK", true), "Cancel", ("Apply", false));
+        assert_eq!(row.iter().map(|b| b.text).collect::<Vec<_>>(), ["OK", "Cancel", "Apply"]);
+        assert_eq!(row.iter().map(|b| b.key_hint).collect::<Vec<_>>(), [Some("Enter"), Some("Esc"), None]);
+        assert!(!row[2].enabled, "nothing to apply - Apply is disabled");
+    }
+
+    /// `button_row` ставит кнопки на экране слева направо в порядке списка, прижатыми к правому краю, и отдаёт
+    /// ответы в том же порядке: от этого зависит порядок кнопок во всех диалогах.
+    #[test]
+    fn button_row_lays_out_in_list_order() {
+        let ctx = egui::Context::default();
+        let mut rects = Vec::new();
+        let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+            let row = ok_cancel_apply_row(("OK", true), "Cancel", ("Apply", true));
+            rects = button_row(ui, &row).iter().map(|r| r.rect).collect();
+        });
+        assert_eq!(rects.len(), 3);
+        assert!(rects[0].right() <= rects[1].left() && rects[1].right() <= rects[2].left(), "order: {rects:?}");
+        let screen = ctx.content_rect();
+        assert!(screen.right() - rects[2].right() < 20.0, "row is right-aligned: {rects:?} in {screen:?}");
     }
 
     #[test]

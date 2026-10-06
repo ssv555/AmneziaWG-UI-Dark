@@ -53,10 +53,12 @@ pub enum DialogId {
     ExitKeep,
     /// Выход: отключить туннели.
     ExitDisconnect,
+    /// Подтверждение отключения туннеля (кнопка, меню строки, трей).
+    Disconnect,
 }
 
 impl DialogId {
-    const ALL: [DialogId; 4] = [DialogId::ModeOverlay, DialogId::ModeEngine, DialogId::ExitKeep, DialogId::ExitDisconnect];
+    const ALL: [DialogId; 5] = [DialogId::ModeOverlay, DialogId::ModeEngine, DialogId::ExitKeep, DialogId::ExitDisconnect, DialogId::Disconnect];
 
     /// Имя в INI. Не менять: файлы прежних версий хранят именно эти строки.
     pub fn ini_name(self) -> &'static str {
@@ -65,6 +67,7 @@ impl DialogId {
             DialogId::ModeEngine => "mode.engine",
             DialogId::ExitKeep => "exit.keep",
             DialogId::ExitDisconnect => "exit.disconnect",
+            DialogId::Disconnect => "tunnel.disconnect",
         }
     }
 
@@ -471,7 +474,7 @@ mod tests {
         assert_eq!(names, ["exit.keep", "mode.engine"]);
         // Имена закреплены: это формат файла, а не ключи перевода.
         let all: Vec<_> = DialogId::ALL.iter().map(|d| d.ini_name()).collect();
-        assert_eq!(all, ["mode.overlay", "mode.engine", "exit.keep", "exit.disconnect"]);
+        assert_eq!(all, ["mode.overlay", "mode.engine", "exit.keep", "exit.disconnect", "tunnel.disconnect"]);
         assert_eq!(DialogId::mode_help(Mode::Engine), DialogId::ModeEngine);
     }
 

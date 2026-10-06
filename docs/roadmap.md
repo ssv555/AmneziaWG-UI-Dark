@@ -19,13 +19,14 @@ Full per-version lists are in the [changelog](../CHANGELOG.md). Only the headlin
    process (`awg-ui.exe --agent`) that the core restarts; tunnels in the tray menu; event log filter, search and
    copy; config check in the editor; copy values from the tunnel card and copy diagnostics; daily reminder about an
    available update; eframe 0.36 and wgpu 30; fixes and dependency updates.
+6. **0.5.1** (2026.10.06): protection against disconnecting a tunnel by accident (asks first, connect-only
+   double click and Enter); the core restarts a tunnel whose handshake stopped updating; a Settings window with
+   OK / Cancel / Apply instead of the drop-down menu; keyboard access to the menus (F10, Alt, Alt+letter, arrows,
+   Ctrl+N, Ctrl+I, F1, F5); screen reader support (accessibility tree, painted rows, graph and status dots are named).
 
 ## Next
 
-1. **Usability**: protection against disconnecting a tunnel by accident; a Settings window instead of the drop-down
-   menu; keyboard access to the menus (Alt and F10).
-2. **Accessibility**: screen reader support.
-3. **Stability**: reconnect a tunnel whose handshake stopped updating.
+1. **Accessibility**: check the screen reader support with Narrator and NVDA and fix what they find.
 
 ## Later, not scheduled
 

@@ -2,6 +2,7 @@
 
 use eframe::egui::{self, Align2, FontId, Pos2, RichText, Sense, Stroke, Ui, Vec2};
 
+use super::a11y::{self, Painted};
 use super::theme::{mono, BLUE, GREEN, RED, VIOLET};
 use crate::fmt;
 use crate::i18n::{tr, trf};
@@ -70,6 +71,10 @@ pub(super) fn graph(ui: &mut Ui, live: &Live, ping: Option<&PingState>, s: &mut 
         FontId::proportional(12.0),
         ui.visuals().weak_text_color(),
     );
+    // Диктору — то, что зрячий видит с одного взгляда: текущие приём и передача (как в карточке, за 3 с) и пик.
+    let (rx_now, tx_now) = live.rate(3.0);
+    let (rx, tx, peak) = (fmt::rate(rx_now), fmt::rate(tx_now), fmt::rate(max));
+    a11y::describe(&hover, Painted::Graph { rx: &rx, tx: &tx, peak: &peak });
 
     // Наведение: ближайшая точка — вертикальная линия, точки на кривых, подсказка со значениями.
     if let Some(pos) = hover.hover_pos() {
@@ -153,6 +158,11 @@ fn ping_strip(ui: &mut Ui, ping: &PingState, period: f64) {
         FontId::proportional(12.0),
         ui.visuals().weak_text_color(),
     );
+    let last = match ping.last {
+        Some(Ok(ms)) => trf("unit.ms", &[&ms.to_string()]),
+        _ => stale_ping(ping),
+    };
+    a11y::describe(&hover, Painted::Ping { host: &ping.host, last: &last });
 
     // Наведение: ближайший замер по времени.
     let Some(pos) = hover.hover_pos() else { return };

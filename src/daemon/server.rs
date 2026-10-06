@@ -9,6 +9,7 @@ use super::budget::{Budgets, Limits};
 use super::pipe::Server;
 use super::proto::{CoreState, NativeOp, Plan, Request, Response};
 use super::agent_watch::{self, AgentCell};
+use super::deadwatch::{self, DeadNote, Verdict};
 use super::retry::{self, Note, Retries, Seen};
 use super::{data_dir, Config, CoreApi, DATA_SDDL};
 use crate::backend::{EngineHost, Real, TunnelHost, MANAGER_SERVICE};
@@ -60,11 +61,13 @@ pub struct Core {
     agent_took: AtomicU64,
 }
 
-/// Кто переключает туннель: пользователь (команда окна) или надзор ядра, поднимая желаемый туннель (`retry`).
+/// Кто переключает туннель: пользователь (команда окна), надзор ядра, поднимая желаемый туннель (`retry`), или сторож
+/// мёртвых туннелей, перезапуская работающий без связи (`deadwatch`).
 #[derive(Clone, Copy, PartialEq)]
 enum Origin {
     User,
     Retry,
+    Dead,
 }
 
 /// Сколько ждём после старта, пока канал ядра ответит на собственный запрос; не ответил — ядро не поднялось.
@@ -515,10 +518,18 @@ impl Core {
         };
         // Под той же блокировкой, что и команды пользователя: отключённый им за время ожидания не поднимается обратно,
         // а взятый в аренду, пока попытка ждала блокировку (`hold`), не трогается.
-        if origin == Origin::Retry && (running.iter().any(|r| r == name) || !self.is_desired(name) || lock(&self.retries).is_held(name)) {
+        let is_running = running.iter().any(|r| r == name);
+        let nothing_to_do = match origin {
+            Origin::User => false,
+            Origin::Retry => is_running,
+            // Перезапуск мёртвого — только пока он работает: остановленный поднимает надзор повторов.
+            Origin::Dead => !is_running,
+        };
+        if nothing_to_do || (origin != Origin::User && (!self.is_desired(name) || lock(&self.retries).is_held(name))) {
             return Ok(false);
         }
-        let others = to_replace(name, plan, multiple, &running, |n| self.footprint(n));
+        // Перезапуск мёртвого трогает только его: с соседями он ужился, когда подключался.
+        let others = if origin == Origin::Dead { Vec::new() } else { to_replace(name, plan, multiple, &running, |n| self.footprint(n)) };
         if origin == Origin::User {
             self.update_desired(name, |config| {
                 config.tunnels = Some(super::restore::after_switch(config.tunnels.as_deref().unwrap_or_default(), name, plan, &others));
@@ -645,7 +656,55 @@ impl Core {
             self.shared.log(t, Severity::Warn, &trf("core.hold_expired", &[t]));
         }
         self.attempt(&tick.due, multiple);
+        self.watch_dead(now, &desired, multiple);
         self.shared.set_retries(lock(&self.retries).view(Instant::now()));
+    }
+
+    /// Сторож мёртвых туннелей (`deadwatch`): по показаниям опроса — кто работает без связи; таких перезапускает
+    /// обычным переключением (`Plan::Reconnect`), исходы — в счёт и журнал.
+    fn watch_dead(&self, now: Instant, desired: &[String], multiple: bool) {
+        let restarted = lock(&self.retries).dead.restarted_at();
+        let now_unix = crate::monitor::unix_now();
+        let verdicts: Vec<(String, Verdict)> = self.shared.with_snapshot(|snap| {
+            snap.running
+                .iter()
+                .filter(|(t, _)| desired.contains(*t))
+                .map(|(t, live)| (t.clone(), deadwatch::verdict(live, now, now_unix, restarted.get(t).copied())))
+                .collect()
+        });
+        self.dead_round(now, desired, &verdicts, multiple);
+    }
+
+    /// Решения сторожа по вердиктам и перезапуски; отдельно от чтения снимка — проверяется тестами без опроса.
+    fn dead_round(&self, now: Instant, desired: &[String], verdicts: &[(String, Verdict)], multiple: bool) {
+        let tick = lock(&self.retries).dead_tick(now, desired, verdicts, &|t| self.shared.is_pending(t));
+        for (t, note) in tick.notes {
+            self.log_dead(&t, note);
+        }
+        for t in &tick.due {
+            let result = self.switch_from(Origin::Dead, t, Plan::Reconnect, multiple);
+            let note = lock(&self.retries).dead.restarted(t, Instant::now(), result);
+            if let Some(note) = note {
+                self.log_dead(t, note);
+            }
+        }
+    }
+
+    /// Запись сторожа мёртвых туннелей в журнал: обнаружение, перезапуски первых фаз, вход в 10-минутную фазу — с
+    /// уведомлением, возврат связи.
+    fn log_dead(&self, t: &str, note: DeadNote) {
+        let failed = |error: Option<String>| error.map_or_else(String::new, |e| trf("core.dead_restart_failed", &[&e]));
+        match note {
+            DeadNote::Detected => self.shared.log(t, Severity::Warn, &trf("core.dead_detected", &[t])),
+            DeadNote::Restarted { restart, error } => {
+                self.shared.log(t, Severity::Warn, &(trf("core.dead_restarted", &[t, &restart.to_string()]) + &failed(error)))
+            }
+            DeadNote::Slow { restarts, error } => {
+                self.shared.notify(t, Severity::Bad, &(trf("core.dead_slow", &[t, &restarts.to_string()]) + &failed(error)))
+            }
+            DeadNote::Recovered { restarts: 0 } => self.shared.log(t, Severity::Info, &trf("core.dead_back_alone", &[t])),
+            DeadNote::Recovered { restarts } => self.shared.log(t, Severity::Info, &trf("core.dead_recovered", &[t, &restarts.to_string()])),
+        }
     }
 
     /// Попытки надзора — обычным переключением ядра; исходы — в расписание и журнал.
@@ -1109,6 +1168,29 @@ mod tests {
         assert!(!core.shared.is_pending("a"));
         core.release(&["a".to_string()]).unwrap();
         assert_eq!(calls(&host), ["up a"], "повторный возврат ничего не делает");
+    }
+
+    /// Мёртвый туннель перезапускается обычным переключением ядра — только он, работающий сосед не трогается; под
+    /// арендой — не трогается вовсе. В журнале — обнаружение и перезапуск.
+    #[test]
+    fn dead_tunnel_is_restarted_alone_and_held_one_is_not() {
+        let host = Arc::new(Recorder { running: Mutex::new(vec!["a".into(), "b".into()]), ..Default::default() });
+        let core = core_over(host.clone(), &["a", "b"]);
+        let desired = ["a".to_string(), "b".to_string()];
+        let dead = [("a".to_string(), Verdict::Dead), ("b".to_string(), Verdict::Unknown)];
+        let t0 = Instant::now();
+        core.dead_round(t0, &desired, &dead, true);
+        assert_eq!(calls(&host), ["down a", "up a"]);
+        let texts: Vec<String> = core.shared.events_since(0).into_iter().map(|(_, e)| e.text).collect();
+        assert_eq!(texts, [trf("core.dead_detected", &["a"]), trf("core.dead_restarted", &["a", "1"])]);
+        core.dead_round(t0 + Duration::from_secs(30), &desired, &dead, true);
+        assert_eq!(calls(&host).len(), 2, "следующий перезапуск — через минуту");
+
+        let host = Arc::new(Recorder { running: Mutex::new(vec!["a".into()]), ..Recorder::native() });
+        let core = core_over(host.clone(), &["a"]);
+        assert_eq!(core.hold_native(Duration::from_secs(900)), Ok(vec!["a".to_string()]));
+        core.dead_round(Instant::now(), &["a".to_string()], &[("a".to_string(), Verdict::Dead)], false);
+        assert!(calls(&host).is_empty(), "под арендой не перезапускается");
     }
 
     /// Держатель пропал: аренда истекает на такте надзора, пометка снимается, попытка идёт сразу.

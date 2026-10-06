@@ -146,6 +146,22 @@ pub(crate) fn measure(host: &str) -> Result<u32, String> {
     resolve(host).and_then(|ip| echo(ip, TIMEOUT_MS))
 }
 
+/// Узел для пинга, который вообще можно разрешить: адрес IPv4 или имя DNS (RFC 1123: метки 1–63 знаков из букв,
+/// цифр и дефиса, не с дефиса по краям, всё имя до 253 знаков, точка в конце допустима). IPv6 нет: `resolve`
+/// ищет только IPv4. Имя из одних цифровых меток (`999.1.1.1`) — опечатка в адресе, а не имя.
+/// Окно не даёт сохранить другое — мусор не уходит агенту.
+pub(crate) fn valid_host(host: &str) -> bool {
+    if host.parse::<Ipv4Addr>().is_ok() {
+        return true;
+    }
+    let name = host.strip_suffix('.').unwrap_or(host);
+    let label_ok = |l: &str| {
+        (1..=63).contains(&l.len()) && !l.starts_with('-') && !l.ends_with('-') && l.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+    };
+    let last_alpha = name.rsplit('.').next().is_some_and(|l| !l.bytes().all(|b| b.is_ascii_digit()));
+    !name.is_empty() && name.len() <= 253 && name.split('.').all(label_ok) && last_alpha
+}
+
 fn resolve(host: &str) -> Result<Ipv4Addr, String> {
     if let Ok(ip) = host.parse::<Ipv4Addr>() {
         return Ok(ip);
@@ -199,6 +215,24 @@ fn echo(ip: Ipv4Addr, timeout_ms: u32) -> Result<u32, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ping_host_validation() {
+        let long_label = "a".repeat(63);
+        let long_name = format!("{0}.{0}.{0}.{0}", "b".repeat(63)); // 255 знаков
+        let good = ["1.1.1.1", "8.8.8.8", "localhost", "one.one.one.one", "dns.google.", "my-host.example.com", "xn--80ak6aa92e.com", &long_label];
+        for h in good {
+            assert!(valid_host(h), "rejected good host {h:?}");
+        }
+        let too_long_label = "a".repeat(64);
+        let bad = [
+            "", " ", ".", "1.1.1.1 ", "http://1.1.1.1", "host name", "-host.com", "host-.com", "a..b", "999.1.1.1", "1.2.3",
+            "::1", "2606:4700::1111", "host_name.com", "хост.рф", "1.1.1.1:80", &too_long_label, &long_name,
+        ];
+        for h in bad {
+            assert!(!valid_host(h), "accepted bad host {h:?}");
+        }
+    }
 
     #[test]
     fn loopback_answers() {

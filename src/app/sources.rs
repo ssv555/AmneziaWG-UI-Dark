@@ -14,7 +14,7 @@ use crate::events::Severity;
 use crate::groups;
 use crate::i18n::{tr, trf};
 use crate::monitor::Shared;
-use crate::settings::Mode;
+use crate::settings::{DialogId, Mode};
 use crate::{tray, win};
 
 use super::dialog::{dialog_buttons, dialog_window};
@@ -22,7 +22,7 @@ use super::modals::{Modal, Outcome, Turn};
 use super::theme::YELLOW;
 use super::{Action, App, ErrorSink};
 
-/// Действия, которые перезаписывают или удаляют данные, — только после подтверждения.
+/// Действия, которые перезаписывают или удаляют данные или рвут VPN, — только после подтверждения.
 #[derive(Clone)]
 pub(super) enum Confirm {
     /// AmneziaWG → файл-источник.
@@ -35,6 +35,15 @@ pub(super) enum Confirm {
     DeleteTunnel(String),
     /// Удалить службу ядра.
     UninstallCore,
+    /// Отключить туннель (кнопка, меню строки, трей): трафик пойдёт мимо VPN. Можно больше не спрашивать.
+    Disconnect(String),
+}
+
+impl Confirm {
+    /// Диалог с «Больше не спрашивать»: отключение — да; удаление и перезапись спрашивают всегда.
+    fn hideable(&self) -> Option<DialogId> {
+        matches!(self, Confirm::Disconnect(_)).then_some(DialogId::Disconnect)
+    }
 }
 
 impl App {
@@ -80,6 +89,10 @@ impl App {
                     copy = ui.button(tr("del.save_copy")).on_hover_text(tr("del.save_copy_hint")).clicked();
                     ui.add_space(4.0);
                 }
+                if c.hideable().is_some() {
+                    ui.checkbox(turn.remember, tr("dlg.dont_ask"));
+                    ui.add_space(6.0);
+                }
                 (yes, no) = dialog_buttons(ui, &primary, true, Some(&tr("btn.cancel")));
             });
         let (enter, escape) = turn.keys(ctx);
@@ -94,11 +107,15 @@ impl App {
             return Outcome::Keep;
         }
         if yes || enter {
+            if let (true, Some(id)) = (*turn.remember, c.hideable()) {
+                self.s.hidden_dialogs.insert(id);
+            }
             match c.clone() {
                 c @ (Confirm::ToSource(_) | Confirm::ToNative(_)) => self.run_sync(c),
                 Confirm::DeleteGroup(path) => self.apply(Action::DeleteGroup(path)),
                 Confirm::DeleteTunnel(t) => self.run_delete_tunnel(t, None),
                 Confirm::UninstallCore => self.run_core_setup(crate::daemon::install::UNINSTALL_FLAG),
+                Confirm::Disconnect(t) => self.switch(t, crate::daemon::proto::Plan::Disconnect),
             }
         }
         if yes || no || enter || escape || !open {
@@ -121,6 +138,7 @@ impl App {
                 (tr("del.group_title"), text, tr("del.delete"), None)
             }
             Confirm::UninstallCore => (tr("core.uninstall_title"), tr("core.uninstall_text"), tr("del.delete"), None),
+            Confirm::Disconnect(t) => (tr("off.title"), trf("off.text", &[t]), tr("act.disconnect"), None),
             Confirm::DeleteTunnel(t) if self.s.mode() == Mode::Engine => {
                 let running = self.shared.is_running(t);
                 let warning = running.then(|| tr("eng.delete_running"));
@@ -188,7 +206,7 @@ impl App {
         let (tunnel, to_source) = match c {
             Confirm::ToSource(t) => (t, true),
             Confirm::ToNative(t) => (t, false),
-            Confirm::DeleteGroup(_) | Confirm::DeleteTunnel(_) | Confirm::UninstallCore => return,
+            Confirm::DeleteGroup(_) | Confirm::DeleteTunnel(_) | Confirm::UninstallCore | Confirm::Disconnect(_) => return,
         };
         let Some(path) = self.s.book.source(&tunnel).map(PathBuf::from) else { return };
         *notice.lock().unwrap() = Some(trf("sync.running", &[&tunnel]));

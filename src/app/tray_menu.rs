@@ -2,6 +2,7 @@
 //! переключение, что у окна (`Switcher`): один запрос ядру, «несколько сразу» и конфликты решает ядро.
 //! Меню строит поток окна и тогда, когда окно скрыто и кадров не рисует, — поэтому всё нужное лежит здесь, а не в `App`.
 
+use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -10,10 +11,10 @@ use eframe::egui;
 use crate::groups::{self, Row, TunnelBook};
 use crate::i18n::tr;
 use crate::monitor::Snapshot;
-use crate::settings::Settings;
+use crate::settings::{DialogId, Settings};
 use crate::tray::{self, Entry, Hooks};
 
-use super::list::Primary;
+use super::list::{asks_first, Primary};
 use super::Switcher;
 
 /// Что из настроек окна нужно меню. Меняет их только окно (`publish`), а читает меню — и при скрытом окне.
@@ -22,21 +23,26 @@ pub(super) struct Layout {
     groups: bool,
     book: TunnelBook,
     multiple: bool,
+    /// Скрытые диалоги: спрашивать ли подтверждение отключения (`asks_first`), как окно.
+    hidden: BTreeSet<DialogId>,
 }
 
 impl Layout {
     pub(super) fn of(s: &Settings) -> Layout {
-        Layout { groups: s.view.groups, book: s.book.clone(), multiple: s.multiple }
+        Layout { groups: s.view.groups, book: s.book.clone(), multiple: s.multiple, hidden: s.hidden_dialogs.clone() }
     }
 }
 
 /// Раскладка, общая для окна и трея.
 pub(super) type SharedLayout = Arc<Mutex<Layout>>;
 
+/// Туннель, отключение которого из трея ждёт подтверждения в окне. Пишет трей, забирает окно в кадре.
+pub(super) type DisconnectAsk = Arc<Mutex<Option<String>>>;
+
 /// Положить в общую раскладку настройки окна, если они изменились (зовётся каждый кадр — сравнение дешёвое).
 pub(super) fn publish(layout: &SharedLayout, s: &Settings) {
     let mut l = layout.lock().unwrap();
-    if l.groups != s.view.groups || l.multiple != s.multiple || l.book != s.book {
+    if l.groups != s.view.groups || l.multiple != s.multiple || l.book != s.book || l.hidden != s.hidden_dialogs {
         *l = Layout::of(s);
     }
 }
@@ -47,6 +53,8 @@ pub(super) struct TrayHooks {
     pub(super) switcher: Switcher,
     /// «Выход» в трее — как в меню: при подключённых туннелях окно спросит, отключать ли их.
     pub(super) exit_request: Arc<AtomicBool>,
+    /// Отключение из трея — с тем же подтверждением, что в окне: трей кладёт сюда туннель и поднимает окно.
+    pub(super) disconnect_ask: DisconnectAsk,
 }
 
 impl Hooks for TrayHooks {
@@ -62,7 +70,17 @@ impl Hooks for TrayHooks {
         let primary = primary(&shared.snapshot_clone(), tunnel, shared.pending_label(tunnel));
         // Туннель уже переключается — как у окна: второе нажатие ничего не делает (пункт был серым).
         let Some(plan) = primary.plan() else { return };
-        let multiple = self.layout.lock().unwrap().multiple;
+        let (multiple, ask) = {
+            let layout = self.layout.lock().unwrap();
+            (layout.multiple, asks_first(plan, &layout.hidden))
+        };
+        if ask {
+            // Диалог рисует окно; скрытое окно кадров не рисует — его сначала показываем, как при выходе.
+            *self.disconnect_ask.lock().unwrap() = Some(tunnel.to_string());
+            tray::show_window();
+            self.switcher.ctx.request_repaint();
+            return;
+        }
         self.switcher.switch(tunnel.to_string(), plan, multiple);
     }
 
@@ -199,7 +217,7 @@ mod tests {
 
     #[test]
     fn flat_menu_marks_connected_and_busy_tunnels() {
-        let layout = Layout { groups: false, book: book(), multiple: false };
+        let layout = Layout { groups: false, book: book(), multiple: false, ..Layout::default() };
         let busy = |name: &str| (name == "lab").then_some("busy.connect");
         let got = entries(&layout, &snap(&["home", "lab", "office"], &["office"]), &busy);
         // Переключаемый туннель отмечен, как в таблице («занят» — не «отключён»), но выбрать его нельзя.
@@ -208,7 +226,7 @@ mod tests {
 
     #[test]
     fn grouped_menu_follows_the_table_tree() {
-        let layout = Layout { groups: true, book: book(), multiple: false };
+        let layout = Layout { groups: true, book: book(), multiple: false, ..Layout::default() };
         let got = entries(&layout, &snap(&["home", "lab", "office"], &[]), &none);
         let lab = Entry::Group { title: "Lab".into(), entries: vec![tunnel("lab", false, true)] };
         let work = Entry::Group { title: "Work".into(), entries: vec![lab, tunnel("office", false, true)] };
@@ -217,7 +235,7 @@ mod tests {
 
     #[test]
     fn groups_view_without_groups_is_flat() {
-        let layout = Layout { groups: true, book: TunnelBook::default(), multiple: false };
+        let layout = Layout { groups: true, ..Layout::default() };
         assert_eq!(entries(&layout, &snap(&["a"], &[]), &none), [tunnel("a", false, true)]);
     }
 
@@ -227,7 +245,7 @@ mod tests {
         // «Отключить»; теперь, как в окне («Неизвестно: нет связи с ядром»), — пояснение, без отметок, серые.
         let mut s = snap(&["a", "b"], &["b"]);
         s.core_lost = true;
-        let layout = Layout { groups: true, book: book(), multiple: false };
+        let layout = Layout { groups: true, book: book(), multiple: false, ..Layout::default() };
         let got = entries(&layout, &s, &none);
         assert_eq!(got, [Entry::Note(tr("tray.core_lost")), tunnel("a", false, false), tunnel("b", false, false)]);
         s.core_lost = false;
@@ -258,7 +276,7 @@ mod tests {
     fn hooks(core: Arc<FakeCore>, shared: Arc<Shared>, error: super::super::errors::ErrorSink, multiple: bool) -> TrayHooks {
         let layout = Arc::new(Mutex::new(Layout { multiple, ..Layout::default() }));
         let switcher = Switcher { shared, core, error, ctx: egui::Context::default() };
-        TrayHooks { layout, switcher, exit_request: Arc::default() }
+        TrayHooks { layout, switcher, exit_request: Arc::default(), disconnect_ask: Arc::default() }
     }
 
     #[test]
@@ -281,5 +299,49 @@ mod tests {
         let _busy = shared.try_pending_guard("office", "busy.connect").expect("free");
         hooks(core.clone(), shared, error, false).toggle("office");
         assert!(core.requests().is_empty());
+    }
+
+    /// Туннель, который ядро держит (переподключает): главное действие — «Отключить».
+    fn held(shared: &Shared, name: &str) {
+        let retry = crate::daemon::proto::RetryState { attempt: 1, next_in_s: 5, last_error: String::new(), slow: false };
+        shared.set_retries(BTreeMap::from([(name.to_string(), retry)]));
+    }
+
+    #[test]
+    fn tray_disconnect_asks_in_the_window_first() {
+        let core = Arc::new(FakeCore::new(|_| Ok(Response::Ok)));
+        let (shared, error) = sink();
+        held(&shared, "office");
+        let hooks = hooks(core.clone(), shared, error, false);
+        hooks.toggle("office");
+        assert!(core.requests().is_empty(), "без подтверждения ядру ничего не уходит");
+        assert_eq!(hooks.disconnect_ask.lock().unwrap().as_deref(), Some("office"), "вопрос ждёт окно");
+    }
+
+    #[test]
+    fn tray_disconnect_after_dont_ask_again_goes_straight_to_the_core() {
+        let core = Arc::new(FakeCore::new(|_| Ok(Response::Ok)));
+        let (shared, error) = sink();
+        held(&shared, "office");
+        let hooks = hooks(core.clone(), shared.clone(), error, false);
+        hooks.layout.lock().unwrap().hidden.insert(DialogId::Disconnect);
+        hooks.toggle("office");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while core.requests().is_empty() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(core.requests(), [r#"Switch { tunnel: "office", plan: Disconnect, multiple: false }"#]);
+        assert!(hooks.disconnect_ask.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn layout_carries_the_remembered_answer() {
+        let shared: SharedLayout = Arc::default();
+        let mut s = Settings::default();
+        publish(&shared, &s);
+        assert!(asks_first(crate::daemon::proto::Plan::Disconnect, &shared.lock().unwrap().hidden));
+        s.hidden_dialogs.insert(DialogId::Disconnect);
+        publish(&shared, &s);
+        assert!(!asks_first(crate::daemon::proto::Plan::Disconnect, &shared.lock().unwrap().hidden), "трей видит «больше не спрашивать»");
     }
 }

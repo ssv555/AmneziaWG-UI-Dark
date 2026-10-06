@@ -46,7 +46,7 @@ Top-level files, by layer. Layers are explained in [modules](modules.md).
 | `elevated.rs` | Start our exe elevated (UAC) and get its result back |
 | `events.rs` | Event log: model, in-memory ring, `events.log` file with rotation |
 | `stats.rs` | Cumulative per-tunnel statistics model and `Stats.ini` format |
-| `ping.rs` | ICMP ping through the VPN and its state |
+| `ping.rs` | ICMP ping through the VPN and its state; ping host check (`valid_host`) |
 | `groups.rs` | Tunnel book: nested groups, assignments, selection |
 | `settings.rs` | Window settings (`Settings.ini`) and the working-mode type |
 | `health.rs` | Tunnel state to level (dot color, tray icon, events) and text |
@@ -62,18 +62,20 @@ Top-level files, by layer. Layers are explained in [modules](modules.md).
 | File | Purpose |
 |---|---|
 | `window.rs` | Window state: size and position, closing, settings saving, scaling, `--snapshot` |
-| `list.rs`, `list/rows.rs` | Tunnel table: columns, keyboard, group and tunnel rows, menus, drag and drop |
+| `list.rs`, `list/rows.rs` | Tunnel table: columns, keyboard, group and tunnel rows, menus, drag and drop; the primary action of a tunnel (`Primary`: button, menus, tray, double click and `Enter` only connect) and the disconnect confirmation rule (`asks_first`) |
 | `details.rs`, `graph.rs`, `status.rs` | Selected tunnel details (right click on a value: Copy; private and preshared keys are never shown or copied), speed graph with ping strip, status bar |
 | `event_log.rs` | Event log panel: severity and tunnel filter, search, copy, "Save as…"; the filter is a pure function (`visible`) |
-| `menu.rs`, `theme.rs` | Menu bar, the one context-menu helper (right click, Shift+F10, Menu key), colors and fonts |
+| `menu.rs`, `theme.rs` | Menu bar with its keyboard (`MenuNav`: F10, lone Alt, Alt+letter mnemonics, arrows and submenus, command shortcuts; window filter for `SC_KEYMENU`), the one context-menu helper (right click, Shift+F10, Menu key), colors and fonts |
+| `a11y.rs` | Screen reader names for custom-painted elements (tunnel and group rows, speed graph, ping strip, status dots): one helper `describe` |
 | `diagnostics.rs` | Help → Copy diagnostics: a plain-text report (versions, mode, Windows, core and agent status, tunnel states, last 50 events, component versions) built by a pure function and passed through one scrub that removes keys, addresses, bare host names and the host of any URL (`scheme://host…` keeps scheme and path, the query and fragment become `?<query>` / `#<fragment>`; a `label.label` token with an alphabetic last label, except file names with known extensions, the app's own hosts and tunnel names), user and computer names and the profile path |
 | `dialog.rs`, `modals.rs`, `group_dialog.rs`, `about.rs`, `editor.rs` | The shared dialog-window constructor and the dialogs built with it (the About window has the **Copy diagnostics** button) |
+| `settings_dialog.rs` | Settings window: a draft of every option in sections (General, Notifications and tray, Network, Working mode), OK / Cancel / Apply (`dialog::dialog_ok_cancel_apply`), Reset to defaults with a confirmation; applied through `push_options`, `Action::Autostart` and `Action::ChooseMode` |
 | `core_ui.rs` | Core install and update strip, install through one UAC prompt, mode from the core |
 | `engine_mode.rs` | Mode 2 in the window: mode switch, import, take over from AmneziaWG, backup, new tunnel, rename |
 | `updates.rs`, `reminder.rs`, `markdown.rs` | "Updates and rollbacks" window, update reminder timing, release notes rendering |
 | `sources.rs`, `watcher.rs` | Source `.conf` files opened for editing and the config details cache |
 | `exit.rs`, `errors.rs` | Exit with the "keep the VPN" question, action errors into the event log |
-| `tray_menu.rs` | Tray menu with the tunnels (groups as submenus) and its click: the same switch request and the same primary action (`list::Primary`) as the window; without the core a note on top, tunnels unchecked and grey; a click on a tunnel notification selects the tunnel |
+| `tray_menu.rs` | Tray menu with the tunnels (groups as submenus) and its click: the same switch request and the same primary action (`list::Primary`) as the window; a disconnect is confirmed in the window first (`list::asks_first`); without the core a note on top, tunnels unchecked and grey; a click on a tunnel notification selects the tunnel |
 | `demo_core.rs` | Fake core for `--demo` |
 
 ### `src/daemon/` (core and agent)
@@ -83,7 +85,7 @@ Top-level files, by layer. Layers are explained in [modules](modules.md).
 | `mod.rs` | Core constants, `Config` (`core.ini`), the `CoreApi` trait, the core fence test |
 | `service.rs` | Windows service entry: dispatcher, status, stop and shutdown |
 | `server.rs` | Core runtime: threads, pipe server, request handling, switching, mode change, hold and release |
-| `retry.rs`, `restore.rs`, `netwatch.rs` | Reconnect schedule, desired-set rules, network-change signal |
+| `retry.rs`, `deadwatch.rs`, `restore.rs`, `netwatch.rs` | Reconnect schedule, dead-tunnel restarts, desired-set rules, network-change signal |
 | `agent_watch.rs` | Agent watchdog: Job object, restart backoff, `Hello` probes |
 | `pipe.rs`, `proto.rs` | Core pipe (access rules, deadlines) and the window-to-core protocol |
 | `budget.rs` | Connection slots (user, SYSTEM, reserve for `Hello`) shared by the core and the agent pipes |

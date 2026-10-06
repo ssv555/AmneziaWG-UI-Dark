@@ -11,7 +11,7 @@
 ```mermaid
 flowchart TB
   W["Окно / app<br/>app/, tray, taskbar, shortcut, icon, groups, settings, elevated"]
-  C["Ядро (служба)<br/>daemon/ (server, retry, restore, netwatch, agent_watch, pipe, proto, install, service),<br/>backend, engine"]
+  C["Ядро (служба)<br/>daemon/ (server, retry, deadwatch, restore, netwatch, agent_watch, pipe, proto, install, service),<br/>backend, engine"]
   A["Агент<br/>daemon/agent/, update/, ping, stats, native"]
   S["Общие библиотеки<br/>monitor, events, health, store, archive, conf, uapi, win, scm,<br/>i18n, ini, fmt, fsutil, crash"]
 
@@ -46,7 +46,7 @@ flowchart LR
   end
 
   subgraph C["Ядро (служба)"]
-    dcore["daemon/<br/>server, retry, restore, netwatch,<br/>agent_watch, pipe, proto, install, service"]
+    dcore["daemon/<br/>server, retry, deadwatch, restore, netwatch,<br/>agent_watch, pipe, proto, install, service"]
     backend
     engine
   end
@@ -177,12 +177,12 @@ flowchart LR
 Два теста просматривают текст исходников (только код, без блоков `#[cfg(test)]` и строк-комментариев `//`) и роняют сборку при нарушении.
 
 1. `core_does_not_reach_into_agent_work` в `src/daemon/mod.rs`. Ядро не должно зависеть от кода обновлений, пинга, статистики и помощника родного окна и не должно писать файл журнала на живых путях.
-   1.1. Проверяются: `daemon/server.rs`, `retry.rs`, `restore.rs`, `agent_watch.rs`, `netwatch.rs`, `service.rs` и функции `spawn`, `poll`, `core_state` из `src/monitor.rs`.
+   1.1. Проверяются: `daemon/server.rs`, `retry.rs`, `deadwatch.rs`, `restore.rs`, `agent_watch.rs`, `netwatch.rs`, `service.rs` и функции `spawn`, `poll`, `core_state` из `src/monitor.rs`.
    1.2. Запрещённые слова: `crate::update`, `update::`, `crate::ping`, `ping::`, `crate::stats`, `stats::`, `TunnelStats`, `crate::native`, `native::`, `helper::`, `run_elevated`.
    1.3. На живых путях запрещено ещё (во всех проверяемых файлах, кроме `service.rs`): `append_event`, `EventLog::open`, `events_file`. `service.rs` может трогать файл: он работает после остановки ядра.
    1.4. Не проверяются: `daemon/proto.rs` (его типы общие с окнами прежних версий), `install.rs`, `helper.rs`, а также код туннелей в `backend.rs` и `engine.rs`. Ограда — проверка текста, а не анализ зависимостей.
    1.5. `core_fence_sees_code_not_comments_or_tests` проверяет саму проверку.
-2. `agent_does_not_reach_into_vpn_code` в `src/daemon/agent/mod.rs`. В агенте не должно быть кода VPN: во всех файлах `src/daemon/agent/` запрещены `daemon::server`, `daemon::retry`, `daemon::restore`, `daemon::netwatch`, `crate::backend`, `crate::engine`, `crate::uapi` и `switching`.
+2. `agent_does_not_reach_into_vpn_code` в `src/daemon/agent/mod.rs`. В агенте не должно быть кода VPN: во всех файлах `src/daemon/agent/` запрещены `daemon::server`, `daemon::retry`, `daemon::deadwatch`, `daemon::restore`, `daemon::netwatch`, `crate::backend`, `crate::engine`, `crate::uapi` и `switching`.
 
 Проверки изоляции в `src/daemon/server.rs`: `isolation_killed_agent_is_respawned_and_the_core_keeps_working` и `isolation_hung_agent_is_killed_and_respawned_without_slowing_the_core`. Запуск процесса поддельного агента ждётся с запасом (`START_BUDGET`, 30 с: первый запуск только что собранного exe может тормозить проверка антивирусом); проверки ядра остаются строгими (каждый Switch — быстрее 1 с, туннель поднят по расписанию надзора). Ядро в этих тестах держит желаемый набор в памяти (`config_file: None`): надёжная запись `core.ini` дважды сбрасывает диск и под нагрузкой на диск одна занимает больше 1 с, так что срок 1 с мерит ядро, а не диск. `isolation_slow_agent_start_is_waited_for_not_taken_for_a_hang` проверяет саму обвязку агентом, который открывает канал через 4 с после запуска.
 

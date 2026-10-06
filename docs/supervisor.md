@@ -103,6 +103,26 @@ installer. Details of the update flow: [Updates](updates.md).
 5. After an engine update the manager sends `ReconnectEngine`: on the next tick the core reconnects the running mode 2 tunnels with the busy mark
    (a command, not an alarm). The core does not wait for it in the answer.
 
+## Dead tunnels
+
+The schedule above sees only stopped and missing services. A tunnel whose service runs but whose peer is unreachable (the handshake is not renewed) is
+handled by the dead-tunnel watch: decisions in `src/daemon/deadwatch.rs`, applied by `Core::watch_dead` in `src/daemon/server.rs` on every supervisor
+tick, from the core's 1 s poll (`src/monitor.rs`, `Live`: last handshake, rx/tx byte counters). Always on, no setting.
+
+1. **Dead** means all of:
+   1. the tunnel is desired and its service runs;
+   2. no handshake for more than `STALE_HANDSHAKE_SECS` (180 s, `src/health.rs`), or none at all. WireGuard renews the handshake every 2 min while
+      traffic flows and rejects session keys older than 3 min, so past 180 s no data can pass;
+   3. over the last `WINDOW` (60 s) the sent counter grew and the received one did not. Handshake attempts count as sent bytes, so an unreachable peer
+      shows as sending without receiving. An idle tunnel sends nothing and is **not** dead, however old its handshake.
+   After a restart only samples of the new service count, so the window fills again; samples older than 10 s (poll not running) decide nothing.
+2. **Restart.** The ordinary switch with `Reconnect` (origin "dead"), under the `switching` lock, of this tunnel only (its running neighbours are not
+   touched). It does nothing if the tunnel no longer runs (the retry schedule brings it up), is no longer desired or is held.
+3. **Backoff, no end.** First restart at detection, then after 1, 2, 5 min, then every 10 min while the tunnel stays dead.
+4. **Recovery.** A fresh handshake ends the count: one line with the number of restarts; the next drop starts from detection again.
+5. **Not touched:** held tunnels (a lease also resets the count), tunnels being switched by a command, tunnels under the retry schedule. A user command
+   over the tunnel and a mode switch reset the count.
+
 ## State diagram
 
 Per tunnel in the desired set (`Retries`, `Track`):
@@ -144,6 +164,11 @@ The event log (`events.log`, shown in the window) gets these supervisor lines; t
 | `<t> connected after N attempts` | info | tunnel confirmed after at least one attempt of the core, any phase |
 | `Connected` | info | tunnel came up without an attempt of the core (confirmed after 5 s) |
 | `Reconnecting <t>: started over by the user` | info | `Retry` |
+| `<t>: no handshake for over 3 minutes, the tunnel is sending but receives nothing - restarting it` | warning | a dead tunnel detected (once per drop) |
+| `<t>: dead tunnel restarted (restart N)[, error: ...]` | warning | restarts 1-3 (pauses 1, 2, 5 min) |
+| `<t> still has no connection after N restarts. Next - one restart every 10 minutes[, error: ...]` | error, with a notification | once, on entering the 10-minute phase; later restarts are **not** logged |
+| `<t> came back after N restarts` | info | a fresh handshake after at least one restart |
+| `<t>: the connection came back by itself` | info | a fresh handshake before the first restart |
 | `<t> was disconnected outside this program (its service is gone): it will not be reconnected` | info | mode 1, service removed in the AmneziaWG window |
 | `<t>: off supervision for up to N s while AmneziaWG is being installed` | info | `HoldNative` |
 | `<t>: the hold expired without being handed back - supervision resumes` | warning | lease ended by itself |

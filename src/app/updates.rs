@@ -552,15 +552,13 @@ fn toggle(selected: &mut BTreeSet<Component>, id: Component) {
 }
 
 /// Заголовок меню «Справка»: с отметкой — маленькая жёлтая точка после текста, по центру строки.
-pub(super) fn menu_title(ui: &Ui, text: String, badge: bool) -> egui::WidgetText {
+/// Текст с мнемоникой готовит `menu::menu_title`; точка — по размеру его шрифта.
+pub(super) fn menu_title(mut job: egui::text::LayoutJob, badge: bool) -> egui::WidgetText {
     if !badge {
-        return text.into();
+        return job.into();
     }
-    let font = egui::TextStyle::Button.resolve(ui.style());
-    let mut job = egui::text::LayoutJob::default();
-    // PLACEHOLDER — цвет текста подставит кнопка меню, как у соседних пунктов.
-    job.append(&text, 0.0, egui::TextFormat { font_id: font.clone(), color: Color32::PLACEHOLDER, ..Default::default() });
-    let dot = egui::FontId::proportional(font.size * 0.55);
+    let size = job.sections.first().map_or(14.0, |s| s.format.font_id.size);
+    let dot = egui::FontId::proportional(size * 0.55);
     job.append("●", 4.0, egui::TextFormat { font_id: dot, color: YELLOW, valign: Align::Center, ..Default::default() });
     job.into()
 }

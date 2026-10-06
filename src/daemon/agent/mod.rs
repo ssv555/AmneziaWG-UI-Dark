@@ -447,7 +447,7 @@ mod tests {
     /// Агент не тянет VPN-код: туннели, переключение и переподключение остаются в ядре.
     #[test]
     fn agent_does_not_reach_into_vpn_code() {
-        let forbidden = ["daemon::server", "daemon::retry", "daemon::restore", "daemon::netwatch", "crate::backend", "crate::engine", "crate::uapi", "switching"];
+        let forbidden = ["daemon::server", "daemon::retry", "daemon::deadwatch", "daemon::restore", "daemon::netwatch", "crate::backend", "crate::engine", "crate::uapi", "switching"];
         for (name, source) in [
             ("mod.rs", include_str!("mod.rs")),
             ("proto.rs", include_str!("proto.rs")),

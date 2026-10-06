@@ -38,6 +38,8 @@ pub(super) enum Modal {
     /// Конфиг в редакторе с ошибками сохраняют: записать всё равно (и что сделать затем) или вернуться к правке.
     EditorInvalid(super::editor::AfterSave),
     About,
+    /// Окно «Настройки» с черновиком параметров.
+    Settings(Box<super::settings_dialog::SettingsDialog>),
 }
 
 /// Что диалог решил в этом кадре.

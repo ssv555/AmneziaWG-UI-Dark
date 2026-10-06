@@ -28,6 +28,7 @@
 - Nested groups of any depth (`Europe/Netherlands`), shown as a tree or a flat list. A group row shows totals for
   its whole subtree: active / total, downloaded, uploaded, peak speed and time share.
 - Drag and drop tunnels and groups, a right-click menu, keyboard navigation, instant search (`Ctrl+F`).
+- Screen readers (Narrator, NVDA): tunnel and group rows, the speed graph and status dots are read with their name and state.
 - Sortable, resizable columns: downloaded total, uploaded total, peak speed, share of connected time.
 
 **Live status**
@@ -43,7 +44,7 @@
 - A coloured dot on the tray icon and on the taskbar button (overlay badge) shows the state; Windows notifications when a link
   drops or comes back. Clicking a notification opens the window on that tunnel.
 - **Tray menu** (right click on the tray icon): Open window, the tunnels (in their groups when the window shows groups;
-  connected ones are checked) and Exit. Clicking a tunnel connects or disconnects it exactly like the window does,
+  connected ones are checked) and Exit. Clicking a tunnel connects or disconnects it exactly like the window does (disconnecting asks first),
   including the "several tunnels at once" setting. Without a connection to the core the state is unknown: the menu
   says so on top, no tunnel is checked and none can be clicked (the window shows "Unknown: no connection to the core"
   and greys out the Connect / Disconnect button).
@@ -57,7 +58,11 @@
 - **Tunnels come back after a reboot, power loss or a drop**: the core reconnects a tunnel you left connected
   every 10 s for 3 minutes, every minute up to 10 minutes, then every 10 minutes, and at once when the network changes.
 - **Exit asks about the VPN** when tunnels are connected: disconnect and exit, or exit and keep the VPN running. The
-  choice can be remembered; **Settings → Show hidden dialogs again** brings the question back.
+  choice can be remembered; **Settings → Settings… → Show hidden dialogs again** brings the question back.
+- **No accidental disconnects**: a double click or `Enter` on a tunnel row only connects; on a connected tunnel they do
+  nothing. **Disconnect** (card button, row menu, tray) asks first, with **Don't ask again** (**Settings → Settings…
+  → Show hidden dialogs again** brings the question back). With "several tunnels at once" off, the tooltip of **Connect** names the
+  tunnels it will disconnect.
 - **Copy diagnostics** (**Help → Copy diagnostics**, also a button in **About**): a plain-text report for bug reports goes to the clipboard - versions, mode, Windows, core and agent status, tunnel names with state, the last 50 events, component versions. Keys, addresses, host names, user and computer names are removed, the profile path becomes `%USERPROFILE%`.
 - **Updates and rollbacks** (**Help → Check for updates…**): the original AmneziaWG client, the built-in engine and
   the app itself, each separately or all at once. Before every update and every rollback the current version is
@@ -70,7 +75,9 @@
   bottom right (**Open** / **Later**; it can be dragged by its title, the close button and `Esc` mean **Later**) without
   stealing focus or blocking the window; if the window is hidden in the
   tray, Windows shows a notification as well.
-- Every panel can be switched on or off in the **View** menu; behaviour is configured in **Settings**.
+- Every panel can be switched on or off in the **View** menu; behaviour is configured in the **Settings…** window (sections General, Notifications and tray,
+  Network, Working mode; **OK** / **Cancel** / **Apply**, **Reset to defaults** with a confirmation). The ping host is
+  checked there: a host name or an IPv4 address, otherwise the window shows the error and does not save.
 - Sharp on any screen: the interface follows the Windows display scale of each monitor (Full HD, 2K, 4K, 8K) and
   can be made larger or smaller on top of it with **View -> Interface scale** or `Ctrl+Plus` / `Ctrl+Minus`.
 - Dark theme with a dark title bar. English by default, Russian built in, easy to add your own language.
@@ -158,10 +165,14 @@ Start `awg-ui.exe`. Select a tunnel and use **Connect / Disconnect** (or **Recon
 | `Ctrl+F` | Focus the tunnel search (`Esc` clears it) |
 | `Up` / `Down` | Move between rows |
 | `Left` / `Right` | Collapse / expand a group, or jump to the parent |
-| `Enter` | Connect a tunnel (it never disconnects; use the button or the menu), or collapse / expand a group |
+| `Enter`, double click | Connect a tunnel (never disconnects; use the button or the menu), or collapse / expand a group |
 | `F2` | Rename the selected group |
 | `Delete` | Delete the selected group or tunnel (with confirmation) |
 | `Shift+F10` / Menu key | Context menu of the selected row, or of the focused card value or log line (`Tab` moves the focus) |
+| `F10` or `Alt` alone | Focus the menu bar (first menu highlighted); `Left` / `Right` move between menus, `Down` or `Enter` opens one, `Esc` steps back |
+| `Alt+F`, `Alt+V`, `Alt+S`, `Alt+L`, `Alt+H` | Open **File**, **View**, **Settings**, **Language**, **Help** (the underlined letter); inside a menu `Up` / `Down` move, `Enter` runs the item, `Right` opens a submenu, `Left` closes it |
+| `Ctrl+N` / `Ctrl+I` | New tunnel / import tunnels (built-in engine mode) |
+| `F1` / `F5` | About / check for updates |
 | `Ctrl+S` | Save in the built-in config editor |
 | `Ctrl+Plus` / `Ctrl+Minus` / `Ctrl+0` | Larger / smaller interface / back to 100 % |
 | `Enter` / `Esc` in dialogs | Primary button / cancel; `Esc` and the title-bar close button cancel or close any window |
@@ -178,7 +189,7 @@ Start `awg-ui.exe`. Select a tunnel and use **Connect / Disconnect** (or **Recon
 
 - Closing the window hides it to the tray; **File -> Exit** quits only the UI. **Exit with AmneziaWG** also closes
   the native window and its tray icon. Services and tunnels keep running either way.
-- **Settings -> Start at Windows sign-in** starts the window hidden in the tray (`--tray`) when you sign in. The core
+- **Settings -> Settings… -> Start at Windows sign-in** starts the window hidden in the tray (`--tray`) when you sign in. The core
   does not need it: it is a service and starts with Windows. The same switch from the command line:
   `awg-ui.exe --autostart on|off`.
 - **Settings -> Create desktop shortcut** puts a shortcut to the window on the desktop.
@@ -197,7 +208,7 @@ Start `awg-ui.exe`. Select a tunnel and use **Connect / Disconnect** (or **Recon
 
 ### Working modes
 
-**Settings -> Working mode** switches between two modes. Before switching, a window explains the chosen mode and
+**Settings -> Settings… -> Working mode** switches between two modes. After **OK**, a window explains the chosen mode and
 lists the tunnels that will be disconnected; the core switches without restarting the window.
 
 1. **On top of AmneziaWG** (default). The official client runs alongside and receives its own updates; this app shows
@@ -228,7 +239,8 @@ English is the default and Russian is built in. To add a translation:
 1. **Language -> Add language...** creates a template `lang\<ISO 639-2 code>.lng` (for example `deu.lng`,
    `fra.lng`) with all keys and the English text, and opens it in Notepad.
 2. Translate the values and save the file under the language's code.
-3. Pick the language in the **Language** menu. A missing key or an empty value falls back to English.
+3. Pick the language in the **Language** menu. A missing key or an empty value falls back to English. In menu titles
+   `&` marks the Alt letter (`&File`); keep the letters of the five menus different.
 
 Pull requests with new translations are very welcome - see [CONTRIBUTING.md](CONTRIBUTING.md).
 
