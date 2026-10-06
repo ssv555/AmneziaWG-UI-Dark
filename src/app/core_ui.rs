@@ -229,7 +229,7 @@ impl App {
     }
 
     /// Полоса над таблицей, пока ядро не готово: что с ним и кнопка, которая это исправит.
-    pub(super) fn core_banner(&self, ctx: &egui::Context, actions: &mut Vec<Action>) {
+    pub(super) fn core_banner(&self, ui: &mut egui::Ui, actions: &mut Vec<Action>) {
         let link = self.core_link.state();
         if let LinkState::Outdated(v) = &link {
             self.self_update(v, false);
@@ -248,7 +248,7 @@ impl App {
             LinkState::Installing => (tr("core.installing"), None, None),
         };
         let mut retry_clicked = false;
-        egui::TopBottomPanel::top("core-banner").show(ctx, |ui| {
+        egui::Panel::top("core-banner").show(ui, |ui| {
             ui.horizontal(|ui| {
                 if matches!(link, LinkState::Installing) {
                     ui.spinner();

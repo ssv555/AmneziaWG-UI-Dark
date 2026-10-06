@@ -4,9 +4,11 @@
 //! Новый компонент — новая реализация здесь, а не ветки по всему менеджеру.
 
 use std::path::Path;
+use std::sync::Arc;
 
 use super::backup::BackupInfo;
 use super::busy::Busy;
+use super::core_link::CoreLink;
 use super::manager::{Fetched, Manager, DOWNLOADS};
 use super::{feed, ours, sign, Action, Component};
 use crate::i18n::tr;
@@ -60,8 +62,15 @@ pub(super) trait ComponentOps: Send + Sync {
     fn journal(&self, _action: Action) -> Journal {
         Journal::After
     }
-    /// Компонент заменён (обновлён или возвращён) успешно.
-    fn after_change(&self) {}
+    /// Компонент заменён (обновлён или возвращён) успешно; ошибка уходит в журнал, замена остаётся удачной.
+    fn after_change(&self) -> Result<(), String> {
+        Ok(())
+    }
+    /// `after_change` что-то делает и не должен потеряться: менеджер отмечает его долгом до замены и повторяет после
+    /// сбоя или смерти процесса. У программы шага нет (её замена и так перезапускает процесс), у AmneziaWG — тоже.
+    fn owes_after_change(&self) -> bool {
+        false
+    }
 }
 
 /// Реализации по компонентам; у каждого компонента ровно одна.
@@ -76,9 +85,10 @@ impl Components {
         Components { native, engine, app }
     }
 
-    /// Настоящие компоненты; `on_engine_changed` — движок заменён: ядро переподключает туннели режима 2.
-    pub(super) fn real(on_engine_changed: Box<dyn Fn() + Send + Sync>) -> Self {
-        Components::new(Box::new(native::NativeOps), Box::new(EngineOps { on_changed: on_engine_changed }), Box::new(AppOps))
+    /// Настоящие компоненты; туннели при замене трогает только ядро (`core`): аренда на время MSI, переподключение
+    /// после замены движка.
+    pub(super) fn real(core: Arc<dyn CoreLink>) -> Self {
+        Components::new(Box::new(native::NativeOps { core: core.clone() }), Box::new(EngineOps { core }), Box::new(AppOps))
     }
 
     pub(super) fn get(&self, c: Component) -> &dyn ComponentOps {
@@ -97,7 +107,7 @@ fn ours_release(f: &Fetched) -> Result<&(feed::Release, sign::Manifest), String>
 
 /// Движок режима 2 (`tunnel.dll` + `wintun.dll`).
 struct EngineOps {
-    on_changed: Box<dyn Fn() + Send + Sync>,
+    core: Arc<dyn CoreLink>,
 }
 
 impl ComponentOps for EngineOps {
@@ -127,8 +137,14 @@ impl ComponentOps for EngineOps {
         ours::restore_engine(job.dir)
     }
 
-    fn after_change(&self) {
-        (self.on_changed)();
+    /// Переподключает ядро в своём потоке надзора: работа обновления не ждёт туннели и не держит их блокировку.
+    fn after_change(&self) -> Result<(), String> {
+        self.core.reconnect_engine()
+    }
+
+    /// Без переподключения туннели режима 2 так и работают на прежней DLL.
+    fn owes_after_change(&self) -> bool {
+        true
     }
 }
 
@@ -208,7 +224,7 @@ pub(super) mod fake {
 
         /// Версию из проверки находит настоящая реализация компонента `c`; установленная — `installed`.
         pub(in crate::update) fn real(c: Component, installed: Option<&str>, calls: &Calls) -> FakeOps {
-            let Components { native, engine, app } = Components::real(Box::new(|| {}));
+            let Components { native, engine, app } = Components::real(Arc::new(crate::update::core_link::fake::RecordingCore::default()));
             let real = match c {
                 Component::Native => native,
                 Component::Engine => engine,
@@ -282,8 +298,9 @@ pub(super) mod fake {
             self.journal
         }
 
-        fn after_change(&self) {
+        fn after_change(&self) -> Result<(), String> {
             self.call(format!("changed {:?}", self.c));
+            Ok(())
         }
     }
 

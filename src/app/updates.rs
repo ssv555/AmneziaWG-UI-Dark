@@ -1,6 +1,6 @@
 //! Окно «Обновления и откаты» (Справка → «Проверить обновления…»): компоненты, их версии и что нового,
-//! установка выбранного с подтверждением, история с кнопкой «Вернуть». Всё делает ядро: окно спрашивает
-//! его состояние раз в секунду, пока открыто, и раз в 30 минут — для отметки «есть новое» в меню «Справка».
+//! установка выбранного с подтверждением, история с кнопкой «Вернуть». Всё делает агент (вторичная служба): окно
+//! спрашивает его состояние раз в секунду, пока открыто, и раз в 30 минут — для отметки «есть новое» в меню «Справка».
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -12,10 +12,11 @@ use eframe::egui::{self, Align, Align2, Color32, Layout, RichText, Ui, Vec2};
 use super::dialog::{dialog_window, window_escape, window_keys};
 use super::markdown;
 use super::modals::{Modal, Outcome as ModalOutcome, Turn};
-use super::{dialog_buttons, mono, Core, ErrorSink, GRAY, GREEN, RED, YELLOW};
+use super::reminder::{self, Due, Presence};
+use super::{dialog_buttons, mono, ErrorSink, GRAY, GREEN, RED, YELLOW};
+use crate::daemon::agent::client::{AgentApi, UpdatesError};
 use crate::fmt;
 use crate::i18n::{tr, trf};
-use crate::monitor::Shared;
 use crate::update::{Action, Available, Component, ComponentState, HistoryEntry, RestoreBlock, RestoreOffer, UpdateOp, UpdatesState};
 use crate::elevated::Outcome;
 
@@ -50,7 +51,7 @@ const MIN_HIST_NAME: f32 = 120.0;
 /// Окно «Обновления и откаты»: состояние, показ, опрос ядра и подтверждение. Принадлежит `App`, остальное окно
 /// видит только публичные методы; поля закрыты.
 pub(super) struct UpdatesWindow {
-    /// С чем окно говорит: ядро, журнал ошибок, строка уведомления, перерисовка, режим монитора.
+    /// С чем окно говорит: агент, журнал ошибок, строка уведомления, перерисовка.
     link: Link,
     open: bool,
     polled: Arc<Mutex<Polled>>,
@@ -68,6 +69,16 @@ pub(super) struct UpdatesWindow {
     badge_at: Option<Instant>,
     /// Обновления из последнего ответа ядра; кадр забирает их и решает, о чём сообщить (настройки — в потоке окна).
     proposed: Arc<Mutex<Option<Vec<(Component, String)>>>>,
+    /// Что ядро предлагает сейчас (последний ответ); пусто после установки — напоминания прекращаются.
+    offered_now: Vec<(Component, String)>,
+    /// Не раньше какого момента снова спрашивать Windows, на месте ли пользователь (после отказа сообщить).
+    next_check: Option<Instant>,
+    /// Уведомление закрыто «Позже», крестиком или Esc (или открыто кнопкой): следующий кадр сдвигает напоминание на сутки.
+    snoozed: bool,
+    /// Показанное уведомление — напоминание, а не первое сообщение: другой текст.
+    news_reminder: bool,
+    /// Откуда берётся состояние пользователя; в тестах подменяется.
+    presence: fn() -> Presence,
     /// Показанное и ещё не закрытое уведомление: компонент и версия.
     news: Vec<(Component, String)>,
     /// Уведомление — активное окно: последний щелчок мыши был по нему. Только тогда ему достаётся Esc.
@@ -85,17 +96,24 @@ struct Notes {
 /// Внешнее, что окну нужно от программы; клонируется в потоки запросов.
 #[derive(Clone)]
 pub(super) struct Link {
-    core: Core,
+    /// Обновления ведёт агент (вторичная служба); `None` — демо, агента нет.
+    agent: Option<Arc<dyn AgentApi>>,
     error: ErrorSink,
     /// Строка уведомления в главном окне (отмена UAC).
     notice: Arc<Mutex<Option<String>>>,
     ctx: egui::Context,
-    shared: Arc<Shared>,
 }
 
 impl Link {
-    pub(super) fn new(core: Core, error: ErrorSink, notice: Arc<Mutex<Option<String>>>, ctx: egui::Context, shared: Arc<Shared>) -> Self {
-        Self { core, error, notice, ctx, shared }
+    pub(super) fn new(agent: Option<Arc<dyn AgentApi>>, error: ErrorSink, notice: Arc<Mutex<Option<String>>>, ctx: egui::Context) -> Self {
+        Self { agent, error, notice, ctx }
+    }
+
+    fn updates(&self, op: UpdateOp) -> Result<UpdatesState, UpdatesError> {
+        match &self.agent {
+            Some(agent) => agent.updates(op),
+            None => Err(UpdatesError::Unreachable("demo: no secondary service".into())),
+        }
     }
 }
 
@@ -186,6 +204,11 @@ impl UpdatesWindow {
             badge: Arc::default(),
             badge_at: None,
             proposed: Arc::default(),
+            offered_now: Vec::new(),
+            next_check: None,
+            snoozed: false,
+            news_reminder: false,
+            presence: reminder::probe,
             news: Vec::new(),
             news_focused: false,
             notes: None,
@@ -210,11 +233,12 @@ impl UpdatesWindow {
         }
     }
 
-    /// Каждый кадр до окна: отметка в меню и новые обновления, о которых ещё не сообщали (`notified` — настройки).
-    /// Всплывающее уведомление Windows или его отсутствие решает вызывающий: он знает, скрыто ли главное окно.
-    pub(super) fn tick(&mut self, notified: &mut BTreeMap<String, String>) -> Vec<(Component, String)> {
+    /// Каждый кадр до окна: отметка в меню и напоминания (`notified`, `reminded` — настройки, `now` — unix-секунды).
+    /// Возвращает текст всплывающего уведомления Windows, если об обновлении сообщили в этот кадр: показать его
+    /// или нет (настройка уведомлений), решает вызывающий.
+    pub(super) fn tick(&mut self, notified: &mut BTreeMap<String, String>, reminded: &mut Option<u64>, now: u64) -> Option<String> {
         self.refresh_badge();
-        self.collect_news(notified)
+        self.collect_news(notified, reminded, now)
     }
 
     /// Окно со списком компонентов и историей, опрос ядра. `confirm_open` — подтверждение этого окна уже открыто.
@@ -359,7 +383,7 @@ impl UpdatesWindow {
             self.news_focused = false;
             return;
         }
-        let text = news_text(&self.news);
+        let text = news_text(&self.news, self.news_reminder);
         let (mut shown, mut open, mut later) = (true, false, false);
         // Активным уведомление делает щелчок по нему, щелчок в любом другом месте — снимает. Проверка — до показа:
         // попадание считается по раскладке прошлого кадра (её и видел пользователь); после `show` в этом кадре
@@ -372,7 +396,7 @@ impl UpdatesWindow {
         dialog_window(ctx, tr("upd.notice_title"), NEWS_ID, &mut shown)
             .order(egui::Order::Foreground)
             .pivot(Align2::RIGHT_BOTTOM)
-            .default_pos(ctx.screen_rect().right_bottom() - Vec2::splat(12.0))
+            .default_pos(ctx.content_rect().right_bottom() - Vec2::splat(12.0))
             .show(ctx, |ui| {
                 ui.set_max_width(320.0);
                 ui.add(egui::Label::new(text).wrap());
@@ -386,6 +410,8 @@ impl UpdatesWindow {
         if open || later {
             self.news.clear();
             self.news_focused = false;
+            // Закрыто любым способом — следующее напоминание не раньше чем через сутки.
+            self.snoozed = true;
         }
         if open {
             self.open();
@@ -408,7 +434,7 @@ impl UpdatesWindow {
         let pending = if command { self.command.begin() } else { self.polling.begin() };
         let (link, seq, polled, badge, proposed) = (self.link.clone(), self.seq, self.polled.clone(), self.badge.clone(), self.proposed.clone());
         std::thread::spawn(move || {
-            take_updates_reply(link.core.updates(op), command, seq, &polled, &badge, &proposed, &link.error);
+            take_updates_reply(link.updates(op), command, seq, &polled, &badge, &proposed, &link.error);
             drop(pending);
             link.ctx.request_repaint();
         });
@@ -433,14 +459,14 @@ impl UpdatesWindow {
     /// Отметка «есть новое»: при запуске и раз в 30 минут, только с ядром. Пока окно открыто, её ведёт опрос окна.
     fn refresh_badge(&mut self) {
         let now = Instant::now();
-        if !badge_due(self.open, self.link.shared.mirrors_core(), self.badge_at, now) {
+        if !badge_due(self.open, self.link.agent.is_some(), self.badge_at, now) {
             return;
         }
         self.badge_at = Some(now);
         let (link, badge, proposed) = (self.link.clone(), self.badge.clone(), self.proposed.clone());
         std::thread::spawn(move || {
             // Ошибку в журнал не пишем: фоновая проверка повторялась бы в нём каждые 30 минут; окно покажет её само.
-            if let Ok(state) = link.core.updates(UpdateOp::State) {
+            if let Ok(state) = link.updates(UpdateOp::State) {
                 badge.store(has_updates(&state), Ordering::SeqCst);
                 *proposed.lock().unwrap() = Some(offered_updates(&state));
                 link.ctx.request_repaint();
@@ -448,10 +474,43 @@ impl UpdatesWindow {
         });
     }
 
-    /// Новый ответ ядра: что из предложенного ещё не сообщали.
-    fn collect_news(&mut self, notified: &mut BTreeMap<String, String>) -> Vec<(Component, String)> {
-        let Some(offered) = self.proposed.lock().unwrap().take() else { return Vec::new() };
-        refresh_news(&mut self.news, &offered, notified)
+    /// Новый ответ ядра и напоминания по нему. Сообщает (уведомление в окне и текст для уведомления Windows), когда
+    /// `reminder::due` говорит «пора» и пользователь на месте; иначе молчит и повторяет проверку через `RECHECK`.
+    fn collect_news(&mut self, notified: &mut BTreeMap<String, String>, reminded: &mut Option<u64>, now: u64) -> Option<String> {
+        if std::mem::take(&mut self.snoozed) {
+            *reminded = Some(now);
+        }
+        if let Some(offered) = self.proposed.lock().unwrap().take() {
+            // Установленное выпадает из открытого уведомления; новый ответ — повод проверить сразу, не ждать RECHECK.
+            self.news.retain(|n| offered.contains(n));
+            self.offered_now = offered;
+            self.next_check = None;
+        }
+        let due = reminder::due(&self.offered_now, notified, *reminded, now)?;
+        if self.open {
+            // Список обновлений уже перед глазами: сообщать нечем, но считаем, что пользователь в курсе.
+            self.mark_told(notified, reminded, now);
+            return None;
+        }
+        let at = Instant::now();
+        if self.next_check.is_some_and(|t| at < t) {
+            return None;
+        }
+        if !reminder::available((self.presence)()) {
+            self.next_check = Some(at + reminder::RECHECK);
+            return None;
+        }
+        self.next_check = None;
+        self.mark_told(notified, reminded, now);
+        self.news = self.offered_now.clone();
+        self.news_reminder = due == Due::Remind;
+        Some(news_text(&self.news, self.news_reminder))
+    }
+
+    /// О предложенном сообщили (или оно у пользователя перед глазами): запомнить версии и время.
+    fn mark_told(&self, notified: &mut BTreeMap<String, String>, reminded: &mut Option<u64>, now: u64) {
+        to_notify(&self.offered_now, notified);
+        *reminded = Some(now);
     }
 }
 
@@ -460,9 +519,10 @@ fn poll_due(polling: bool, polled_at: Option<Instant>, now: Instant) -> bool {
     !polling && polled_at.map_or(true, |t| now.saturating_duration_since(t) >= POLL_EVERY)
 }
 
-/// Фоновая проверка для отметки меню: окно закрыто (иначе её ведёт его опрос), ядро есть, с прошлой — полчаса.
-fn badge_due(window_open: bool, mirrors_core: bool, badge_at: Option<Instant>, now: Instant) -> bool {
-    !window_open && mirrors_core && badge_at.map_or(true, |t| now.saturating_duration_since(t) >= BADGE_EVERY)
+/// Фоновая проверка для отметки меню: окно закрыто (иначе её ведёт его опрос), агент есть (не демо), с прошлой —
+/// полчаса.
+fn badge_due(window_open: bool, has_agent: bool, badge_at: Option<Instant>, now: Instant) -> bool {
+    !window_open && has_agent && badge_at.map_or(true, |t| now.saturating_duration_since(t) >= BADGE_EVERY)
 }
 
 /// Что делает подтверждение после кадра.
@@ -818,10 +878,10 @@ fn status_color(s: &Status) -> Color32 {
     }
 }
 
-/// Ответ ядра на запрос окна обновлений `seq`: состояние — в окно (если новее показанного) и в отметку меню;
+/// Ответ агента на запрос окна обновлений `seq`: состояние — в окно (если новее показанного) и в отметку меню;
 /// ошибка — в журнал событий: у команды всегда, у опроса — один раз, пока текст не сменится.
 fn take_updates_reply(
-    result: Result<UpdatesState, String>,
+    result: Result<UpdatesState, UpdatesError>,
     command: bool,
     seq: u64,
     polled: &Mutex<Polled>,
@@ -840,11 +900,20 @@ fn take_updates_reply(
             }
             p.error = None;
         }
-        Err(e) => {
+        Err(UpdatesError::Failed(e)) => {
             if command || p.error.as_ref() != Some(&e) {
                 error.push(e.clone());
             }
             p.error = Some(e);
+        }
+        // Агента нет (перезапускается, ядро прежней версии): окно говорит «вторичная служба недоступна», а не «нет
+        // связи с ядром» — туннели от агента не зависят. Опрос в журнал не пишет (остановки агента пишет сторож ядра),
+        // команда пользователя — пишет: он нажал и должен узнать, почему ничего не произошло.
+        Err(e @ UpdatesError::Unreachable(_)) => {
+            if command {
+                error.push(e.to_string());
+            }
+            p.error = Some(tr("agent.unavailable"));
         }
     }
 }
@@ -862,7 +931,7 @@ fn offered_updates(s: &UpdatesState) -> Vec<(Component, String)> {
         .collect()
 }
 
-fn component_key(c: Component) -> &'static str {
+pub(super) fn component_key(c: Component) -> &'static str {
     match c {
         Component::Native => "native",
         Component::Engine => "engine",
@@ -884,25 +953,10 @@ fn to_notify(offered: &[(Component, String)], notified: &mut BTreeMap<String, St
     fresh
 }
 
-/// Открытое уведомление следует за ответом ядра: обновлённое выпадает, новая версия заменяет старую. Возвращает
-/// то, о чём сообщается впервые.
-fn refresh_news(
-    news: &mut Vec<(Component, String)>,
-    offered: &[(Component, String)],
-    notified: &mut BTreeMap<String, String>,
-) -> Vec<(Component, String)> {
-    news.retain(|n| offered.contains(n));
-    let fresh = to_notify(offered, notified);
-    for (c, v) in &fresh {
-        news.retain(|(k, _)| k != c);
-        news.push((*c, v.clone()));
-    }
-    fresh
-}
-
-pub(super) fn news_text(list: &[(Component, String)]) -> String {
+/// Текст уведомления; `reminder` — напоминание о том, о чём уже сообщали.
+fn news_text(list: &[(Component, String)], reminder: bool) -> String {
     let items: Vec<String> = list.iter().map(|(c, v)| format!("{} {v}", short(*c))).collect();
-    trf("upd.notice_text", &[&items.join(", ")])
+    trf(if reminder { "upd.remind_text" } else { "upd.notice_text" }, &[&items.join(", ")])
 }
 
 /// Компоненты с версиями, которые пользователь видел в подтверждении: ядро ставит только их.
@@ -1067,7 +1121,7 @@ mod tests {
         assert!(release_notes(&with_notes(row(Component::App, Some("0.4.0"), Some("0.5.0"), true))).is_some());
     }
 
-    fn pair(c: Component, v: &str) -> (Component, String) {
+    pub(super) fn pair(c: Component, v: &str) -> (Component, String) {
         (c, v.to_string())
     }
 
@@ -1121,31 +1175,6 @@ mod tests {
         assert_eq!(offered_updates(&s), vec![pair(Component::Engine, "3.1.20260901")]);
         assert_eq!(targets(&s, &[Component::Engine]), vec![pair(Component::Engine, "3.1.20260901")], "ядру уходит версия без пояснения");
         assert_eq!(apply_lines(&s, &[Component::Engine]), vec!["Mode 2 engine: 1 → 3.1.20260901 · wintun 0.14.1"], "в подтверждении — с пояснением");
-    }
-
-    #[test]
-    fn open_notice_follows_the_core_answer() {
-        let (mut notified, mut news) = (BTreeMap::new(), Vec::new());
-        let fresh = refresh_news(&mut news, &[pair(Component::Native, "3.1.1")], &mut notified);
-        assert_eq!((fresh.len(), news.len()), (1, 1));
-        // Та же версия: ничего нового, уведомление остаётся.
-        assert!(refresh_news(&mut news, &[pair(Component::Native, "3.1.1")], &mut notified).is_empty());
-        assert_eq!(news, vec![pair(Component::Native, "3.1.1")]);
-        // Вышла более новая: заменяет прежнюю строку.
-        refresh_news(&mut news, &[pair(Component::Native, "3.2.0")], &mut notified);
-        assert_eq!(news, vec![pair(Component::Native, "3.2.0")]);
-        // Обновили (предложений нет): уведомление исчезает, запомненная версия остаётся.
-        assert!(refresh_news(&mut news, &[], &mut notified).is_empty());
-        assert!(news.is_empty());
-        assert_eq!(notified["native"], "3.2.0");
-    }
-
-    #[test]
-    fn notice_text_lists_components() {
-        assert_eq!(
-            news_text(&[pair(Component::Native, "3.1.0"), pair(Component::App, "0.5.0")]),
-            "Updates available: AmneziaWG 3.1.0, AmneziaWG UI Dark 0.5.0"
-        );
     }
 
     fn entry(from: Option<&str>, to: Option<&str>) -> HistoryEntry {
@@ -1341,52 +1370,113 @@ mod tests {
     }
 }
 
-/// Окно обновлений против подделки ядра: что доходит до журнала событий.
+/// Окно обновлений против подделки агента: что уходит агенту и что доходит до журнала событий.
 #[cfg(test)]
 mod core_tests {
     use super::super::testkit::{errors, sink};
-    use super::tests::{row, state};
+    use super::tests::{pair, row, state};
     use super::*;
-    use crate::daemon::fake::FakeCore;
-    use crate::daemon::CoreApi;
+    use crate::daemon::agent::proto::{AgentRequest, AgentResponse};
 
-    fn poll(core: &FakeCore, seq: u64, polled: &Mutex<Polled>, error: &ErrorSink) {
+    type Reply = dyn Fn(&AgentRequest) -> Result<AgentResponse, String> + Send + Sync;
+
+    /// Подделка агента, которая помнит запросы (`{:?}`): ответ задаёт тест, ошибка — канал (агента нет).
+    struct TestAgent {
+        reply: Box<Reply>,
+        seen: Mutex<Vec<String>>,
+    }
+
+    impl TestAgent {
+        fn new(reply: impl Fn(&AgentRequest) -> Result<AgentResponse, String> + Send + Sync + 'static) -> TestAgent {
+            TestAgent { reply: Box::new(reply), seen: Mutex::default() }
+        }
+
+        fn unreachable(error: &str) -> TestAgent {
+            let error = error.to_string();
+            TestAgent::new(move |_| Err(error.clone()))
+        }
+
+        fn requests(&self) -> Vec<String> {
+            self.seen.lock().unwrap().clone()
+        }
+    }
+
+    impl AgentApi for TestAgent {
+        fn call(&self, req: AgentRequest) -> Result<AgentResponse, String> {
+            self.seen.lock().unwrap().push(format!("{req:?}"));
+            (self.reply)(&req)
+        }
+    }
+
+    fn poll(agent: &TestAgent, seq: u64, polled: &Mutex<Polled>, error: &ErrorSink) {
         let (badge, proposed) = (AtomicBool::new(false), Mutex::new(None));
-        take_updates_reply(core.updates(UpdateOp::State), false, seq, polled, &badge, &proposed, error);
+        take_updates_reply(agent.updates(UpdateOp::State), false, seq, polled, &badge, &proposed, error);
     }
 
     #[test]
     fn poll_error_reaches_the_event_log_once_until_it_changes() {
-        let core = FakeCore::unreachable("core unavailable");
+        let agent = TestAgent::new(|_| Ok(AgentResponse::Err("feed broken".into())));
         let (shared, error) = sink();
         let polled = Mutex::new(Polled::default());
         // Опрос раз в секунду: одна и та же ошибка не заполняет журнал.
-        poll(&core, 1, &polled, &error);
-        poll(&core, 2, &polled, &error);
-        assert_eq!(errors(&shared), [(String::new(), "core unavailable".to_string())]);
-        assert_eq!(polled.lock().unwrap().error.as_deref(), Some("core unavailable"));
-        assert_eq!(core.requests(), ["Updates(State)", "Updates(State)"]);
+        poll(&agent, 1, &polled, &error);
+        poll(&agent, 2, &polled, &error);
+        assert_eq!(errors(&shared), [(String::new(), "feed broken".to_string())]);
+        assert_eq!(polled.lock().unwrap().error.as_deref(), Some("feed broken"));
+        assert_eq!(agent.requests(), ["Updates(State)", "Updates(State)"]);
+    }
+
+    /// Агента нет (перезапуск, ядро прежней версии): окно пишет «вторичная служба недоступна», а не ошибку ядра;
+    /// опрос в журнал не пишет вовсе, команда пользователя — один раз на нажатие.
+    #[test]
+    fn absent_agent_is_shown_as_unavailable_without_log_spam() {
+        let agent = TestAgent::unreachable("pipe: not found");
+        let (shared, error) = sink();
+        let polled = Mutex::new(Polled::default());
+        for seq in 1..=3 {
+            poll(&agent, seq, &polled, &error);
+        }
+        assert_eq!(polled.lock().unwrap().error, Some(tr("agent.unavailable")));
+        assert!(errors(&shared).is_empty(), "опрос без агента журнал не засыпает: {:?}", errors(&shared));
+        let (badge, proposed) = (AtomicBool::new(false), Mutex::new(None));
+        take_updates_reply(agent.updates(UpdateOp::Check), true, 4, &polled, &badge, &proposed, &error);
+        let logged = errors(&shared);
+        assert_eq!(logged.len(), 1, "{logged:?}");
+        assert!(logged[0].1.starts_with(&tr("agent.unavailable")) && logged[0].1.contains("pipe: not found"), "{logged:?}");
+        assert!(!badge.load(Ordering::SeqCst) && proposed.lock().unwrap().is_none());
+    }
+
+    /// Демо (агента нет вовсе): окно открывается и показывает то же «недоступна», фоновой отметки нет.
+    #[test]
+    fn demo_window_without_agent_shows_unavailable() {
+        let (shared, error) = sink();
+        let mut w = UpdatesWindow::new(Link::new(None, error, Arc::default(), egui::Context::default()));
+        w.request(UpdateOp::State, false);
+        settle(&w);
+        assert_eq!(w.polled.lock().unwrap().error, Some(tr("agent.unavailable")));
+        assert!(errors(&shared).is_empty());
+        assert!(!badge_due(false, w.link.agent.is_some(), None, Instant::now()));
     }
 
     #[test]
     fn command_error_is_logged_every_time_and_success_clears_the_error() {
-        let core = FakeCore::new(|_| Err("refused".to_string()));
+        let agent = TestAgent::new(|_| Ok(AgentResponse::Refused("busy".into())));
         let (shared, error) = sink();
         let polled = Mutex::new(Polled::default());
         let (badge, proposed) = (AtomicBool::new(false), Mutex::new(None));
         for seq in 1..=2 {
-            take_updates_reply(core.updates(UpdateOp::State), true, seq, &polled, &badge, &proposed, &error);
+            take_updates_reply(agent.updates(UpdateOp::State), true, seq, &polled, &badge, &proposed, &error);
         }
         assert_eq!(errors(&shared).len(), 2, "ошибка команды — каждый раз");
-        let ok = FakeCore::new(|_| Ok(crate::daemon::proto::Response::Updates(Box::default())));
+        let ok = TestAgent::new(|_| Ok(AgentResponse::Updates(Box::default())));
         poll(&ok, 3, &polled, &error);
         let p = polled.lock().unwrap();
         assert_eq!((p.error.as_deref(), p.applied), (None, 3));
     }
 
-    fn window(core: &Arc<FakeCore>) -> UpdatesWindow {
-        let (shared, error) = sink();
-        UpdatesWindow::new(Link::new(core.clone(), error, Arc::default(), egui::Context::default(), shared))
+    fn window(agent: &Arc<TestAgent>) -> UpdatesWindow {
+        let (_shared, error) = sink();
+        UpdatesWindow::new(Link::new(Some(agent.clone() as Arc<dyn AgentApi>), error, Arc::default(), egui::Context::default()))
     }
 
     fn settle(w: &UpdatesWindow) {
@@ -1397,8 +1487,8 @@ mod core_tests {
         assert!(!w.command.any() && !w.polling.any(), "запросы не завершились");
     }
 
-    fn offering_core() -> FakeCore {
-        FakeCore::new(|_| {
+    fn offering_agent() -> TestAgent {
+        TestAgent::new(|_| {
             let row = ComponentState {
                 component: Some(Component::App),
                 installed: Some("0.4.0".into()),
@@ -1406,7 +1496,7 @@ mod core_tests {
                 update: true,
                 ..Default::default()
             };
-            Ok(crate::daemon::proto::Response::Updates(Box::new(UpdatesState { components: vec![row], ..Default::default() })))
+            Ok(AgentResponse::Updates(Box::new(UpdatesState { components: vec![row], ..Default::default() })))
         })
     }
 
@@ -1429,7 +1519,7 @@ mod core_tests {
         let ago = |s| now.checked_sub(Duration::from_secs(s)).unwrap();
         assert!(badge_due(false, true, None, now), "при запуске — сразу");
         assert!(!badge_due(true, true, None, now), "пока окно открыто, отметку ведёт его опрос");
-        assert!(!badge_due(false, false, None, now), "без ядра обновлять нечего");
+        assert!(!badge_due(false, false, None, now), "без агента (демо) обновлять нечего");
         assert!(!badge_due(false, true, Some(ago(29 * 60)), now));
         assert!(badge_due(false, true, Some(ago(30 * 60)), now));
     }
@@ -1457,42 +1547,43 @@ mod core_tests {
         let gate = Arc::new(Mutex::new(()));
         let held = gate.lock().unwrap();
         let g = gate.clone();
-        let core = Arc::new(FakeCore::new(move |_| {
+        let agent = Arc::new(TestAgent::new(move |_| {
             let _wait = g.lock().unwrap();
-            Ok(crate::daemon::proto::Response::Updates(Box::default()))
+            Ok(AgentResponse::Updates(Box::default()))
         }));
-        let mut w = window(&core);
+        let mut w = window(&agent);
         assert!(!w.is_open());
         w.open();
         w.open();
         assert!(w.is_open() && w.command.any());
         drop(held);
         settle(&w);
-        assert_eq!(core.requests(), ["Updates(Check)"], "второе открытие при идущей проверке не повторяет её");
+        assert_eq!(agent.requests(), ["Updates(Check)"], "второе открытие при идущей проверке не повторяет её");
         w.open();
         settle(&w);
-        assert_eq!(core.requests().len(), 2, "после ответа открытие проверяет снова");
+        assert_eq!(agent.requests().len(), 2, "после ответа открытие проверяет снова");
     }
 
     #[test]
     fn answer_with_an_update_sets_the_badge_and_is_announced_once() {
-        let mut w = window(&Arc::new(offering_core()));
+        let mut w = quiet_window();
         assert!(!w.has_new());
         w.request(UpdateOp::State, false);
         settle(&w);
         assert!(w.has_new(), "обновление в ответе — отметка");
-        let mut notified = BTreeMap::new();
-        assert_eq!(w.collect_news(&mut notified), vec![(Component::App, "0.5.0".to_string())]);
+        let (mut notified, mut reminded) = (BTreeMap::new(), None);
+        assert!(w.collect_news(&mut notified, &mut reminded, T0).is_some());
         w.request(UpdateOp::State, false);
         settle(&w);
-        assert!(w.collect_news(&mut notified).is_empty(), "та же версия второй раз не сообщается");
+        assert!(w.collect_news(&mut notified, &mut reminded, T0 + 1).is_none(), "та же версия второй раз не сообщается");
         assert_eq!(w.news, vec![(Component::App, "0.5.0".to_string())], "уведомление ждёт, пока его откроют");
     }
 
     /// Кадр: уведомление, под ним окно-«редактор» (слой `Middle`, как у всех окон); `true` — Esc достался «редактору».
     fn news_frame(ctx: &egui::Context, w: &mut UpdatesWindow, events: Vec<egui::Event>) -> bool {
         let mut editor_escape = false;
-        let _ = ctx.run(egui::RawInput { events, ..Default::default() }, |ctx| {
+        let _ = ctx.run_ui(egui::RawInput { events, ..Default::default() }, |ui| {
+            let ctx = ui.ctx();
             w.show_news(ctx);
             let mut open = true;
             dialog_window(ctx, "editor", "test-editor", &mut open).default_pos([100.0, 100.0]).show(ctx, |ui| ui.label("text"));
@@ -1514,7 +1605,7 @@ mod core_tests {
     /// после щелчка по себе и теряет после щелчка в другое место.
     #[test]
     fn news_takes_escape_only_after_click() {
-        let mut w = window(&Arc::new(offering_core()));
+        let mut w = window(&Arc::new(offering_agent()));
         let news = vec![(Component::App, "0.5.0".to_string())];
         w.news = news.clone();
         let ctx = egui::Context::default();
@@ -1560,8 +1651,8 @@ mod core_tests {
         let view = View { state, error: None, selected: &selected, busy: false, locked: false };
         let ctx = egui::Context::default();
         let mut height = 0.0;
-        let _ = ctx.run(egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(1000.0, 700.0))), ..Default::default() }, |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| {
+        let _ = ctx.run_ui(egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(1000.0, 700.0))), ..Default::default() }, |ui| {
+            egui::CentralPanel::default().show(ui, |ui| {
                 components_table(ui, &view, &mut Vec::new());
                 height = ui.min_rect().height();
             });
@@ -1590,7 +1681,7 @@ mod core_tests {
 
     #[test]
     fn opening_notes_replaces_the_open_window() {
-        let mut w = window(&Arc::new(offering_core()));
+        let mut w = window(&Arc::new(offering_agent()));
         let ctx = egui::Context::default();
         let mut s = notes_state("## One\n- a");
         s.components[2] = with_notes(s.components[2].clone(), "## Two\n- b\n- c");
@@ -1608,7 +1699,8 @@ mod core_tests {
     /// Кадр с окном «Что нового» под окном-«редактором»; `true` — Esc достался «редактору».
     fn notes_frame(ctx: &egui::Context, w: &mut UpdatesWindow, events: Vec<egui::Event>) -> bool {
         let mut editor_escape = false;
-        let _ = ctx.run(egui::RawInput { events, ..Default::default() }, |ctx| {
+        let _ = ctx.run_ui(egui::RawInput { events, ..Default::default() }, |ui| {
+            let ctx = ui.ctx();
             let mut open = true;
             dialog_window(ctx, "editor", "test-editor", &mut open).default_pos([100.0, 100.0]).show(ctx, |ui| ui.label("text"));
             w.show_notes(ctx);
@@ -1619,7 +1711,7 @@ mod core_tests {
 
     #[test]
     fn notes_window_closes_on_escape_and_only_when_on_top() {
-        let mut w = window(&Arc::new(offering_core()));
+        let mut w = window(&Arc::new(offering_agent()));
         let ctx = egui::Context::default();
         let s = notes_state("## T\n- a");
         notes_frame(&ctx, &mut w, Vec::new());
@@ -1637,4 +1729,161 @@ mod core_tests {
         assert!(notes_frame(&ctx, &mut w, escape()));
     }
 
+
+    /// Окно для проверки напоминаний: пользователь всегда на месте, пока тест не скажет иное (`PRESENCE`).
+    fn quiet_window() -> UpdatesWindow {
+        let mut w = window(&Arc::new(offering_agent()));
+        w.presence = || PRESENCE.with(|p| p.get());
+        PRESENCE.with(|p| p.set(Presence { idle_secs: 0, notifications_accepted: true }));
+        w
+    }
+
+    thread_local! {
+        /// Состояние пользователя для `quiet_window`; у каждого теста свой поток — тесты не мешают друг другу.
+        static PRESENCE: std::cell::Cell<Presence> = const { std::cell::Cell::new(Presence { idle_secs: 0, notifications_accepted: true }) };
+    }
+
+    fn present(idle_secs: u64, notifications_accepted: bool) {
+        PRESENCE.with(|p| p.set(Presence { idle_secs, notifications_accepted }));
+    }
+
+    /// Ответ ядра: предложены такие обновления.
+    fn answered(w: &UpdatesWindow, list: &[(Component, String)]) {
+        *w.proposed.lock().unwrap() = Some(list.to_vec());
+    }
+
+    const T0: u64 = 1_800_000_000;
+    const DAY: u64 = reminder::REMIND_EVERY;
+
+    #[test]
+    fn open_notice_follows_the_core_answer() {
+        let mut w = quiet_window();
+        let (mut notified, mut reminded) = (BTreeMap::new(), None);
+        answered(&w, &[pair(Component::Native, "3.1.1")]);
+        assert!(w.collect_news(&mut notified, &mut reminded, T0).is_some());
+        assert_eq!(w.news, vec![pair(Component::Native, "3.1.1")]);
+        // Та же версия: ничего нового, уведомление остаётся.
+        answered(&w, &[pair(Component::Native, "3.1.1")]);
+        assert!(w.collect_news(&mut notified, &mut reminded, T0 + 1).is_none());
+        assert_eq!(w.news, vec![pair(Component::Native, "3.1.1")]);
+        // Вышла более новая: заменяет прежнюю строку.
+        answered(&w, &[pair(Component::Native, "3.2.0")]);
+        assert!(w.collect_news(&mut notified, &mut reminded, T0 + 2).is_some());
+        assert_eq!(w.news, vec![pair(Component::Native, "3.2.0")]);
+        // Обновили (предложений нет): уведомление исчезает, запомненная версия остаётся.
+        answered(&w, &[]);
+        assert!(w.collect_news(&mut notified, &mut reminded, T0 + 3).is_none());
+        assert!(w.news.is_empty());
+        assert_eq!(notified["native"], "3.2.0");
+    }
+
+    #[test]
+    fn notice_text_lists_components() {
+        let list = [pair(Component::Native, "3.1.0"), pair(Component::App, "0.5.0")];
+        assert_eq!(news_text(&list, false), "Updates available: AmneziaWG 3.1.0, AmneziaWG UI Dark 0.5.0");
+        assert_eq!(news_text(&list, true), "Update still not installed: AmneziaWG 3.1.0, AmneziaWG UI Dark 0.5.0");
+    }
+
+    #[test]
+    fn first_announcement_comes_at_once_with_the_notice() {
+        let mut w = quiet_window();
+        let (mut notified, mut reminded) = (BTreeMap::new(), None);
+        answered(&w, &[pair(Component::App, "0.5.0")]);
+        let toast = w.collect_news(&mut notified, &mut reminded, T0).expect("сообщение");
+        assert_eq!(toast, "Updates available: AmneziaWG UI Dark 0.5.0");
+        assert_eq!(w.news, vec![pair(Component::App, "0.5.0")], "то же и в окне");
+        assert_eq!((notified["app"].as_str(), reminded), ("0.5.0", Some(T0)));
+        assert!(!w.news_reminder);
+    }
+
+    #[test]
+    fn unchanged_update_is_reminded_after_a_day_with_the_reminder_text() {
+        let mut w = quiet_window();
+        let (mut notified, mut reminded) = (BTreeMap::new(), None);
+        answered(&w, &[pair(Component::App, "0.5.0")]);
+        w.collect_news(&mut notified, &mut reminded, T0).unwrap();
+        w.news.clear();
+        // Ответы идут каждые полчаса, а сутки ещё не прошли.
+        answered(&w, &[pair(Component::App, "0.5.0")]);
+        assert_eq!(w.collect_news(&mut notified, &mut reminded, T0 + DAY - 1), None);
+        assert!(w.news.is_empty());
+        let toast = w.collect_news(&mut notified, &mut reminded, T0 + DAY).expect("напоминание");
+        assert_eq!(toast, "Update still not installed: AmneziaWG UI Dark 0.5.0");
+        assert_eq!(w.news, vec![pair(Component::App, "0.5.0")]);
+        assert!(w.news_reminder);
+        assert_eq!(reminded, Some(T0 + DAY), "следующее — ещё через сутки");
+        assert_eq!(w.collect_news(&mut notified, &mut reminded, T0 + DAY + 60), None, "дважды подряд не напоминает");
+    }
+
+    #[test]
+    fn idle_user_postpones_the_announcement_and_it_is_not_lost() {
+        let mut w = quiet_window();
+        let (mut notified, mut reminded) = (BTreeMap::new(), None);
+        present(reminder::IDLE_LIMIT, true);
+        answered(&w, &[pair(Component::App, "0.5.0")]);
+        assert_eq!(w.collect_news(&mut notified, &mut reminded, T0), None);
+        assert!(notified.is_empty() && reminded.is_none() && w.news.is_empty(), "ничего не потрачено: версия не помечена сообщённой");
+        // Пока не прошло RECHECK, Windows не опрашивается: пользователь вернулся, но сообщение ещё ждёт.
+        present(0, true);
+        assert_eq!(w.collect_news(&mut notified, &mut reminded, T0 + 1), None);
+        w.next_check = Some(Instant::now());
+        assert!(w.collect_news(&mut notified, &mut reminded, T0 + 2).is_some(), "через несколько минут пользователь на месте — сообщили");
+        assert_eq!(reminded, Some(T0 + 2));
+    }
+
+    #[test]
+    fn busy_screen_presentation_or_quiet_hours_postpone_the_reminder() {
+        let mut w = quiet_window();
+        let (mut notified, mut reminded) = (BTreeMap::from([("app".to_string(), "0.5.0".to_string())]), Some(T0));
+        present(1, false);
+        answered(&w, &[pair(Component::App, "0.5.0")]);
+        assert_eq!(w.collect_news(&mut notified, &mut reminded, T0 + 2 * DAY), None);
+        assert_eq!(reminded, Some(T0), "время напоминания не сдвинулось — оно ещё не показано");
+        assert!(w.next_check.is_some(), "повтор проверки назначен");
+        present(1, true);
+        w.next_check = None;
+        assert!(w.collect_news(&mut notified, &mut reminded, T0 + 2 * DAY + 300).is_some());
+    }
+
+    #[test]
+    fn installed_update_stops_the_reminders() {
+        let mut w = quiet_window();
+        let (mut notified, mut reminded) = (BTreeMap::new(), None);
+        answered(&w, &[pair(Component::App, "0.5.0")]);
+        w.collect_news(&mut notified, &mut reminded, T0).unwrap();
+        answered(&w, &[]);
+        assert_eq!(w.collect_news(&mut notified, &mut reminded, T0 + 3 * DAY), None);
+        assert_eq!(w.collect_news(&mut notified, &mut reminded, T0 + 30 * DAY), None, "ни через сутки, ни через месяц");
+        assert!(w.news.is_empty());
+    }
+
+    #[test]
+    fn later_closes_the_notice_and_snoozes_for_a_day() {
+        let mut w = quiet_window();
+        let (mut notified, mut reminded) = (BTreeMap::new(), None);
+        answered(&w, &[pair(Component::App, "0.5.0")]);
+        w.collect_news(&mut notified, &mut reminded, T0).unwrap();
+        // «Позже» в середине суток: окно закрыло уведомление и пометило отсрочку.
+        let ctx = egui::Context::default();
+        w.news_focused = true;
+        let _ = ctx.run_ui(egui::RawInput { events: escape(), ..Default::default() }, |ui| w.show_news(ui.ctx()));
+        assert!(w.news.is_empty() && w.snoozed);
+        let later = T0 + DAY / 2;
+        answered(&w, &[pair(Component::App, "0.5.0")]);
+        assert_eq!(w.collect_news(&mut notified, &mut reminded, later), None);
+        assert_eq!(reminded, Some(later), "сутки считаются от «Позже»");
+        assert_eq!(w.collect_news(&mut notified, &mut reminded, later + DAY - 1), None);
+        assert!(w.collect_news(&mut notified, &mut reminded, later + DAY).is_some());
+    }
+
+    #[test]
+    fn open_updates_window_gets_no_notice_and_counts_as_told() {
+        let mut w = quiet_window();
+        w.open = true;
+        let (mut notified, mut reminded) = (BTreeMap::new(), None);
+        answered(&w, &[pair(Component::App, "0.5.0")]);
+        assert_eq!(w.collect_news(&mut notified, &mut reminded, T0), None);
+        assert!(w.news.is_empty());
+        assert_eq!((notified["app"].as_str(), reminded), ("0.5.0", Some(T0)), "список перед глазами — повторять через минуту незачем");
+    }
 }

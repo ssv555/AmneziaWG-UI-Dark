@@ -1,8 +1,10 @@
 //! Проверка «трафик реально проходит»: ICMP-пинг до узла из Allowed IPs раз в 10 секунд,
 //! пока подключён хоть один туннель. Рукопожатие говорит только, что сервер отвечает.
+//! Ведёт его агент (`daemon::agent`), в демо-режиме — само окно; ядро пинга не касается.
 
 use std::collections::VecDeque;
 use std::net::{Ipv4Addr, ToSocketAddrs};
+use std::ops::ControlFlow;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -53,31 +55,90 @@ impl PingState {
     }
 }
 
-pub fn spawn(shared: Arc<Shared>) {
+/// Где живёт пинг: окно демо-режима (`Shared`, выдуманные туннели) или агент (`daemon::agent`). Поток один и тот же,
+/// разные только источники настроек, туннелей и замера и место результата.
+pub(crate) trait PingHome: Send + Sync {
+    /// Включён ли пинг и до какого узла.
+    fn settings(&self) -> (bool, String);
+    /// Подключён ли хоть один туннель: без туннеля пинг ничего не говорит о VPN.
+    fn any_running(&self) -> bool;
+    fn measure(&self, host: &str) -> Result<u32, String>;
+    fn update(&self, f: &mut dyn FnMut(&mut PingState));
+    /// Паника замера: в журнал; поток продолжает после паузы `wait`.
+    fn report_panic(&self, panic: &str, wait: Duration);
+}
+
+/// Поток пинга. Пинг вторичен: его паника (странный ответ ICMP, сбой разбора имени) — запись в журнал и пауза
+/// (`crash::nonfatal_loop`), а не остановка процесса.
+pub(crate) fn spawn(home: Arc<dyn PingHome>) {
     crate::crash::spawn_named("ping", move || {
-        let mut next = Instant::now();
-        loop {
-            std::thread::sleep(Duration::from_millis(500));
-            let (enabled, host) = {
-                let o = shared.options();
-                (o.ping, o.ping_host)
-            };
-            let active = shared.any_running();
-            if !enabled || !active {
-                shared.update_ping(|p| *p = PingState { host, ..Default::default() });
-                next = Instant::now();
-                continue;
-            }
-            if Instant::now() < next {
-                continue;
-            }
-            next = Instant::now() + INTERVAL;
-            // Окно с ядром не пингует само: пинг приходит от ядра (spawn для него не вызывается).
-            let Some(tunnels) = shared.host() else { continue };
-            let result = tunnels.ping_ms(&host);
-            shared.update_ping(|p| p.record(&host, result));
-        }
+        let mut pinger = Pinger::new(Instant::now());
+        let report = |panic: &str, wait: Duration| home.report_panic(panic, wait);
+        crate::crash::nonfatal_loop(STEP, &std::thread::sleep, &report, || {
+            pinger.step(home.as_ref(), Instant::now());
+            ControlFlow::Continue(())
+        });
     });
+}
+
+/// Шаг потока пинга: так часто проверяются настройки.
+const STEP: Duration = Duration::from_millis(500);
+
+/// Расписание замеров: раз в `INTERVAL`, пока пинг включён и подключён хоть один туннель.
+struct Pinger {
+    next: Instant,
+}
+
+impl Pinger {
+    fn new(now: Instant) -> Pinger {
+        Pinger { next: now }
+    }
+
+    fn step(&mut self, home: &dyn PingHome, now: Instant) {
+        let (enabled, host) = home.settings();
+        if !enabled {
+            home.update(&mut |p| *p = PingState { host: host.clone(), ..Default::default() });
+            self.next = now;
+            return;
+        }
+        if now < self.next {
+            return;
+        }
+        // До замера: паника в нём не повторяет замер на каждом шаге, следующий — по расписанию. Туннели проверяются
+        // тоже по расписанию: у агента это запрос к ядру, а не чтение своей памяти.
+        self.next = now + INTERVAL;
+        if !home.any_running() {
+            home.update(&mut |p| *p = PingState { host: host.clone(), ..Default::default() });
+            return;
+        }
+        let mut result = Some(home.measure(&host));
+        home.update(&mut |p| {
+            if let Some(r) = result.take() {
+                p.record(&host, r);
+            }
+        });
+    }
+}
+
+/// Окно демо-режима: туннели и замер выдуманные (`Demo`), результат — в `Shared`, откуда его рисует окно.
+impl PingHome for Shared {
+    fn settings(&self) -> (bool, String) {
+        let o = self.options();
+        (o.ping, o.ping_host)
+    }
+    fn any_running(&self) -> bool {
+        Shared::any_running(self)
+    }
+    fn measure(&self, host: &str) -> Result<u32, String> {
+        // Окно с ядром пингом не занимается (его ведёт агент) и туннелей своих не имеет.
+        self.host().ok_or_else(|| "ping: no tunnel host in this process".to_string())?.ping_ms(host)
+    }
+    fn update(&self, f: &mut dyn FnMut(&mut PingState)) {
+        self.update_ping(|p| f(p));
+    }
+    fn report_panic(&self, panic: &str, wait: Duration) {
+        self.report_secondary_panic(panic, wait);
+    }
 }
 
 /// Настоящий замер: имя узла → IPv4 → эхо-запрос.
@@ -142,6 +203,63 @@ mod tests {
     #[test]
     fn loopback_answers() {
         assert!(echo(Ipv4Addr::LOCALHOST, 1000).is_ok());
+    }
+
+    /// Один подключённый туннель; первый замер паникует (как на странном ответе ICMP), дальше — 7 мс.
+    #[derive(Default)]
+    struct PanickyHost {
+        pings: std::sync::atomic::AtomicU32,
+    }
+
+    impl crate::backend::TunnelHost for PanickyHost {
+        fn configs(&self) -> std::io::Result<Vec<String>> {
+            Ok(vec!["t".into()])
+        }
+        fn running(&self) -> std::io::Result<Vec<String>> {
+            Ok(vec!["t".into()])
+        }
+        fn query(&self, _: &str) -> std::io::Result<crate::uapi::Status> {
+            Ok(crate::uapi::Status::default())
+        }
+        fn connect(&self, _: &str) -> Result<(), String> {
+            Ok(())
+        }
+        fn disconnect(&self, _: &str) -> Result<(), String> {
+            Ok(())
+        }
+        fn ping_ms(&self, _: &str) -> Result<u32, String> {
+            if self.pings.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                assert!(crate::crash::isolated_now(), "паника пинга не станет сбоем ядра");
+                panic!("odd ICMP reply");
+            }
+            Ok(7)
+        }
+    }
+
+    #[test]
+    fn ping_panic_is_logged_and_the_next_measure_runs() {
+        use crate::monitor::{Options, Shared};
+        let host = Arc::new(PanickyHost::default());
+        let options = Options { ping: true, ping_host: "h".into(), notify: false, tray: false, taskbar: false };
+        let shared = Shared::new(Some(host.clone()), options, None);
+        crate::monitor::poll(&shared, host.as_ref());
+        assert!(shared.any_running());
+
+        let start = Instant::now();
+        let now = std::cell::Cell::new(start);
+        let mut pinger = Pinger::new(start);
+        let report = |panic: &str, wait: Duration| shared.report_secondary_panic(panic, wait);
+        crate::crash::nonfatal_loop(STEP, &|d| now.set(now.get() + d), &report, || {
+            pinger.step(&shared, now.get());            if host.pings.load(std::sync::atomic::Ordering::SeqCst) >= 2 {
+                ControlFlow::Break(())
+            } else {
+                ControlFlow::Continue(())
+            }
+        });
+        assert!(crate::crash::core_failure().is_none());
+        assert_eq!(shared.update_ping(|p| p.last.clone()), Some(Ok(7)), "после паники замер идёт по расписанию");
+        let events = shared.events_since(0);
+        assert!(events.iter().any(|(_, e)| e.severity == crate::events::Severity::Bad && e.text.contains("odd ICMP reply")), "паника — в журнале");
     }
 
     #[test]

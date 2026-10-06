@@ -21,6 +21,7 @@ impl App {
             .clone();
         let mut open = true;
         let mut close = false;
+        let mut copy = false;
         dialog_window(ctx, tr("help.about"), "about", &mut open)
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
@@ -50,8 +51,13 @@ impl App {
                 ui.add_space(6.0);
                 ui.add(egui::Label::new(RichText::new(trf("about.files", &[&fmt::short_path(&self.base_dir)])).weak()).wrap());
                 ui.add_space(8.0);
+                copy = ui.button(tr("help.diag")).on_hover_text(tr("help.diag_hint")).clicked();
+                ui.add_space(8.0);
                 close = dialog_buttons(ui, &tr("btn.close"), true, None).0;
             });
+        if copy {
+            self.copy_diagnostics();
+        }
         let (enter, escape) = turn.keys(ctx);
         if open && !close && !enter && !escape {
             Outcome::Keep

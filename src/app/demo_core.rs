@@ -1,12 +1,20 @@
 //! Ядро демо-режима: окно говорит с ним так же, как с настоящим (`CoreApi`), а оно отвечает выдуманными
 //! туннелями `Demo`. Так у окна один путь к туннелям, а не ветка «ядро или демо» в каждом действии.
 
+use std::ops::ControlFlow;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use crate::backend::{Demo, TunnelHost};
 use crate::daemon::proto::{Request, Response};
 use crate::daemon::server::{run_switch, to_replace};
+use crate::daemon::agent::AgentStats;
 use crate::daemon::CoreApi;
+use crate::monitor::Shared;
+use crate::settings::Mode;
+
+/// Демо-статистика пересчитывается так же часто, как агент опрашивает ядро.
+const STATS_PERIOD: Duration = Duration::from_secs(1);
 
 pub(super) struct DemoCore(pub(super) Arc<Demo>);
 
@@ -33,6 +41,25 @@ impl CoreApi for DemoCore {
     }
 }
 
+/// Демо: статистика трафика растёт по счётчикам выдуманных туннелей тем же кодом, что у агента (`AgentStats`), только
+/// без файла. Паника шага — в журнал окна, цикл идёт дальше (как пинг демо).
+pub(super) fn spawn_stats(shared: Arc<Shared>) {
+    crate::crash::spawn_named("demo-stats", move || {
+        let stats = AgentStats::in_memory();
+        let report = |panic: &str, wait: Duration| shared.report_secondary_panic(panic, wait);
+        crate::crash::nonfatal_loop(STATS_PERIOD, &std::thread::sleep, &report, || {
+            stats_step(&shared, &stats, Instant::now());
+            ControlFlow::Continue(())
+        });
+    });
+}
+
+fn stats_step(shared: &Shared, stats: &AgentStats, at: Instant) {
+    // Режим статистике не важен: из `State` она берёт только туннели и счётчики.
+    let state = shared.core_state(Mode::Overlay, u64::MAX);
+    shared.update_stats(|s| stats.observe_into(s, &state, at));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -51,5 +78,46 @@ mod tests {
         assert_eq!(d.running().unwrap().len(), 2);
         core.ok(Request::Switch { tunnel: a.clone(), plan: Plan::Disconnect, multiple: false }).unwrap();
         assert_eq!(d.running().unwrap(), vec![c.clone()]);
+    }
+
+    /// Демо: статистика растёт по счётчикам опроса (до шага 10 её считал опрос окна; после переноса в агента — стояла).
+    /// Правка окна (удаление туннеля в демо) не затирается следующим шагом.
+    #[test]
+    fn demo_stats_grow_and_keep_window_edits() {
+        use crate::monitor::{poll, Options};
+        use crate::uapi::{Peer, Status};
+        struct Counters(u64);
+        impl TunnelHost for Counters {
+            fn configs(&self) -> std::io::Result<Vec<String>> {
+                Ok(vec!["t".into(), "gone".into()])
+            }
+            fn running(&self) -> std::io::Result<Vec<String>> {
+                Ok(vec!["t".into()])
+            }
+            fn query(&self, _: &str) -> std::io::Result<Status> {
+                Ok(Status { listen_port: 7, peers: vec![Peer { rx_bytes: self.0, tx_bytes: self.0 / 2, ..Default::default() }], ..Default::default() })
+            }
+            fn connect(&self, _: &str) -> Result<(), String> {
+                Ok(())
+            }
+            fn disconnect(&self, _: &str) -> Result<(), String> {
+                Ok(())
+            }
+        }
+        let options = Options { ping: false, ping_host: String::new(), notify: false, tray: false, taskbar: false };
+        let shared = Shared::new(None, options, None);
+        shared.update_stats(|s| s.insert("gone".into(), Default::default()));
+        let stats = AgentStats::in_memory();
+        let t0 = Instant::now();
+        for (i, rx) in [1_000u64, 5_000, 9_000].into_iter().enumerate() {
+            poll(&shared, &Counters(rx));
+            stats_step(&shared, &stats, t0 + Duration::from_secs(i as u64));
+            if i == 0 {
+                shared.update_stats(|s| s.remove("gone"));
+            }
+        }
+        let (rx, keys) = shared.update_stats(|s| (s["t"].rx, s.keys().cloned().collect::<Vec<_>>()));
+        assert_eq!(rx, 9_000, "новая сессия: первый замер целиком, дальше прирост");
+        assert_eq!(keys, ["t"], "удалённое окном не вернулось");
     }
 }

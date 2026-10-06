@@ -1,13 +1,11 @@
-//! Строка состояния и журнал событий под таблицей.
+//! Строка состояния под таблицей (журнал событий — `event_log`).
 
 use eframe::egui::{self, RichText, Ui};
 
-use crate::fmt;
 use crate::i18n::{tr, trf};
-use crate::monitor::Shared;
 use crate::settings::Mode;
 
-use super::theme::{dot, mono, severity_color, GRAY, GREEN, NEON, RED};
+use super::theme::{GREEN, NEON, RED};
 use super::Action;
 
 pub(super) struct StatusBar<'a> {
@@ -45,26 +43,3 @@ pub(super) fn status_bar(ui: &mut Ui, bar: &StatusBar, actions: &mut Vec<Action>
     });
 }
 
-pub(super) fn event_log(ui: &mut Ui, shared: &Shared) {
-    ui.add_space(4.0);
-    ui.strong(tr("log.title"));
-    // Черта отделяет заголовок от строк, прокрученных наполовину.
-    ui.separator();
-    egui::ScrollArea::vertical().auto_shrink([false, false]).stick_to_bottom(true).show(ui, |ui| {
-        shared.with_events(|events| {
-            if events.items.is_empty() {
-                ui.weak(tr("log.empty"));
-            }
-            for e in &events.items {
-                ui.horizontal(|ui| {
-                    ui.label(mono(fmt::date_time_sec(e.at), GRAY));
-                    dot(ui, severity_color(e.severity), 4.0);
-                    if !e.tunnel.is_empty() {
-                        ui.strong(&e.tunnel);
-                    }
-                    ui.label(&e.text);
-                });
-            }
-        });
-    });
-}

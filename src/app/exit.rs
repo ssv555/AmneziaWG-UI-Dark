@@ -104,13 +104,12 @@ impl App {
         names
     }
 
-    /// Настройки и счётчики — на диск перед выходом. Сбой записи настроек уходит в журнал окна: `ErrorSink` пишет
+    /// Настройки — на диск перед выходом. Сбой записи настроек уходит в журнал окна: `ErrorSink` пишет
     /// и в `window-errors.log` сразу, так что запись переживёт выход.
     pub(super) fn save_before_exit(&self) {
         if let Err(e) = self.s.to_ini().save(self.window.settings_path()) {
             self.action_error.push(crate::fsutil::io_ctx(self.window.settings_path(), e));
         }
-        self.shared.save_stats();
     }
 }
 

@@ -2,19 +2,23 @@
 //!
 //! Ядро. Запрос окна выполняется изолированно (`isolate`): паника в нём становится ответом с ошибкой, место
 //! соединения и пометки «занят» возвращают охранники, блокировки берутся через `lock` и переживают отравление.
-//! Паника любого другого потока (опрос, пинг, приём канала, обновления) — ядро без этого потока выглядело бы живым,
-//! но показывало бы застывшее состояние или не отвечало: причина пишется в журнал событий, `failure()` видит
-//! главный цикл, служба останавливается с кодом сбоя, и диспетчер служб её перезапускает.
+//! Вторичные потоки (пинг, статистика, ежедневная проверка обновлений) идут в `nonfatal_loop`: паника шага —
+//! запись в журнал и пауза, ядро продолжает держать туннели. Паника потока VPN (опрос, надзор, сеть, приём канала)
+//! — ядро без этого потока выглядело бы живым, но показывало бы застывшее состояние или не отвечало: причина
+//! пишется в журнал событий, `core_failure()` видит главный цикл, служба останавливается с кодом сбоя, и диспетчер
+//! служб её перезапускает.
 //!
 //! Окно. Паника любого потока — запись в `crash.log`, сообщение пользователю и выход: окно без потока опроса
 //! показывало бы застывшие данные, а при `windows_subsystem = "windows"` stderr никто не видит.
 
 use std::any::Any;
 use std::cell::{Cell, RefCell};
+use std::ops::ControlFlow;
 use std::panic::PanicHookInfo;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, MutexGuard, OnceLock};
+use std::time::Duration;
 
 /// Первая паника фонового потока ядра — по ней главный цикл останавливает службу.
 static CORE_FAILURE: OnceLock<String> = OnceLock::new();
@@ -121,6 +125,52 @@ pub fn isolate<R>(f: impl FnOnce() -> R) -> Result<R, String> {
     })
 }
 
+/// Пауза после паники шага вторичного потока: первая — `period`, но не меньше 10 с (паника каждые полсекунды
+/// забила бы журнал), каждая следующая подряд — вдвое дольше, не больше 10 минут. Так детерминированная паника
+/// пишет в журнал не чаще нескольких раз в час, а случайная (редкий ответ сети) не выключает поток надолго.
+pub fn backoff(period: Duration, failures: u32) -> Duration {
+    const FIRST: Duration = Duration::from_secs(10);
+    const CAP: Duration = Duration::from_secs(600);
+    let doubled = period.max(FIRST).saturating_mul(1u32 << failures.saturating_sub(1).min(16));
+    doubled.min(CAP)
+}
+
+/// Цикл вторичного потока ядра (пинг, статистика, ежедневная проверка обновлений): туннели от него не зависят, и
+/// его паника не должна останавливать ядро — иначе детерминированная паника перезапускала бы службу каждые
+/// несколько секунд, и надзор за туннелями не успевал бы работать. Каждый шаг `body` выполняется под `isolate`:
+/// паника уходит в `report` (журнал) с паузой до следующего шага (`backoff`), и цикл идёт дальше. Между удачными
+/// шагами — `period`. `sleep` и остановка через `ControlFlow::Break` — для проверок; в ядре цикл не кончается.
+pub fn nonfatal_loop(
+    period: Duration,
+    sleep: &dyn Fn(Duration),
+    report: &dyn Fn(&str, Duration),
+    mut body: impl FnMut() -> ControlFlow<()>,
+) {
+    let mut failures = 0;
+    let mut wait = period;
+    loop {
+        sleep(wait);
+        match isolate(&mut body) {
+            Ok(ControlFlow::Break(())) => return,
+            Ok(ControlFlow::Continue(())) => {
+                failures = 0;
+                wait = period;
+            }
+            Err(panic) => {
+                failures += 1;
+                wait = backoff(period, failures);
+                report(&panic, wait);
+            }
+        }
+    }
+}
+
+/// Для проверок: идёт ли код сейчас под `isolate` (его паника тогда не станет `core_failure`).
+#[cfg(test)]
+pub(crate) fn isolated_now() -> bool {
+    ISOLATED.with(Cell::get)
+}
+
 /// Каталог журналов окна: `log_dir` из настроек, относительный — от папки программы. Здесь `crash.log` и журнал
 /// ошибок действий окна.
 pub fn window_log_dir(base: &Path, log_dir: &str) -> PathBuf {
@@ -217,6 +267,44 @@ mod tests {
         let r: Result<(), String> = isolate(|| panic!("bad request"));
         assert!(r.unwrap_err().contains("bad request"));
         assert!(!ISOLATED.with(Cell::get), "поток после запроса снова не изолирован");
+    }
+
+    #[test]
+    fn backoff_doubles_from_at_least_ten_seconds_up_to_ten_minutes() {
+        let s = Duration::from_secs;
+        assert_eq!(backoff(Duration::from_millis(500), 1), s(10), "короткий период — не чаще раза в 10 с");
+        assert_eq!(backoff(s(30), 1), s(30));
+        assert_eq!(backoff(s(30), 2), s(60));
+        assert_eq!(backoff(s(30), 3), s(120));
+        assert_eq!(backoff(s(30), 6), s(600));
+        assert_eq!(backoff(s(30), u32::MAX), s(600), "без переполнения");
+    }
+
+    #[test]
+    fn nonfatal_loop_reports_a_panic_and_ticks_again() {
+        let slept = RefCell::new(Vec::new());
+        let reports = RefCell::new(Vec::new());
+        let mut ticks = 0;
+        let period = Duration::from_secs(15);
+        nonfatal_loop(period, &|d| slept.borrow_mut().push(d), &|p, wait| reports.borrow_mut().push((p.to_string(), wait)), || {
+            ticks += 1;
+            match ticks {
+                1 | 2 => {
+                    assert!(isolated_now(), "паника шага не станет сбоем ядра");
+                    panic!("bad stats {ticks}")
+                }
+                3 => ControlFlow::Continue(()),
+                _ => ControlFlow::Break(()),
+            }
+        });
+        assert_eq!(ticks, 4, "после паник цикл идёт дальше");
+        assert!(core_failure().is_none());
+        let reports = reports.into_inner();
+        assert_eq!(reports.len(), 2);
+        assert!(reports[0].0.contains("bad stats 1"));
+        let s = Duration::from_secs;
+        assert_eq!(slept.into_inner(), vec![period, s(15), s(30), period], "пауза растёт, удачный шаг её сбрасывает");
+        assert!(!ISOLATED.with(Cell::get));
     }
 
     #[test]

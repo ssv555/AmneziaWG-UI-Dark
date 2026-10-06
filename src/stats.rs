@@ -1,4 +1,5 @@
-//! Накопительная статистика по туннелям с первого запуска — `Stats.ini` рядом с exe.
+//! Накопительная статистика по туннелям с первого запуска — `Stats.ini` в папке данных; ведёт её агент
+//! (`daemon::agent::stats`), окно показывает то, что агент прислал.
 //!
 //! Счётчики WireGuard обнуляются при каждом старте службы туннеля. Чтобы не терять трафик, пока окно
 //! закрыто, храним последние значения счётчиков и порт: тот же порт и счётчики не меньше — та же сессия,
@@ -41,6 +42,13 @@ pub type Stats = BTreeMap<String, TunnelStats>;
 impl TunnelStats {
     /// Учесть замер счётчиков. `dt` — секунды с прошлого замера в этом запуске программы (None — первый).
     pub fn observe(&mut self, rx: u64, tx: u64, port: u16, dt: Option<f64>, now_unix: u64) {
+        self.observe_sampled(rx, tx, port, dt, dt, now_unix);
+    }
+
+    /// То же, но пик скорости считается по своему промежутку `rate_dt` — с чтения, на котором счётчики менялись в
+    /// прошлый раз. Агент берёт счётчики не у службы, а из `State` ядра и может дважды подряд застать один и тот же
+    /// замер ядра: тогда прирост следующего чтения накоплен за два шага ядра, и деление на один шаг удвоило бы пик.
+    pub fn observe_sampled(&mut self, rx: u64, tx: u64, port: u16, dt: Option<f64>, rate_dt: Option<f64>, now_unix: u64) {
         if self.since == 0 {
             self.since = now_unix;
         }
@@ -48,14 +56,22 @@ impl TunnelStats {
         let (drx, dtx) = if same_session { (rx - self.last_rx, tx - self.last_tx) } else { (rx, tx) };
         self.rx += drx;
         self.tx += dtx;
-        if let Some(dt) = dt.filter(|dt| *dt > 0.0 && *dt <= MAX_GAP_SECS) {
+        let within_gap = |dt: Option<f64>| dt.filter(|dt| *dt > 0.0 && *dt <= MAX_GAP_SECS);
+        if let Some(dt) = within_gap(dt) {
             self.seconds += dt;
-            if same_session {
-                self.peak_rx = self.peak_rx.max(drx as f64 / dt);
-                self.peak_tx = self.peak_tx.max(dtx as f64 / dt);
-            }
+        }
+        if let (true, Some(dt)) = (same_session, within_gap(rate_dt)) {
+            self.peak_rx = self.peak_rx.max(drx as f64 / dt);
+            self.peak_tx = self.peak_tx.max(dtx as f64 / dt);
         }
         (self.last_rx, self.last_tx, self.last_port) = (rx, tx, port);
+    }
+}
+
+/// Туннель переименован: статистика переходит к новому имени. Нет статистики под старым — ничего не меняется.
+pub fn rename(stats: &mut Stats, old: &str, new: &str) {
+    if let Some(st) = stats.remove(old) {
+        stats.insert(new.to_string(), st);
     }
 }
 

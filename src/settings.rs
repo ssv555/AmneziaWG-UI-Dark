@@ -211,6 +211,9 @@ pub struct Settings {
     pub hidden_dialogs: BTreeSet<DialogId>,
     /// О каких версиях обновлений уже сообщали окном: ключ компонента → версия. Новая версия сообщается снова.
     pub update_notified: BTreeMap<String, String>,
+    /// Когда в последний раз сообщали о неустановленном обновлении (unix-секунды); следующее напоминание — не раньше
+    /// чем через сутки. Нигде не показывается, поэтому число, а не дата. «Позже» на уведомлении сдвигает его вперёд.
+    pub update_reminded: Option<u64>,
 }
 
 impl Default for Settings {
@@ -239,6 +242,7 @@ impl Default for Settings {
             book: TunnelBook::default(),
             hidden_dialogs: BTreeSet::new(),
             update_notified: BTreeMap::new(),
+            update_reminded: None,
         }
     }
 }
@@ -310,6 +314,7 @@ impl Settings {
             // выбор, смысл которого эта версия не знает.
             hidden_dialogs: list("hidden_dialogs").iter().filter_map(|n| DialogId::parse(n)).collect(),
             update_notified: ini.section("update_notified").iter().cloned().collect(),
+            update_reminded: ini.get("update_reminder", "last").and_then(|t| t.parse().ok()),
         }
     }
 
@@ -374,6 +379,9 @@ impl Settings {
         for (component, version) in &self.update_notified {
             ini.set("update_notified", component, version);
         }
+        if let Some(t) = self.update_reminded {
+            ini.set("update_reminder", "last", t);
+        }
         for (tunnel, group) in self.book.assignments() {
             ini.set("assign", tunnel, group);
         }
@@ -431,6 +439,7 @@ mod tests {
         s.hidden_dialogs.insert(DialogId::ModeEngine);
         s.update_notified.insert("app".into(), "0.4.0".into());
         s.update_notified.insert("native".into(), "1.2.3".into());
+        s.update_reminded = Some(1_800_000_000);
         assert_eq!(reload(&s), s);
     }
 

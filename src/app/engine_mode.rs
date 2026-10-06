@@ -9,6 +9,7 @@ use std::time::Duration;
 use eframe::egui::{self, RichText};
 
 use super::modals::{Modal, Outcome, Turn};
+use super::sources::{follow_stats, StatsChange};
 use super::dialog::dialog_window;
 use super::{dialog_buttons, App, Editor, RED, YELLOW};
 use crate::archive::{self, ReadError};
@@ -260,11 +261,13 @@ impl App {
         }
     }
 
-    /// Переименование у ядра (там же переезжает статистика); группа и выбор — здесь.
+    /// Переименование у ядра; статистика — у агента (в фоне: зависший агент не держит окно); группа и выбор — здесь.
     fn rename_tunnel(&mut self, old: String, new: String) {
         if let Err(e) = self.core.ok(Request::Rename { old: old.clone(), new: new.clone() }) {
             return self.fail(e);
         }
+        let (agent, shared, change) = (self.agent.clone(), self.shared.clone(), StatsChange::Rename { old: old.clone(), new: new.clone() });
+        std::thread::spawn(move || follow_stats(agent.as_deref(), &shared, change));
         self.s.book.rename_tunnel(&old, &new);
         self.sources.rename(&old, &new);
     }
@@ -369,7 +372,7 @@ fn mode_switch_silent(help_hidden: bool, running: bool, problem: bool) -> bool {
     help_hidden && !running && !problem
 }
 
-/// «Импортировано: N» + какие уже были и какие с неподходящим именем.
+/// «Импортировано: N» + какие уже были, какие с неподходящим именем и какие отклонены из-за команд.
 fn report_text(r: &store::ImportReport) -> String {
     let mut text = trf("eng.imported", &[&r.added.len().to_string()]);
     if !r.existing.is_empty() {
@@ -379,6 +382,10 @@ fn report_text(r: &store::ImportReport) -> String {
     if !r.bad_name.is_empty() {
         text += " · ";
         text += &trf("eng.import_bad_name", &[&r.bad_name.join(", ")]);
+    }
+    if !r.scripts.is_empty() {
+        text += " · ";
+        text += &trf("eng.import_scripts", &[&r.scripts.join(", ")]);
     }
     text
 }

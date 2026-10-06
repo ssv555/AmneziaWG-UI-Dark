@@ -1,44 +1,63 @@
 //! Работа ядра: опрос, пинг и статистика в фоне, ответы окну по каналу, смена режима на лету.
 
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use super::helper::{self, Op, Out};
+use super::budget::{Budgets, Limits};
 use super::pipe::Server;
 use super::proto::{CoreState, NativeOp, Plan, Request, Response};
+use super::agent_watch::{self, AgentCell};
 use super::retry::{self, Note, Retries, Seen};
 use super::{data_dir, Config, CoreApi, DATA_SDDL};
 use crate::backend::{EngineHost, Real, TunnelHost, MANAGER_SERVICE};
 use crate::crash::lock;
-use crate::events::Severity;
+use crate::events::{Event, Severity};
 use crate::i18n::{tr, trf};
-use crate::monitor::{Options, Shared};
+use crate::monitor::{Options, PendingGuard, Shared};
 use crate::settings::Mode;
 use crate::store;
-use crate::update::manager::Manager;
 
 /// Сколько ждём, пока служба туннеля появится или исчезнет после команды.
 const SWITCH_TIMEOUT: Duration = Duration::from_secs(15);
 /// Одновременных соединений с окном больше этого — лишние получают отказ (память и потоки ядра не бесконечны).
 const MAX_CONNECTIONS: usize = 32;
+/// Своё малое число мест для клиентов-SYSTEM (второй процесс — агент): он ходит к ядру редко и короткими
+/// запросами, 8 хватает с запасом. Предела «без границ», как было, нет: цикл с ошибкой в агенте иначе плодил бы
+/// потоки ядра без счёта. Места отдельные от `MAX_CONNECTIONS`: зависший агент не отрезает окно от ядра, а 32
+/// подключения программ владельца не отрезают агента.
+const MAX_SYSTEM_CONNECTIONS: usize = 8;
+/// Запас для проверки канала самим ядром при старте (`wait_listening`): Hello от SYSTEM принимается, даже когда
+/// `MAX_SYSTEM_CONNECTIONS` заняты. Запас один, и на нём отвечают только на Hello — потоки по-прежнему ограничены.
+const SELF_CHECK_CONNECTIONS: usize = 1;
+const CORE_LIMITS: Limits = Limits { user: MAX_CONNECTIONS, system: MAX_SYSTEM_CONNECTIONS, self_check: SELF_CHECK_CONNECTIONS };
 
 pub struct Core {
     shared: Arc<Shared>,
     config: Mutex<Config>,
+    /// Куда записывается `config` при смене желаемого набора: `core.ini` ядра (в тестах — свой файл, не живой).
+    /// `None` — только в памяти: тесты изоляции ядра (`tests::isolation_*`). Запись `core.ini` надёжная (сброс на диск
+    /// дважды) и под нагрузкой на диск занимает больше секунды; их срок «Switch быстрее секунды» мерит ядро, а не диск.
+    config_file: Option<std::path::PathBuf>,
     /// Смена режима, переключения туннелей и запросы, зависящие от режима, не пересекаются.
     switching: Mutex<()>,
-    /// Действия в родном окне — по одному: два помощника сразу мешали бы друг другу в одном окне.
-    helper_lock: Mutex<()>,
-    /// Занятые места соединений; место держит `Slot`.
-    connections: Arc<AtomicUsize>,
+    /// Занятые места соединений; место держит `budget::Slot`.
+    connections: Budgets,
     /// Сведения о туннелях режима 1, прочитанные из родного окна: по ним видно, с кем туннель конфликтует.
     details: Mutex<HashMap<String, crate::conf::TunnelInfo>>,
-    /// Обновления и откаты компонентов.
-    updates: Arc<Manager>,
     /// Надзор за желаемыми туннелями — единственный, кто их переподключает. Берётся после `switching`, не наоборот.
     retries: Mutex<Retries>,
+    /// Пометки «занят» туннелей под арендой (`HoldNative`); срок аренды — в `retries`, пометка снимается вместе с ней.
+    /// Берётся после `retries`, не наоборот.
+    held: Mutex<HashMap<String, PendingGuard>>,
+    /// Движок заменён: такт надзора переподключит туннели режима 2 (`ReconnectEngine`).
+    engine_replaced: AtomicBool,
+    /// Состояние второго процесса (агента); пишет только его сторож (`agent_watch`).
+    agent: Arc<AgentCell>,
+    /// До какого номера журнал ядра забрал агент: `events_after` его последнего `State` (`agent::journal`). На
+    /// остановке ядра события после него дописываются в файл напрямую (`unpersisted_tail`).
+    agent_took: AtomicU64,
 }
 
 /// Кто переключает туннель: пользователь (команда окна) или надзор ядра, поднимая желаемый туннель (`retry`).
@@ -76,8 +95,9 @@ impl From<String> for RunError {
 }
 
 /// Запустить ядро и работать, пока не поднят `stop`. `ready` вызывается один раз — когда канал уже отвечает;
-/// ошибка до этого — ядро не поднялось.
-pub fn run(stop: &AtomicBool, ready: impl FnOnce()) -> Result<(), RunError> {
+/// ошибка до этого — ядро не поднялось. `persist_tail` — на выходе (любом, после создания ядра): события, которых агент
+/// не успел забрать; файл пишет вызвавший (служба), не ядро — у ядра нет записи в журнал на живых путях.
+pub fn run(stop: &AtomicBool, ready: impl FnOnce(), persist_tail: impl FnOnce(Vec<Event>)) -> Result<(), RunError> {
     let dir = data_dir();
     crate::win::protect_dir(&dir, DATA_SDDL)?;
     let (config, unreadable) = Config::load_guarded();
@@ -90,30 +110,55 @@ pub fn run(stop: &AtomicBool, ready: impl FnOnce()) -> Result<(), RunError> {
     if config.owner_sid.is_empty() {
         return Err(tr("core.no_owner").into());
     }
-    let options = Options { ping: config.ping, ping_host: config.ping_host.clone(), notify: false, tray: false, taskbar: false };
-    let shared = Arc::new(Shared::new(Some(host_for(config.mode)), options, Some(dir.join("Stats.ini")), Some(super::events_file())));
-    let core = Arc::new_cyclic(|me: &Weak<Core>| {
-        // Движок заменён — туннели режима 2 переподключаются уже на новом.
-        let me = me.clone();
-        let on_engine_changed = Box::new(move || {
-            if let Some(core) = me.upgrade() {
-                core.reconnect_engine();
-            }
-        });
-        Core {
-            updates: Manager::new(shared.clone(), on_engine_changed),
-            shared,
-            config: Mutex::new(config),
-            switching: Mutex::new(()),
-            helper_lock: Mutex::new(()),
-            connections: Arc::default(),
-            details: Mutex::default(),
-            retries: Mutex::default(),
-        }
+    // Пинг ведёт агент: у ядра он выключен, `State` несёт пустой.
+    let options = Options { ping: false, ping_host: String::new(), notify: false, tray: false, taskbar: false };
+    // Журнал ядра — только память: файл ведёт агент, забирая события по курсору из `State` (`agent::journal`).
+    // Зависший диск так не держит ни блокировку журнала, ни остановку ядра.
+    let shared = Arc::new(Shared::new(Some(host_for(config.mode)), options, None));
+    let core = Arc::new(Core {
+        shared,
+        config: Mutex::new(config),
+        config_file: Some(Config::path()),
+        switching: Mutex::new(()),
+        connections: Budgets::new(CORE_LIMITS),
+        details: Mutex::default(),
+        retries: Mutex::default(),
+        held: Mutex::default(),
+        engine_replaced: AtomicBool::new(false),
+        agent: Arc::default(),
+        agent_took: AtomicU64::new(0),
     });
     core.prepare_mode();
+    let result = serve_until_stopped(&core, stop, ready, Endpoints::live());
+    finish(&core, persist_tail);
+    result
+}
+
+/// Остановка: агент забирает журнал ядра раз в секунду и гибнет вместе со службой — события последней секунды иначе
+/// не дошли бы до `events.log`.
+fn finish(core: &Core, persist_tail: impl FnOnce(Vec<Event>)) {
+    let tail = core.unpersisted_tail();
+    if !tail.is_empty() {
+        persist_tail(tail);
+    }
+}
+
+/// Имена и процессы, постоянные у живого ядра: канал ядра и агент. Тест изоляции ядра (`tests::isolation_*`)
+/// подставляет свои — не трогая живую службу, её каналы и файлы.
+struct Endpoints {
+    pipe: String,
+    agent: agent_watch::AgentSpec,
+}
+
+impl Endpoints {
+    fn live() -> Endpoints {
+        Endpoints { pipe: super::pipe::NAME.to_string(), agent: agent_watch::AgentSpec::live() }
+    }
+}
+
+/// Работа ядра с подготовленным режимом: фоновые потоки, канал, агент — до `stop`.
+fn serve_until_stopped(core: &Arc<Core>, stop: &AtomicBool, ready: impl FnOnce(), ends: Endpoints) -> Result<(), RunError> {
     crate::monitor::spawn(core.shared.clone(), Box::new(|| {}));
-    crate::ping::spawn(core.shared.clone());
     // Надзор за желаемыми туннелями: его первый такт — восстановление после запуска ядра.
     let net_core = core.clone();
     super::netwatch::spawn(move |severity, text| net_core.shared.log("", severity, text));
@@ -123,30 +168,33 @@ pub fn run(stop: &AtomicBool, ready: impl FnOnce()) -> Result<(), RunError> {
     let server_core = core.clone();
     let taken = Arc::new(AtomicBool::new(false));
     let server_taken = taken.clone();
-    crate::crash::spawn_named("pipe-accept", move || serve(&server_core, &server_taken));
-    if let Err(e) = wait_listening() {
+    let pipe = ends.pipe.clone();
+    crate::crash::spawn_named("pipe-accept", move || serve(&server_core, &server_taken, &pipe));
+    if let Err(e) = wait_listening(&ends.pipe) {
         return Err(if taken.load(Ordering::SeqCst) { RunError::PipeTaken(e) } else { RunError::Failed(e) });
     }
     ready();
+    // Агент — после того как ядро поднялось: туннели и канал ядра от него не зависят. Поток сторожа вторичный
+    // (паника не останавливает ядро) и не берёт блокировок ядра — только журнал и свою ячейку состояния.
+    let (agent, agent_log, spec) = (core.agent.clone(), core.shared.clone(), ends.agent);
+    crate::crash::spawn_named("agent-watch", move || agent_watch::run(&agent, &|severity, text| agent_log.log("", severity, text), &spec));
 
     while !stop.load(Ordering::SeqCst) {
         // Фоновый поток упал (причина уже в журнале) — ядро без него полуживое: остановиться с кодом сбоя, чтобы
-        // диспетчер служб перезапустил службу. Статистика не сохраняется: поток мог упасть посреди её изменения,
-        // остаётся последнее периодическое сохранение.
+        // диспетчер служб перезапустил службу.
         if crate::crash::core_failure().is_some() {
             return Err(RunError::Failed(tr("core.thread_failed")));
         }
         std::thread::sleep(Duration::from_millis(300));
     }
-    core.shared.save_stats();
     Ok(())
 }
 
 /// Цикл канала: ждать клиента и отвечать ему в своём потоке. `taken` — последняя попытка упёрлась в чужой канал с
 /// тем же именем (для `run`: почему канал не заработал).
-fn serve(core: &Arc<Core>, taken: &AtomicBool) {
+fn serve(core: &Arc<Core>, taken: &AtomicBool, name: &str) {
     let owner = lock(&core.config).owner_sid.clone();
-    let (mut server, bad_owner) = Server::new(&owner);
+    let (mut server, bad_owner) = Server::new(name, &owner);
     if let Some(bad) = bad_owner {
         core.shared.log("", Severity::Bad, &trf("core.bad_owner", &[&bad]));
     }
@@ -168,7 +216,7 @@ fn serve(core: &Arc<Core>, taken: &AtomicBool) {
         if errors.recovered() {
             core.shared.log("", Severity::Info, &tr("core.pipe_recovered"));
         }
-        let Some(slot) = Slot::take(&core.connections, connection_limit(conn.from_system())) else {
+        let Some((slot, hello_only)) = core.connections.admit(conn.from_system()) else {
             // Не дошёл отказ — клиент сам увидит ошибку канала; ядру тут терять нечего.
             drop(conn.reply(&Response::Refused(tr("core.busy"))));
             continue;
@@ -178,20 +226,14 @@ fn serve(core: &Arc<Core>, taken: &AtomicBool) {
             // Место возвращается при выходе из потока при любом исходе.
             let _slot = slot;
             let response = match conn.read() {
-                Ok(req) => core.handle_isolated(req, conn.session, conn.client_sid.as_deref(), conn.elevated),
+                Ok(req) if hello_only && !matches!(req, Request::Hello) => Response::Refused(tr("core.busy")),
+                Ok(req) => core.handle_isolated(req, conn.client_sid.as_deref(), conn.from_system()),
                 Err(e) => Response::Refused(e),
             };
             // Не дошёл ответ (клиент ушёл или не забирает его в срок) — клиент сам увидит ошибку канала.
             drop(conn.reply(&response));
         });
     }
-}
-
-/// Сколько соединений клиента обслуживать одновременно. Проверку канала при старте (запрос от самой системы)
-/// предел не касается: иначе 32 подключения любой программы владельца сорвали бы запуск, и перезапуск после
-/// обновления счёл бы новую сборку сломанной и вернул прежнюю.
-fn connection_limit(from_system: bool) -> usize {
-    if from_system { usize::MAX } else { MAX_CONNECTIONS }
 }
 
 /// Пауза перед новой попыткой после первой ошибки ожидания клиента; дальше она удваивается до `ACCEPT_PAUSE_MAX`.
@@ -241,10 +283,10 @@ impl AcceptErrors {
 
 /// Ядро слушает канал: запрос Hello к самому себе прошёл весь путь (клиент заодно проверяет, что владелец канала —
 /// SYSTEM) и ответила эта же версия, а не чужой канал с тем же именем.
-fn wait_listening() -> Result<(), String> {
+fn wait_listening(name: &str) -> Result<(), String> {
     let until = Instant::now() + READY_TIMEOUT;
     loop {
-        let last = match super::PipeClient.hello() {
+        let last = match PipeAt(name).hello() {
             Ok((version, _)) if version == env!("CARGO_PKG_VERSION") => return Ok(()),
             Ok((version, _)) => format!("core {version}"),
             Err(e) => e,
@@ -256,6 +298,15 @@ fn wait_listening() -> Result<(), String> {
     }
 }
 
+/// Клиент канала ядра с этим именем (у живого ядра — `pipe::NAME`, как у `PipeClient`).
+struct PipeAt<'a>(&'a str);
+
+impl CoreApi for PipeAt<'_> {
+    fn call(&self, req: Request) -> Result<Response, String> {
+        super::pipe::call_to(self.0, &req, super::pipe::Timeouts::CORE)
+    }
+}
+
 fn host_for(mode: Mode) -> Arc<dyn TunnelHost> {
     match mode {
         Mode::Overlay => Arc::new(Real::new()),
@@ -263,39 +314,9 @@ fn host_for(mode: Mode) -> Arc<dyn TunnelHost> {
     }
 }
 
-/// Возврат компонента к версии из копии — только по запросу с правами администратора (подтверждение UAC): иначе
-/// любая программа учётной записи владельца молча откатила бы компонент к старой версии с известными дырами.
-/// Правило — для любого возврата, а не только к более старой версии: версии сравнимы не всегда (AmneziaWG может
-/// быть не установлен, номер сборки — неизвестен), а простое правило нечем обойти.
-fn updates_allowed(op: &crate::update::UpdateOp, elevated: bool) -> Result<(), String> {
-    match op {
-        crate::update::UpdateOp::Restore(_) if !elevated => Err(tr("core.restore_needs_admin")),
-        _ => Ok(()),
-    }
-}
 
 fn done(r: Result<(), String>) -> Response {
     r.map_or_else(Response::Err, |()| Response::Ok)
-}
-
-/// Место в счётчике соединений: возвращается в `Drop` — и при панике обработчика запроса. Иначе каждая паника
-/// навсегда занимала бы место, и через `MAX_CONNECTIONS` паник ядро отвечало бы «занято» на всё.
-struct Slot(Arc<AtomicUsize>);
-
-impl Slot {
-    fn take(counter: &Arc<AtomicUsize>, max: usize) -> Option<Slot> {
-        if counter.fetch_add(1, Ordering::SeqCst) >= max {
-            counter.fetch_sub(1, Ordering::SeqCst);
-            return None;
-        }
-        Some(Slot(counter.clone()))
-    }
-}
-
-impl Drop for Slot {
-    fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::SeqCst);
-    }
 }
 
 impl Core {
@@ -340,133 +361,106 @@ impl Core {
     }
 
     /// Запрос окна: паника в нём — ошибка этого запроса (в журнал и окну), а не остановка ядра.
-    fn handle_isolated(&self, req: Request, session: u32, caller: Option<&str>, elevated: bool) -> Response {
-        crate::crash::isolate(|| self.handle(req, session, caller, elevated)).unwrap_or_else(|panic| {
+    fn handle_isolated(&self, req: Request, caller: Option<&str>, system: bool) -> Response {
+        crate::crash::isolate(|| self.handle(req, caller, system)).unwrap_or_else(|panic| {
             self.shared.log("", Severity::Bad, &trf("core.request_failed", &[&panic]));
             Response::Err(trf("core.request_failed", &[&panic]))
         })
     }
 
-    fn handle(&self, req: Request, session: u32, caller: Option<&str>, elevated: bool) -> Response {
+    /// `system` — клиент канала работает от SYSTEM (`ServerConn::from_system`): только ему открыты внутренние запросы.
+    fn handle(&self, req: Request, caller: Option<&str>, system: bool) -> Response {
+        // Снять туннели с надзора, дёрнуть переподключение или убрать туннель из желаемого набора может только служба:
+        // окно (любая программа владельца) так оставляло бы желаемые туннели без надзора.
+        if internal_request(&req) && !system {
+            self.shared.log("", Severity::Warn, &trf("core.internal_refused", &[caller.unwrap_or("?")]));
+            return Response::Refused(tr("core.internal_only"));
+        }
         // Имя туннеля из запроса становится частью путей и командных строк — только допустимые имена.
         if let Some(bad) = names_in(&req).into_iter().find(|n| !crate::engine::valid_name(n)) {
             return Response::Refused(trf("eng.bad_name", &[bad]));
         }
-        // Команды PreUp/PostUp/… служба туннеля выполнила бы от SYSTEM — из окна их не принимаем.
-        if texts_in(&req).into_iter().any(has_scripts) {
-            return Response::Refused(tr("core.no_scripts"));
-        }
         match req {
             Request::Hello => Response::Hello { version: env!("CARGO_PKG_VERSION").into(), mode: self.mode() },
-            Request::State { events_after } => Response::State(Box::new(self.state(events_after))),
+            Request::State { events_after } => {
+                self.note_agent_position(events_after, system);
+                Response::State(Box::new(self.state(events_after)))
+            }
             Request::Switch { tunnel, plan, multiple } => done(self.switch(&tunnel, plan, multiple)),
             Request::SetMode(mode) => done(self.set_mode(mode)),
-            Request::SetPing { enabled, host } => done(self.set_ping(enabled, host)),
+            // Окно прежней версии: пинг теперь у агента, а не у ядра.
+            Request::SetPing { .. } => Response::Refused(tr("core.ping_moved")),
             Request::SetLanguage(code) => done(self.set_language(code)),
             Request::Retry(tunnel) => done(self.retry(&tunnel)),
-            // Обновления — вне блокировки режима: загрузка идёт минутами.
-            Request::Updates(op) => {
-                if let Err(e) = updates_allowed(&op, elevated) {
-                    self.shared.log("", Severity::Warn, &trf("core.restore_refused", &[caller.unwrap_or("?")]));
-                    return Response::Err(e);
-                }
-                match self.updates.handle(op) {
-                    Ok(s) => Response::Updates(Box::new(s)),
-                    Err(e) => Response::Err(e),
-                }
+            Request::HoldNative { lease_s } => self.hold_native(Duration::from_secs(lease_s)).map_or_else(Response::Err, Response::Held),
+            Request::Release { tunnels } => done(self.release(&tunnels)),
+            Request::ReconnectEngine => {
+                self.request_engine_reconnect();
+                Response::Ok
             }
-            // Остальное зависит от режима: пока оно выполняется, режим не меняется.
-            other => {
-                let _guard = (!native_helper_request(self.mode(), &other)).then(|| lock(&self.switching));
-                self.handle_in_mode(other, session, caller)
-            }
-        }
-    }
-
-    fn handle_in_mode(&self, req: Request, session: u32, caller: Option<&str>) -> Response {
-        let engine = self.mode() == Mode::Engine;
-        let need_engine = || if engine { Ok(()) } else { Err(tr("core.only_engine")) };
-        match req {
-            Request::Read(t) if engine => store::read(&store::path(&t)).map_or_else(Response::Err, Response::Text),
-            Request::Read(t) => self.helper(session, caller, Op::ReadConfig(t)),
-            Request::Write { tunnel, text } if engine => done(store::write(&tunnel, &text).map(drop)),
-            Request::Write { tunnel, text } => {
+            Request::Forget(tunnel) => {
                 lock(&self.details).remove(&tunnel);
-                self.helper(session, caller, Op::WriteConfig(tunnel, text))
+                self.forget(&tunnel);
+                Response::Ok
             }
-            Request::Delete(t) if engine => done(EngineHost.delete_tunnel(&t).inspect(|()| self.forget(&t))),
+            Request::Footprint { tunnel, info } => {
+                let mut details = lock(&self.details);
+                match info {
+                    Some(info) => details.insert(tunnel, info),
+                    None => details.remove(&tunnel),
+                };
+                Response::Ok
+            }
+            // Окно прежней версии: обновления ведёт агент; его менеджер просит ядро только `HoldNative`/`Release`/
+            // `ReconnectEngine` (выше).
+            Request::Updates(_) => Response::Refused(tr("core.updates_moved")),
+            // Удаление туннеля режима 2 убирает его службу — оно остаётся в ядре, под `switching`: режим не меняется
+            // посреди удаления. Удаление в родном окне (режим 1) делает агент и сообщает ядру `Forget`.
             Request::Delete(t) => {
-                lock(&self.details).remove(&t);
-                let r = self.helper(session, caller, Op::Delete(t.clone()));
-                if matches!(r, Response::Ok) {
-                    // Иначе `[имя]` остаётся в Stats.ini навсегда и искажает доли времени.
-                    self.forget(&t);
+                let _guard = lock(&self.switching);
+                if self.mode() != Mode::Engine {
+                    return Response::Refused(tr("core.moved_to_agent"));
                 }
-                r
+                done(EngineHost.delete_tunnel(&t).inspect(|()| self.forget(&t)))
             }
-            Request::Details(t) if engine => {
-                store::read(&store::path(&t)).map_or_else(Response::Err, |text| Response::Info(crate::conf::parse(&text)))
+            Request::Rename { old, new } => {
+                let _guard = lock(&self.switching);
+                let need_engine = if self.mode() == Mode::Engine { Ok(()) } else { Err(tr("core.only_engine")) };
+                done(need_engine.and_then(|()| self.rename(&old, &new)))
             }
-            Request::Details(t) => {
-                let r = self.helper(session, caller, Op::Details(t.clone()));
-                if let Response::Info(info) = &r {
-                    lock(&self.details).insert(t, info.clone());
-                }
-                r
-            }
-            Request::Import(entries) => match need_engine().and_then(|()| store::import(&entries)) {
-                Ok(r) => {
-                    self.log_imported(r.added.len());
-                    Response::Report(r)
-                }
-                Err(e) => Response::Err(e),
-            },
-            Request::ExportAll => need_engine().and_then(|()| store::export_all()).map_or_else(Response::Err, Response::Entries),
-            Request::Rename { old, new } => done(need_engine().and_then(|()| self.rename(&old, &new))),
-            Request::NewTunnel(name) => need_engine().and_then(|()| new_tunnel(&name)).map_or_else(Response::Err, Response::Text),
-            Request::TakeNative => match need_engine().and_then(|()| self.take_native(session, caller)) {
-                Ok(r) => Response::Report(r),
-                Err(e) => Response::Err(e),
-            },
-            Request::Native(_) if engine => Response::Err(tr("core.only_overlay")),
-            Request::Native(op) => self.helper(
-                session,
-                caller,
-                match op {
-                    NativeOp::Open => Op::Open,
-                    NativeOp::Edit(t) => Op::Edit(t),
-                    NativeOp::Import(f) => Op::Import(f),
-                    NativeOp::Close => Op::Close,
-                },
-            ),
-            // Разобраны в `handle`.
-            Request::Hello | Request::State { .. } | Request::Switch { .. } | Request::SetMode(_) | Request::SetPing { .. }
-            | Request::SetLanguage(_)
-            | Request::Retry(_)
-            | Request::Updates(_) => {
-                Response::Err("core: unexpected".into())
-            }
+            // Окно прежней версии: помощник родного окна и хранилище режима 2 ведёт агент (`agent::tunnels`).
+            Request::Read(_)
+            | Request::Write { .. }
+            | Request::Details(_)
+            | Request::Import(_)
+            | Request::ExportAll
+            | Request::NewTunnel(_)
+            | Request::TakeNative
+            | Request::Native(_) => Response::Refused(tr("core.moved_to_agent")),
         }
     }
 
-    /// Действие в родном окне — через помощника в сеансе того, кто прислал запрос, и от его имени.
-    fn helper(&self, session: u32, caller: Option<&str>, op: Op) -> Response {
-        match self.run_helper(session, caller, &op) {
-            Ok(Out::Ok) => Response::Ok,
-            Ok(Out::Text(t)) => Response::Text(t),
-            Ok(Out::Info(i)) => Response::Info(i),
-            Ok(Out::Err(e)) | Err(e) => Response::Err(e),
+    /// Позиция агента в журнале ядра. Только SYSTEM: окно (не SYSTEM) читает журнал для себя, а пинг агента спрашивает
+    /// `State` без событий (`u64::MAX`) — это не подтверждение. Позиция дальше последнего события ядра — метка
+    /// прежнего экземпляра ядра (агент перезапустился со старой меткой, пока ядро запущено заново): она не говорит,
+    /// что агент забрал события нынешнего, и запись стёрла бы из хвоста остановки всё, что агент ещё не получил.
+    fn note_agent_position(&self, events_after: u64, system: bool) {
+        if system && events_after != u64::MAX && events_after <= self.shared.with_events(|log| log.last_seq()) {
+            self.agent_took.store(events_after, Ordering::SeqCst);
         }
     }
 
-    fn run_helper(&self, session: u32, caller: Option<&str>, op: &Op) -> Result<Out, String> {
-        let caller = caller.ok_or_else(|| tr("core.other_session"))?;
-        let _one = lock(&self.helper_lock);
-        helper::run(session, caller, op)
+    /// События журнала ядра после последней позиции агента. Агент мог успеть записать часть из них (его последний
+    /// ответ ещё не подтверждён следующим запросом): лучше строка дважды, чем ни одной.
+    fn unpersisted_tail(&self) -> Vec<Event> {
+        let after = self.agent_took.load(Ordering::SeqCst);
+        self.shared.with_events(|log| log.since(after)).into_iter().map(|(_, event)| event).collect()
     }
 
     fn state(&self, events_after: u64) -> CoreState {
-        self.shared.core_state(self.mode(), events_after)
+        let mut state = self.shared.core_state(self.mode(), events_after);
+        state.agent = self.agent.get();
+        state
     }
 
     /// Что занимает туннель: режим 2 — по конфигу из хранилища, режим 1 — по сведениям из родного окна, если они
@@ -519,8 +513,9 @@ impl Core {
                 return Err(e);
             }
         };
-        // Под той же блокировкой, что и команды пользователя: отключённый им за время ожидания не поднимается обратно.
-        if origin == Origin::Retry && (running.iter().any(|r| r == name) || !self.is_desired(name)) {
+        // Под той же блокировкой, что и команды пользователя: отключённый им за время ожидания не поднимается обратно,
+        // а взятый в аренду, пока попытка ждала блокировку (`hold`), не трогается.
+        if origin == Origin::Retry && (running.iter().any(|r| r == name) || !self.is_desired(name) || lock(&self.retries).is_held(name)) {
             return Ok(false);
         }
         let others = to_replace(name, plan, multiple, &running, |n| self.footprint(n));
@@ -568,12 +563,17 @@ impl Core {
         if next == *config {
             return;
         }
-        let saved = next.save();
+        let saved = self.config_file.as_deref().map_or(Ok(()), |path| next.save_to(path));
         *config = next;
         drop(config);
         if let Err(e) = saved {
             self.shared.log(tunnel, Severity::Warn, &trf("core.desired_unsaved", &[&e]));
         }
+    }
+
+    /// Вывести туннель из желаемого набора по решению надзора.
+    fn drop_desired(&self, tunnel: &str) {
+        self.update_desired(tunnel, |config| config.tunnels.iter_mut().for_each(|tunnels| tunnels.retain(|d| d != tunnel)));
     }
 
     fn is_desired(&self, name: &str) -> bool {
@@ -600,6 +600,11 @@ impl Core {
 
     /// Один такт надзора: решения `Retries::tick`, попытки — обычным переключением, исходы — в журнал и окну.
     fn supervise_tick(&self, now: Instant, network_changed: bool) {
+        // Замена движка — здесь, в потоке надзора: работа обновления переподключения не ждёт и блокировку туннелей
+        // не держит, а такты не идут вперемешку с переподключением.
+        if self.engine_replaced.swap(false, Ordering::SeqCst) {
+            self.reconnect_engine();
+        }
         let (desired, multiple) = {
             let config = lock(&self.config);
             (config.tunnels.clone().unwrap_or_default(), config.multiple)
@@ -612,28 +617,126 @@ impl Core {
             &Seen {
                 desired: &desired,
                 running: running.as_deref(),
-                pending: &|t| self.shared.is_pending(t),
+                // Пометку аренды надзор решает сам (`Retries::hold`): истёкшая аренда на этом же такте даёт попытку,
+                // её пометка снимается после такта.
+                pending: &|t| self.shared.is_pending(t) && !lock(&self.held).contains_key(t),
                 service_exists: &|t| host.service_exists(t),
+                // Список конфигов не прочитался — «есть»: туннель остаётся под надзором, ошибку его попытки журнал
+                // покажет по расписанию; вывести из набора можно только то, чего нет точно.
+                config_exists: &|t| host.configs().map_or(true, |c| c.iter().any(|n| n == t)),
                 stop_reason: &|t| host.stop_reason(t),
                 native_services: host.native_services(),
                 network_changed,
             },
         );
         for t in &tick.outside {
-            self.update_desired(t, |config| config.tunnels.iter_mut().for_each(|tunnels| tunnels.retain(|d| d != t)));
+            self.drop_desired(t);
             self.shared.log(t, Severity::Info, &trf("core.retry_outside", &[t]));
+        }
+        for t in &tick.gone {
+            self.drop_desired(t);
+            self.shared.log(t, Severity::Warn, &trf("core.lease_gone", &[t]));
         }
         for (t, note) in tick.notes {
             self.log_note(&t, note);
         }
-        for t in &tick.due {
+        self.unmark_held(&tick.expired);
+        for t in &tick.expired {
+            self.shared.log(t, Severity::Warn, &trf("core.hold_expired", &[t]));
+        }
+        self.attempt(&tick.due, multiple);
+        self.shared.set_retries(lock(&self.retries).view(Instant::now()));
+    }
+
+    /// Попытки надзора — обычным переключением ядра; исходы — в расписание и журнал.
+    fn attempt(&self, tunnels: &[String], multiple: bool) {
+        for t in tunnels {
             let result = self.switch_from(Origin::Retry, t, Plan::Connect, multiple);
             let note = lock(&self.retries).outcome(t, Instant::now(), result);
             if let Some(note) = note {
                 self.log_note(t, note);
             }
         }
+    }
+
+    /// Аренда туннелей режима 1 на время установщика AmneziaWG (`HoldNative`), который убирает их службы. Набор решает
+    /// ядро, а не держатель: у менеджера обновлений в агенте своих сведений о туннелях нет, и пустой набор от него
+    /// оставлял MSI без аренды — надзор выводил туннели из желаемого набора, VPN не возвращался. В аренду идут
+    /// работающие и желаемые: желаемый неработающий надзор иначе поднимал бы наперегонки с MSI. Режим 2 — пусто, его
+    /// службы установщик не трогает. Список работающих не прочитался — ошибка без аренды: установщик не запускается.
+    /// Под `switching`: идущее переключение доходит до конца, и набор не меняется между чтением и арендой.
+    fn hold_native(&self, lease: Duration) -> Result<Vec<String>, String> {
+        let _guard = lock(&self.switching);
+        let host = self.host()?;
+        if !host.native_services() {
+            return Ok(Vec::new());
+        }
+        let mut tunnels = host.running().map_err(|e| trf("core.hold_no_running", &[&e.to_string()]))?;
+        tunnels.extend(lock(&self.config).tunnels.clone().unwrap_or_default());
+        tunnels.sort();
+        tunnels.dedup();
+        self.hold(&tunnels, lease);
+        Ok(tunnels)
+    }
+
+    /// Аренда туннелей: на `lease` (не дольше `retry::MAX_LEASE`) надзор их не подключает и из набора не выводит, окно
+    /// видит их занятыми. Только под `switching` (берёт вызывающий): пометку «занят» идущего переключения аренда не
+    /// перекрывает.
+    fn hold(&self, tunnels: &[String], lease: Duration) {
+        lock(&self.retries).hold(tunnels, Instant::now(), lease);
+        let mut held = lock(&self.held);
+        for t in tunnels {
+            held.entry(t.clone()).or_insert_with(|| self.shared.pending_guard([(t.clone(), "busy.update")]));
+        }
+        drop(held);
+        let secs = lease.min(retry::MAX_LEASE).as_secs().to_string();
+        for t in tunnels {
+            self.shared.log(t, Severity::Info, &trf("core.hold", &[t, &secs]));
+        }
         self.shared.set_retries(lock(&self.retries).view(Instant::now()));
+    }
+
+    /// Возврат аренды (`Release`): желаемые неработающие из возвращённых подключаются сразу, обычной попыткой надзора
+    /// (под `switching`, с желаемым набором); не вышло — дальше по расписанию надзора. Сразу, а не на следующем такте:
+    /// в режиме 1 такт счёл бы туннель без службы (её убрал установщик) отключённым в окне AmneziaWG.
+    fn release(&self, tunnels: &[String]) -> Result<(), String> {
+        let released = lock(&self.retries).release(tunnels);
+        self.unmark_held(&released);
+        if released.is_empty() {
+            return Ok(());
+        }
+        let (desired, multiple) = {
+            let config = lock(&self.config);
+            (config.tunnels.clone().unwrap_or_default(), config.multiple)
+        };
+        // Список не прочитался — попытка всем желаемым из возвращённых: работающему она ничего не сделает
+        // (`switch_from` проверит сам), а без расписания неработающий выпал бы из набора на ближайшем такте.
+        let running = self.host().and_then(|h| h.running().map_err(|e| e.to_string())).unwrap_or_else(|e| {
+            self.shared.log("", Severity::Warn, &e);
+            Vec::new()
+        });
+        let due: Vec<String> = released.into_iter().filter(|t| desired.contains(t) && !running.contains(t)).collect();
+        {
+            let now = Instant::now();
+            let mut retries = lock(&self.retries);
+            due.iter().for_each(|t| retries.restart(t, now));
+        }
+        self.attempt(&due, multiple);
+        self.shared.set_retries(lock(&self.retries).view(Instant::now()));
+        Ok(())
+    }
+
+    /// Снять пометки «занят» аренды.
+    fn unmark_held(&self, tunnels: &[String]) {
+        let mut held = lock(&self.held);
+        for t in tunnels {
+            held.remove(t);
+        }
+    }
+
+    /// `ReconnectEngine`: переподключение — на ближайшем такте надзора (`supervise_tick`), ответ — сразу.
+    fn request_engine_reconnect(&self) {
+        self.engine_replaced.store(true, Ordering::SeqCst);
     }
 
     /// Запись надзора в журнал. «Подключён» о туннеле под надзором пишет только он (`monitor` о нём молчит).
@@ -729,17 +832,6 @@ impl Core {
         }
     }
 
-    fn set_ping(&self, enabled: bool, host: String) -> Result<(), String> {
-        self.shared.set_ping_options(enabled, host.clone());
-        let mut config = lock(&self.config);
-        if config.ping != enabled || config.ping_host != host {
-            config.ping = enabled;
-            config.ping_host = host;
-            config.save()?;
-        }
-        Ok(())
-    }
-
     /// Язык журнала — как у окна. Файл .lng ядро берёт только из своей папки в Program Files (туда пишут
     /// администраторы); нет файла — встроенный перевод или английский.
     fn set_language(&self, code: String) -> Result<(), String> {
@@ -755,7 +847,7 @@ impl Core {
         Ok(())
     }
 
-    /// Переименование туннеля хранилища (отключённого); статистика переходит к новому имени.
+    /// Переименование туннеля хранилища (отключённого). Статистику ведёт агент: ей о переименовании сообщает окно.
     fn rename(&self, old: &str, new: &str) -> Result<(), String> {
         if !crate::engine::valid_name(new) {
             return Err(trf("eng.bad_name", &[new]));
@@ -764,61 +856,16 @@ impl Core {
             return Err(trf("eng.rename_running", &[old]));
         }
         store::rename(old, new)?;
-        self.shared.update_stats(|stats| {
-            if let Some(st) = stats.remove(old) {
-                stats.insert(new.to_string(), st);
-            }
-        });
         // Желаемый, но упавший сам туннель после перезапуска поднимается под новым именем.
         self.update_desired(new, |config| config.tunnels.iter_mut().flatten().filter(|t| *t == old).for_each(|t| *t = new.to_string()));
         Ok(())
     }
 
-    /// Удалённый туннель — и его статистика, и место в желаемом наборе.
+    /// Удалённый туннель уходит из желаемого набора. Его статистику агенту велит забыть окно.
     fn forget(&self, tunnel: &str) {
-        self.shared.update_stats(|stats| {
-            stats.remove(tunnel);
-        });
         self.update_desired(tunnel, |config| config.tunnels.iter_mut().for_each(|tunnels| tunnels.retain(|t| t != tunnel)));
     }
 
-    /// «Забрать всё из AmneziaWG»: родной экспорт (помощник в сеансе пользователя) во временный архив в защищённой
-    /// папке хранилища, импорт, архив удаляется сразу (остаток после сбоя уберёт `store::startup`).
-    fn take_native(&self, session: u32, caller: Option<&str>) -> Result<store::ImportReport, String> {
-        let zip = store::export_temp()?;
-        let exported = match self.run_helper(session, caller, &Op::Export(zip.display().to_string())) {
-            Ok(Out::Ok) => crate::archive::read(&zip, None).map_err(|e| format!("{}: {e:?}", zip.display())),
-            Ok(Out::Err(e)) | Err(e) => Err(e),
-            Ok(other) => Err(format!("helper: {other:?}")),
-        };
-        let removed = match std::fs::remove_file(&zip) {
-            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(crate::fsutil::io_ctx(&zip, e)),
-            _ => Ok(()),
-        };
-        let report = store::import(&removed.and(exported)?)?;
-        self.log_imported(report.added.len());
-        Ok(report)
-    }
-
-    fn log_imported(&self, n: usize) {
-        if n > 0 {
-            self.shared.log("", Severity::Info, &trf("eng.imported", &[&n.to_string()]));
-        }
-    }
-}
-
-/// Новый туннель хранилища со свежим ключом; возвращает его текст.
-fn new_tunnel(name: &str) -> Result<String, String> {
-    if !crate::engine::valid_name(name) {
-        return Err(trf("eng.bad_name", &[name]));
-    }
-    let names = store::list().map_err(|e| e.to_string())?;
-    if store::find(&names, name).is_some() {
-        return Err(tr("dlg.err_exists"));
-    }
-    let text = store::template();
-    store::write(name, &text)?;
-    Ok(text)
 }
 
 /// Шаги переключения — одни для ядра и демо-ядра окна: отключить `others`, затем туннель (кроме `Connect`) и дождаться,
@@ -861,66 +908,35 @@ pub(crate) fn to_replace(
     others.filter(|n| footprint(n).is_some_and(|f| f.conflicts(&target))).cloned().collect()
 }
 
-/// Запросы режима 1, которые целиком идут помощнику в родное окно. Они не трогают службы туннелей, поэтому
-/// `switching` не держат: иначе медленный шаг UI Automation (до 120 с) стопорит подключение и отключение.
-/// Одновременность с самим помощником задаёт `helper_lock`.
-fn native_helper_request(mode: Mode, req: &Request) -> bool {
-    mode == Mode::Overlay
-        && matches!(req, Request::Read(_) | Request::Write { .. } | Request::Delete(_) | Request::Details(_) | Request::Native(_))
+/// Внутренние запросы: только от SYSTEM (второй процесс ядра), окну — отказ.
+fn internal_request(req: &Request) -> bool {
+    matches!(req, Request::HoldNative { .. } | Request::Release { .. } | Request::ReconnectEngine | Request::Forget(_) | Request::Footprint { .. })
 }
 
 /// Имена туннелей из запроса.
 fn names_in(req: &Request) -> Vec<&str> {
     match req {
         Request::Switch { tunnel, .. } | Request::Write { tunnel, .. } => vec![tunnel],
-        Request::Read(t) | Request::Delete(t) | Request::Details(t) | Request::NewTunnel(t) | Request::Retry(t) => vec![t],
+        Request::Read(t) | Request::Delete(t) | Request::Details(t) | Request::NewTunnel(t) | Request::Retry(t) | Request::Forget(t) => vec![t],
+        Request::Footprint { tunnel, .. } => vec![tunnel],
         Request::Rename { old, new } => vec![old, new],
+        Request::Release { tunnels } => tunnels.iter().map(String::as_str).collect(),
         Request::Native(NativeOp::Edit(t)) => vec![t],
         _ => vec![],
     }
 }
 
-/// Тексты конфигов из запроса.
-fn texts_in(req: &Request) -> Vec<&str> {
-    match req {
-        Request::Write { text, .. } => vec![text],
-        Request::Import(entries) => entries.iter().map(|e| e.text.as_str()).collect(),
-        _ => vec![],
-    }
-}
-
-/// В конфиге есть команды, которые служба туннеля выполнила бы (PreUp, PostUp, PreDown, PostDown).
-fn has_scripts(text: &str) -> bool {
-    text.lines().any(|line| {
-        let key = line.split('=').next().unwrap_or("").trim().to_ascii_lowercase();
-        line.contains('=') && matches!(key.as_str(), "preup" | "postup" | "predown" | "postdown")
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn panicking_request_returns_its_connection_slot() {
-        let counter: Arc<AtomicUsize> = Arc::default();
-        let slot = Slot::take(&counter, 1).expect("свободное место");
-        assert!(Slot::take(&counter, 1).is_none(), "мест больше нет");
-        assert_eq!(counter.load(Ordering::SeqCst), 1, "отказ не занимает место");
-        let r = crate::crash::isolate(move || {
-            let _slot = slot;
-            panic!("handler bug");
-        });
-        assert!(r.is_err());
-        assert_eq!(counter.load(Ordering::SeqCst), 0, "место вернулось после паники");
-        assert!(Slot::take(&counter, 1).is_some());
-    }
+    use std::sync::atomic::AtomicUsize;
+    use super::super::proto::{AgentExit, AgentStatus};
 
     #[test]
     fn panic_mid_switch_leaves_no_tunnel_busy_and_lock_usable() {
         use crate::backend::Demo;
         let options = Options { ping: false, ping_host: String::new(), notify: false, tray: false, taskbar: false };
-        let shared = Arc::new(Shared::new(Some(Arc::new(Demo::new())), options, None, None));
+        let shared = Arc::new(Shared::new(Some(Arc::new(Demo::new())), options, None));
         let switching = Mutex::new(());
         let r = crate::crash::isolate(|| {
             let _guard = lock(&switching);
@@ -932,13 +948,6 @@ mod tests {
         assert!(!shared.is_pending("a") && !shared.is_pending("b"), "пометки «занят» сняты");
         assert!(switching.is_poisoned());
         drop(lock(&switching)); // следующий запрос проходит, а не паникует на отравленной блокировке
-    }
-
-    #[test]
-    fn scripts_are_found_in_any_case() {
-        assert!(has_scripts("[Interface]\npostup = cmd /c calc\n"));
-        assert!(has_scripts("[Interface]\n  PreDown=x\n"));
-        assert!(!has_scripts("[Interface]\nPrivateKey = a\n# PostUp is not set\n"));
     }
 
     /// Стойкая ошибка канала не пишет событие каждую секунду: пауза растёт до минуты, та же ошибка — в журнал раз в
@@ -969,30 +978,361 @@ mod tests {
     }
 
     #[test]
-    fn full_core_still_answers_its_own_startup_check() {
-        assert_eq!(connection_limit(false), MAX_CONNECTIONS, "окну и остальным — общий предел");
-        assert_eq!(connection_limit(true), usize::MAX, "проверка от системы проходит всегда");
+    fn user_budget_is_enforced_and_unaffected_by_system_connections() {
+        let b = Budgets::new(CORE_LIMITS);
+        let system: Vec<_> = (0..MAX_SYSTEM_CONNECTIONS + SELF_CHECK_CONNECTIONS).map(|_| b.admit(true).expect("место SYSTEM")).collect();
+        assert!(b.admit(true).is_none(), "SYSTEM сверх своего бюджета и запаса — отказ");
+        let users: Vec<_> = (0..MAX_CONNECTIONS).map(|_| b.admit(false).expect("место окна при занятом SYSTEM")).collect();
+        assert!(users.iter().all(|(_, hello_only)| !hello_only));
+        assert!(b.admit(false).is_none(), "окну — не больше MAX_CONNECTIONS");
+        drop(users);
+        assert!(b.admit(true).is_none(), "освободившиеся места окна SYSTEM не достаются");
+        drop(system);
     }
 
     #[test]
-    fn restore_needs_elevated_caller() {
-        use crate::update::UpdateOp;
-        assert_eq!(updates_allowed(&UpdateOp::Restore(3), false), Err(tr("core.restore_needs_admin")), "без UAC — отказ");
-        assert_eq!(updates_allowed(&UpdateOp::Restore(3), true), Ok(()));
-        for op in [UpdateOp::State, UpdateOp::Check, UpdateOp::Apply(vec![])] {
-            assert_eq!(updates_allowed(&op, false), Ok(()), "{op:?} — без прав администратора, как раньше");
+    fn system_budget_is_small_and_separate_from_the_user_one() {
+        let b = Budgets::new(CORE_LIMITS);
+        let users: Vec<_> = (0..MAX_CONNECTIONS).map(|_| b.admit(false).expect("место окна")).collect();
+        assert!(b.admit(false).is_none());
+        let system: Vec<_> = (0..MAX_SYSTEM_CONNECTIONS).map(|_| b.admit(true).expect("SYSTEM при занятых местах окна")).collect();
+        assert!(system.iter().all(|(_, hello_only)| !hello_only), "свой бюджет — полноценные места");
+        assert_eq!(MAX_SYSTEM_CONNECTIONS, 8);
+        drop(users);
+    }
+
+    #[test]
+    fn full_core_still_answers_its_own_startup_check() {
+        let b = Budgets::new(CORE_LIMITS);
+        let _users: Vec<_> = (0..MAX_CONNECTIONS).map(|_| b.admit(false).unwrap()).collect();
+        let _system: Vec<_> = (0..MAX_SYSTEM_CONNECTIONS).map(|_| b.admit(true).unwrap()).collect();
+        let (_slot, hello_only) = b.admit(true).expect("проверка канала проходит при всех занятых бюджетах");
+        assert!(hello_only, "запас — только для Hello");
+        assert!(b.admit(true).is_none(), "запас один: потоки по-прежнему ограничены");
+    }
+
+    /// Остановка ядра: события, которых агент ещё не забрал, уходят тому, кто пишет файл (служба); забранные — нет.
+    /// Позиция — только от SYSTEM и не `u64::MAX` (пинг агента): окно журнал ядра не сохраняет.
+    #[test]
+    fn events_the_agent_did_not_take_are_handed_over_on_stop() {
+        let core = engine_core(&[]);
+        let base = core.shared.with_events(|log| log.since(0).last().map_or(0, |(seq, _)| *seq));
+        for text in ["one", "two", "three"] {
+            core.shared.log("", Severity::Info, text);
+        }
+        core.handle(Request::State { events_after: base + 1 }, None, true);
+        core.handle(Request::State { events_after: u64::MAX }, None, true);
+        core.handle(Request::State { events_after: base + 3 }, Some("S-1-5-21-1"), false);
+        let mut sink = Vec::new();
+        finish(&core, |tail| sink.extend(tail.into_iter().map(|e| e.text)));
+        assert_eq!(sink, ["two", "three"]);
+
+        core.handle(Request::State { events_after: base + 3 }, None, true);
+        finish(&core, |tail| panic!("агент забрал всё, а отдано {}", tail.len()));
+    }
+
+    /// Агент перезапустился со старой меткой (экземпляр ядра другой, номера больше нынешних): его первый `State`
+    /// не подтверждение, и если служба встанет до следующего опроса, события ядра всё равно уйдут в файл.
+    #[test]
+    fn position_of_a_previous_core_instance_does_not_hide_the_tail() {
+        let core = engine_core(&[]);
+        let base = core.shared.with_events(|log| log.last_seq());
+        for text in ["one", "two"] {
+            core.shared.log("", Severity::Info, text);
+        }
+        core.handle(Request::State { events_after: base + 1500 }, None, true);
+        let mut sink = Vec::new();
+        finish(&core, |tail| sink.extend(tail.into_iter().map(|e| e.text)));
+        assert!(sink.ends_with(&["one".to_string(), "two".to_string()]), "{sink:?}");
+        assert_eq!(sink.len() as u64, base + 2, "отдано всё: чужая позиция не принята");
+    }
+
+    /// Ядро режима 2 над демо-хостом: `desired` — желаемый набор (прочее — как после чистой установки).
+    fn engine_core(desired: &[&str]) -> Arc<Core> {
+        core_over(Arc::new(crate::backend::Demo::new()), desired)
+    }
+
+    /// Ядро режима 2 над хостом `host`.
+    fn core_over(host: Arc<dyn TunnelHost>, desired: &[&str]) -> Arc<Core> {
+        // Свой файл на каждое ядро теста: смена желаемого набора не пишет в `core.ini` живого ядра.
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+        let config_file = std::env::temp_dir().join(format!("awg-core-test-{}-{}.ini", std::process::id(), NEXT.fetch_add(1, Ordering::SeqCst)));
+        core_saving_to(host, desired, Some(config_file))
+    }
+
+    /// Ядро теста; `config_file: None` — желаемый набор только в памяти.
+    fn core_saving_to(host: Arc<dyn TunnelHost>, desired: &[&str], config_file: Option<std::path::PathBuf>) -> Arc<Core> {
+        let options = Options { ping: false, ping_host: String::new(), notify: false, tray: false, taskbar: false };
+        let shared = Arc::new(Shared::new(Some(host), options, None));
+        let config = Config {
+            mode: Mode::Engine,
+            language: String::new(),
+            owner_sid: String::new(),
+            tunnels: Some(desired.iter().map(|t| t.to_string()).collect()),
+            multiple: false,
+        };
+        Arc::new(Core {
+            shared,
+            config: Mutex::new(config),
+            config_file,
+            switching: Mutex::new(()),
+            connections: Budgets::new(CORE_LIMITS),
+            details: Mutex::default(),
+            retries: Mutex::default(),
+            held: Mutex::default(),
+            engine_replaced: AtomicBool::new(false),
+            agent: Arc::default(),
+            agent_took: AtomicU64::new(0),
+        })
+    }
+
+    fn calls(host: &Recorder) -> Vec<String> {
+        lock(&host.calls).clone()
+    }
+
+    /// Туннель под арендой надзор не подключает и показывает занятым; возврат аренды подключает его сразу, обычной
+    /// попыткой надзора.
+    #[test]
+    fn held_tunnel_is_skipped_by_supervise_tick_until_released() {
+        let host = Arc::new(Recorder::native());
+        let core = core_over(host.clone(), &["a"]);
+        assert_eq!(core.hold_native(Duration::from_secs(900)), Ok(vec!["a".to_string()]));
+        let t0 = Instant::now();
+        for s in [0, 1, 11, 60, 600] {
+            core.supervise_tick(t0 + Duration::from_secs(s), false);
+        }
+        assert!(calls(&host).is_empty(), "под арендой попыток нет: {:?}", calls(&host));
+        assert!(core.shared.is_pending("a"), "туннель под арендой показан занятым");
+
+        core.release(&["a".to_string()]).unwrap();
+        assert_eq!(calls(&host), ["up a"], "возвращённый подключается сразу");
+        assert!(!core.shared.is_pending("a"));
+        core.release(&["a".to_string()]).unwrap();
+        assert_eq!(calls(&host), ["up a"], "повторный возврат ничего не делает");
+    }
+
+    /// Держатель пропал: аренда истекает на такте надзора, пометка снимается, попытка идёт сразу.
+    #[test]
+    fn expired_hold_is_unmarked_and_reconnected_by_the_tick() {
+        // Конфиг у AmneziaWG есть, службы нет (её убрал установщик): истёкшая аренда проверяет конфиг.
+        let host = Arc::new(Recorder { configs: Some(vec!["a".into()]), ..Recorder::native() });
+        let core = core_over(host.clone(), &["a"]);
+        assert_eq!(core.hold_native(Duration::from_secs(10)), Ok(vec!["a".to_string()]));
+        let t0 = Instant::now();
+        core.supervise_tick(t0, false);
+        assert!(calls(&host).is_empty());
+        core.supervise_tick(t0 + Duration::from_secs(11), false);
+        assert_eq!(calls(&host), ["up a"]);
+        assert!(!core.shared.is_pending("a"), "пометка аренды снята вместе с ней");
+        assert!(core.is_desired("a"));
+    }
+
+    /// Аренда истекла, а у AmneziaWG туннеля больше нет: ядро выводит его из набора с предупреждением и не подключает.
+    #[test]
+    fn expired_hold_of_a_tunnel_without_config_drops_it_with_a_warning() {
+        let host = Arc::new(Recorder { configs: Some(vec![]), ..Recorder::native() });
+        let core = core_over(host.clone(), &["a"]);
+        assert_eq!(core.hold_native(Duration::from_secs(10)), Ok(vec!["a".to_string()]));
+        core.supervise_tick(Instant::now() + Duration::from_secs(11), false);
+        assert!(calls(&host).is_empty(), "{:?}", calls(&host));
+        assert!(!core.is_desired("a"));
+        let gone = trf("core.lease_gone", &["a"]);
+        assert!(core.shared.events_since(0).iter().any(|(_, e)| e.text == gone && e.severity == Severity::Warn));
+    }
+
+    /// Пинг ушёл к агенту: окно прежней версии получает понятный отказ, а State ядра несёт пустой пинг.
+    #[test]
+    fn set_ping_is_refused_with_a_clear_text() {
+        let core = engine_core(&[]);
+        let r = core.handle(Request::SetPing { enabled: true, host: "1.1.1.1".into() }, Some("S-1-5-21-1-2-3-1001"), false);
+        assert!(matches!(&r, Response::Refused(t) if *t == tr("core.ping_moved")), "{r:?}");
+        assert_eq!(core.state(0).ping, crate::daemon::proto::PingDto::default());
+    }
+
+    /// Внутренние запросы — только от SYSTEM: окно (любая программа владельца) получает отказ, и ничего не меняется.
+    #[test]
+    fn internal_requests_from_a_non_system_caller_are_refused() {
+        let host = Arc::new(Recorder { running: Mutex::new(vec!["a".into()]), native: true, ..Default::default() });
+        let core = core_over(host.clone(), &["a"]);
+        let user = Some("S-1-5-21-1-2-3-1001");
+        for req in [
+            Request::HoldNative { lease_s: 900 },
+            Request::Release { tunnels: vec!["a".into()] },
+            Request::ReconnectEngine,
+            Request::Forget("a".into()),
+            Request::Footprint { tunnel: "a".into(), info: Some(crate::conf::TunnelInfo::default()) },
+        ] {
+            let r = core.handle(req, user, false);
+            assert!(matches!(&r, Response::Refused(t) if *t == tr("core.internal_only")), "{r:?}");
+        }
+        assert!(!lock(&core.retries).is_held("a") && !core.shared.is_pending("a"));
+        assert_eq!(lock(&core.config).tunnels.as_deref(), Some(&["a".to_string()][..]), "отклонённый Forget набор не меняет");
+        assert!(lock(&core.details).is_empty(), "отклонённый Footprint сведений не кладёт");
+        core.supervise_tick(Instant::now(), false);
+        assert!(calls(&host).is_empty(), "отклонённый ReconnectEngine не переподключает");
+
+        let r = core.handle(Request::HoldNative { lease_s: 900 }, None, true);
+        assert!(matches!(&r, Response::Held(t) if *t == ["a"]), "{r:?}");
+        assert!(lock(&core.retries).is_held("a"), "от SYSTEM аренда берётся");
+        let r = core.handle(Request::Release { tunnels: vec![r"..\x".into()] }, None, true);
+        assert!(matches!(r, Response::Refused(_)), "имена проверяются и у внутренних запросов: {r:?}");
+    }
+
+    /// Замена движка: запрос отвечает сразу, переподключение делает такт надзора, а не работа обновления.
+    #[test]
+    fn engine_reconnect_runs_on_the_supervisor_tick_not_in_the_caller() {
+        let host = Arc::new(Recorder { running: Mutex::new(vec!["a".into()]), ..Default::default() });
+        let core = core_over(host.clone(), &["a"]);
+        let r = core.handle(Request::ReconnectEngine, None, true);
+        assert!(matches!(r, Response::Ok), "{r:?}");
+        assert!(calls(&host).is_empty(), "вызывающий переподключение не ждёт");
+        core.supervise_tick(Instant::now(), false);
+        assert_eq!(calls(&host), ["down a", "up a"]);
+        core.supervise_tick(Instant::now(), false);
+        assert_eq!(calls(&host), ["down a", "up a"], "один запрос — одно переподключение");
+    }
+
+    /// Повтор запроса агентом (отметка «переподключение не принято» пережила его смерть после ответа ядра) до такта
+    /// надзора безвреден: два запроса — одно переподключение.
+    #[test]
+    fn repeated_engine_reconnect_before_the_tick_reconnects_once() {
+        let host = Arc::new(Recorder { running: Mutex::new(vec!["a".into()]), ..Default::default() });
+        let core = core_over(host.clone(), &["a"]);
+        for _ in 0..2 {
+            assert!(matches!(core.handle(Request::ReconnectEngine, None, true), Response::Ok));
+        }
+        core.supervise_tick(Instant::now(), false);
+        core.supervise_tick(Instant::now(), false);
+        assert_eq!(calls(&host), ["down a", "up a"]);
+    }
+
+    /// Менеджер обновлений агента (`PipeCore`) просит ядро по каналу от SYSTEM: аренда видна надзору, отпущенный
+    /// туннель поднимается, замена движка ждёт такта надзора.
+    #[test]
+    fn agents_update_requests_reach_the_core_entry_points() {
+        let host = Arc::new(Recorder::native());
+        let core = core_over(host.clone(), &["a"]);
+        let r = core.handle(Request::HoldNative { lease_s: 900 }, None, true);
+        assert!(matches!(&r, Response::Held(t) if *t == ["a"]), "{r:?}");
+        assert!(lock(&core.retries).is_held("a"));
+        let r = core.handle(Request::Release { tunnels: vec!["a".into()] }, None, true);
+        assert!(matches!(r, Response::Ok), "{r:?}");
+        assert_eq!(calls(&host), ["up a"]);
+        assert!(matches!(core.handle(Request::ReconnectEngine, None, true), Response::Ok));
+        assert!(core.engine_replaced.load(Ordering::SeqCst));
+    }
+
+
+    /// Набор аренды на время установщика решает ядро: в режиме 1 — работающие и желаемые (желаемый упавший тоже, иначе
+    /// надзор поднимал бы его наперегонки с MSI); в режиме 2 — ничего; список работающих не прочитался — ошибка, и
+    /// ничего не взято (установщик не запустится).
+    #[test]
+    fn native_hold_set_is_decided_by_the_core() {
+        let host = Arc::new(Recorder { running: Mutex::new(vec!["office".into(), "manual".into()]), native: true, ..Default::default() });
+        let core = core_over(host.clone(), &["office", "home"]);
+        assert_eq!(core.hold_native(Duration::from_secs(900)), Ok(vec!["home".to_string(), "manual".into(), "office".into()]));
+        assert!(["home", "manual", "office"].iter().all(|t| lock(&core.retries).is_held(t) && core.shared.is_pending(t)));
+
+        let core = core_over(Arc::new(Recorder { running: Mutex::new(vec!["a".into()]), ..Default::default() }), &["a"]);
+        assert_eq!(core.hold_native(Duration::from_secs(900)), Ok(vec![]), "режим 2: службы установщик не трогает");
+        assert!(!lock(&core.retries).is_held("a"));
+
+        let core = core_over(Arc::new(Recorder { native: true, unreadable: true, ..Default::default() }), &["a"]);
+        let r = core.hold_native(Duration::from_secs(900));
+        assert!(r.as_ref().is_err_and(|e| e.contains("pipes unreadable")), "{r:?}");
+        assert!(!lock(&core.retries).is_held("a") && !core.shared.is_pending("a"), "без списка аренды нет");
+    }
+
+    /// Агент удалил туннель в родном окне: ядро убирает его из желаемого набора (и из `core.ini`) и забывает его
+    /// сведения — надзор больше не поднимает удалённый туннель.
+    #[test]
+    fn forget_from_the_agent_drops_the_tunnel_from_the_desired_set_and_details() {
+        let core = core_over(Arc::new(Recorder::default()), &["a", "b"]);
+        lock(&core.details).insert("a".into(), crate::conf::TunnelInfo::default());
+        let r = core.handle(Request::Forget("a".into()), None, true);
+        assert!(matches!(r, Response::Ok), "{r:?}");
+        assert_eq!(lock(&core.config).tunnels.as_deref(), Some(&["b".to_string()][..]));
+        assert!(!lock(&core.details).contains_key("a"));
+        let file = core.config_file.as_deref().expect("core_over saves to a file");
+        let saved = Config::from_ini(&crate::ini::Ini::load(file));
+        assert_eq!(saved.tunnels.as_deref(), Some(&["b".to_string()][..]), "набор записан в файл ядра");
+        std::fs::remove_file(file).unwrap();
+    }
+
+    /// Ядро без файла (тесты изоляции): смена желаемого набора — в памяти, без предупреждения «не записан» в журнале.
+    #[test]
+    fn core_without_a_file_keeps_the_desired_set_in_memory_silently() {
+        let core = core_saving_to(Arc::new(Recorder::default()), &["a", "b"], None);
+        let r = core.handle(Request::Forget("a".into()), None, true);
+        assert!(matches!(r, Response::Ok), "{r:?}");
+        assert_eq!(lock(&core.config).tunnels.as_deref(), Some(&["b".to_string()][..]));
+        let unsaved = trf("core.desired_unsaved", &[""]);
+        let unsaved = unsaved.trim_end_matches(|c: char| !c.is_alphanumeric());
+        assert!(!journal(&core).iter().any(|t| t.contains(unsaved)), "{:?}", journal(&core));
+    }
+
+    /// Сведения из родного окна приходят от агента и решают, кого отключить при подключении с «несколько сразу»;
+    /// `None` (конфиг изменён) их забывает.
+    #[test]
+    fn footprint_from_the_agent_feeds_conflict_detection() {
+        let core = core_over(Arc::new(Recorder::default()), &[]);
+        lock(&core.config).mode = Mode::Overlay;
+        let full = |address: &str| crate::conf::parse(&format!("[Interface]\nAddress = {address}\n[Peer]\nAllowedIPs = 0.0.0.0/0\n"));
+        for (tunnel, info) in [("a", full("10.1.0.2/32")), ("b", full("10.2.0.2/32"))] {
+            let r = core.handle(Request::Footprint { tunnel: tunnel.into(), info: Some(info) }, None, true);
+            assert!(matches!(r, Response::Ok), "{r:?}");
+        }
+        let running = vec!["a".to_string()];
+        assert_eq!(to_replace("b", Plan::Connect, true, &running, |n| core.footprint(n)), ["a"], "оба на весь трафик");
+        let r = core.handle(Request::Footprint { tunnel: "a".into(), info: None }, None, true);
+        assert!(matches!(r, Response::Ok), "{r:?}");
+        assert!(core.footprint("a").is_none());
+        assert!(to_replace("b", Plan::Connect, true, &running, |n| core.footprint(n)).is_empty(), "сведений нет — не трогаем");
+    }
+
+    /// Помощник родного окна и хранилище ведёт агент: окно прежней версии получает от ядра понятный отказ, ядро
+    /// помощника не запускает и хранилище не трогает. Удаление режима 2 остаётся в ядре.
+    #[test]
+    fn requests_moved_to_the_agent_are_refused_with_a_clear_text() {
+        let core = engine_core(&[]);
+        let user = Some("S-1-5-21-1-2-3-1001");
+        let moved = || {
+            vec![
+                Request::Read("a".into()),
+                Request::Write { tunnel: "a".into(), text: "[Interface]\n".into() },
+                Request::Details("a".into()),
+                Request::Import(vec![crate::archive::Entry { name: "a".into(), text: "[Interface]\n".into() }]),
+                Request::ExportAll,
+                Request::NewTunnel("a".into()),
+                Request::TakeNative,
+                Request::Native(NativeOp::Open),
+            ]
+        };
+        for mode in [Mode::Engine, Mode::Overlay] {
+            lock(&core.config).mode = mode;
+            for req in moved() {
+                let what = format!("{mode:?} {req:?}");
+                let r = core.handle(req, user, false);
+                assert!(matches!(&r, Response::Refused(t) if *t == tr("core.moved_to_agent")), "{what}: {r:?}");
+            }
+        }
+        lock(&core.config).mode = Mode::Overlay;
+        let r = core.handle(Request::Delete("a".into()), user, false);
+        assert!(matches!(&r, Response::Refused(t) if *t == tr("core.moved_to_agent")), "удаление в родном окне: {r:?}");
+    }
+
+    /// Обновления ведёт агент: окно прежней версии получает от ядра понятный отказ, а не «ошибку ядра».
+    #[test]
+    fn updates_are_refused_with_a_clear_text() {
+        let core = engine_core(&[]);
+        for op in [crate::update::UpdateOp::State, crate::update::UpdateOp::Check, crate::update::UpdateOp::Restore(1)] {
+            for system in [false, true] {
+                let r = core.handle(Request::Updates(op.clone()), Some("S-1-5-21-1-2-3-1001"), system);
+                assert!(matches!(&r, Response::Refused(t) if *t == tr("core.updates_moved")), "{op:?}: {r:?}");
+            }
         }
     }
 
-    #[test]
-    fn native_helper_requests_skip_the_switch_lock_only_in_overlay_mode() {
-        let slow = Request::Details("t".into());
-        assert!(native_helper_request(Mode::Overlay, &slow));
-        assert!(native_helper_request(Mode::Overlay, &Request::Native(NativeOp::Open)));
-        assert!(!native_helper_request(Mode::Engine, &slow), "режим 2: хранилище меняется под блокировкой");
-        assert!(!native_helper_request(Mode::Overlay, &Request::Rename { old: "a".into(), new: "b".into() }));
-        assert!(!native_helper_request(Mode::Overlay, &Request::SetMode(Mode::Engine)));
-    }
 
     #[test]
     fn names_in_requests_are_collected_for_checks() {
@@ -1001,15 +1341,25 @@ mod tests {
         assert_eq!(names_in(&Request::Rename { old: "a".into(), new: "b".into() }), vec!["a", "b"]);
     }
 
-    /// Хост в памяти, который записывает команды; `fail` — на этой команде ошибка.
+    /// Хост в памяти, который записывает команды; `fail` — на этой команде ошибка; `native` — режим 1 (службы
+    /// AmneziaWG); `unreadable` — список работающих не читается.
     #[derive(Default)]
     struct Recorder {
         running: Mutex<Vec<String>>,
         calls: Mutex<Vec<String>>,
         fail: Option<&'static str>,
+        native: bool,
+        unreadable: bool,
+        /// Конфиги AmneziaWG; `None` — те же, что работают.
+        configs: Option<Vec<String>>,
     }
 
     impl Recorder {
+        fn native() -> Recorder {
+            Recorder { native: true, ..Default::default() }
+        }
+
+
         fn step(&self, call: String) -> Result<(), String> {
             lock(&self.calls).push(call.clone());
             if self.fail == Some(call.as_str()) {
@@ -1021,9 +1371,12 @@ mod tests {
 
     impl TunnelHost for Recorder {
         fn configs(&self) -> std::io::Result<Vec<String>> {
-            Ok(lock(&self.running).clone())
+            Ok(self.configs.clone().unwrap_or_else(|| lock(&self.running).clone()))
         }
         fn running(&self) -> std::io::Result<Vec<String>> {
+            if self.unreadable {
+                return Err(std::io::Error::other("pipes unreadable"));
+            }
             Ok(lock(&self.running).clone())
         }
         fn query(&self, tunnel: &str) -> std::io::Result<crate::uapi::Status> {
@@ -1038,6 +1391,9 @@ mod tests {
             self.step(format!("down {tunnel}"))?;
             lock(&self.running).retain(|n| n != tunnel);
             Ok(())
+        }
+        fn native_services(&self) -> bool {
+            self.native
         }
     }
 
@@ -1073,5 +1429,299 @@ mod tests {
         assert_eq!(to_replace("new", Plan::Connect, false, &running, fp), vec!["opt", "lan"], "один туннель — отключаются все остальные");
         assert!(to_replace("new", Plan::Disconnect, false, &running, fp).is_empty());
         assert!(to_replace("x", Plan::Connect, true, &running, |_| None).is_empty(), "неизвестный конфиг — не трогаем");
+    }
+
+    // Изоляция ядра от агента (автоматический аналог ручной проверки 13.3/13.4 плана core-split): настоящее ядро
+    // (`serve_until_stopped`) на тестовом канале и хосте в памяти, настоящий процесс агента — этот же тестовый файл,
+    // запущенный сторожем в объекте задания. Живые служба, каналы и файлы не трогаются. Потоки ядра под тестом живут
+    // до конца процесса тестов (у ядра нет остановки потоков — его останавливает выход службы); поддельные агенты
+    // гибнут вместе с ним по `KILL_ON_JOB_CLOSE`.
+
+    /// Аргумент, с которым процесс тестов становится поддельным агентом: `<метка><serve|hang>,<пауза мс>,<канал>`.
+    /// Пауза перед созданием канала — медленный запуск процесса (`isolation_slow_agent_start_*`).
+    const FAKE_AGENT: &str = "awg-fake-agent=";
+
+    /// Сколько тест ждёт запуска процесса агента (первого `Hello`, замены после перезапуска). С запасом: первый запуск
+    /// только что собранного exe проверяет антивирус, и процесс может стартовать секунды (первый прогон после
+    /// пересборки падал на прежних сроках, следующие проходили). Проверки ядра от этого срока не зависят и остаются
+    /// строгими: Switch — быстрее секунды, надзор — по своему расписанию.
+    const START_BUDGET: Duration = Duration::from_secs(30);
+
+    /// Точка входа поддельного агента: без аргумента `FAKE_AGENT` (обычный прогон с `--ignored`) не делает ничего.
+    #[test]
+    #[ignore = "точка входа процесса поддельного агента, его запускает сторож в тестах изоляции ядра"]
+    fn fake_agent_process() {
+        let Some(arg) = std::env::args().find_map(|a| a.strip_prefix(FAKE_AGENT).map(str::to_string)) else { return };
+        let mut parts = arg.splitn(3, ',');
+        let (Some(behaviour), Some(delay), Some(pipe)) = (parts.next(), parts.next(), parts.next()) else {
+            panic!("fake agent: bad argument {arg:?}");
+        };
+        let delay = delay.parse().unwrap_or_else(|e| panic!("fake agent: bad start delay {delay:?}: {e}"));
+        std::thread::sleep(Duration::from_millis(delay));
+        serve_fake_agent(behaviour == "hang", pipe);
+    }
+
+    /// Отвечает на `Hello` на канале `pipe`. `hang` — ответив раз, перестаёт отвечать: держит соединение и молчит,
+    /// как зависший агент.
+    fn serve_fake_agent(hang: bool, pipe: &str) -> ! {
+        use super::super::agent::proto::{AgentRequest, AgentResponse};
+        let me = crate::win::current_user_sid().unwrap_or_else(|e| panic!("fake agent SID: {e}"));
+        let (mut server, _) = Server::new(pipe, &me);
+        let mut answered = 0u32;
+        loop {
+            let mut conn = match server.accept() {
+                Ok(conn) => conn,
+                Err(e) => {
+                    eprintln!("fake agent: accept: {}", e.text);
+                    std::thread::sleep(Duration::from_millis(100));
+                    continue;
+                }
+            };
+            let request = conn.read_as::<AgentRequest>();
+            if hang && answered > 0 {
+                loop {
+                    std::thread::sleep(Duration::from_secs(3600));
+                }
+            }
+            let response = match request {
+                Ok(AgentRequest::Hello) => AgentResponse::Hello { version: env!("CARGO_PKG_VERSION").into() },
+                Ok(_) => AgentResponse::Refused("fake agent: Hello only".into()),
+                Err(e) => AgentResponse::Refused(e),
+            };
+            if let Err(e) = conn.reply_with(&response) {
+                eprintln!("fake agent: reply: {e}");
+            }
+            answered += 1;
+        }
+    }
+
+    /// Хост в памяти для ядра под тестом: подключение идемпотентно и записывается со временем.
+    #[derive(Default)]
+    struct TimedHost {
+        running: Mutex<Vec<String>>,
+        connects: Mutex<Vec<(String, Instant)>>,
+    }
+
+    impl TimedHost {
+        /// Туннель упал сам: служба ушла без команды ядра.
+        fn crash(&self, tunnel: &str) {
+            lock(&self.running).retain(|n| n != tunnel);
+        }
+
+        fn connected_after(&self, tunnel: &str, after: Instant) -> Option<Instant> {
+            lock(&self.connects).iter().find(|(t, at)| t == tunnel && *at >= after).map(|(_, at)| *at)
+        }
+    }
+
+    impl TunnelHost for TimedHost {
+        fn configs(&self) -> std::io::Result<Vec<String>> {
+            Ok(lock(&self.running).clone())
+        }
+        fn running(&self) -> std::io::Result<Vec<String>> {
+            Ok(lock(&self.running).clone())
+        }
+        fn query(&self, tunnel: &str) -> std::io::Result<crate::uapi::Status> {
+            Err(std::io::Error::other(tunnel.to_string()))
+        }
+        fn connect(&self, tunnel: &str) -> Result<(), String> {
+            lock(&self.connects).push((tunnel.to_string(), Instant::now()));
+            let mut running = lock(&self.running);
+            if !running.iter().any(|t| t == tunnel) {
+                running.push(tunnel.to_string());
+            }
+            Ok(())
+        }
+        fn disconnect(&self, tunnel: &str) -> Result<(), String> {
+            lock(&self.running).retain(|n| n != tunnel);
+            Ok(())
+        }
+    }
+
+    /// Ядро под тестом. `Drop` останавливает его цикл.
+    struct Rig {
+        core: Arc<Core>,
+        host: Arc<TimedHost>,
+        pipe: String,
+        agent_pipe: String,
+        stop: Arc<AtomicBool>,
+    }
+
+    impl Drop for Rig {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::SeqCst);
+        }
+    }
+
+    /// Сторож здорового агента. Пока агент не ответил, у него `start_grace` на запуск (30 с — как `START_BUDGET`): без
+    /// канала `Hello` не ждёт срока, а сразу промах, и медленный первый запуск exe принимался за зависание. Замолчавший
+    /// после ответа канал считается зависшим через 12 с.
+    const PROBE_SERVE: agent_watch::Probe = agent_watch::Probe { every: Duration::from_secs(3), timeout: Duration::from_secs(1), start_grace: Duration::from_secs(30) };
+    /// Сторож зависающего агента: зависший снимается за ~2 с, а не за 30 с живых сроков. На запуск у агента здесь 10 с;
+    /// зависание отсчитывается от первого ответа — агент `hang` отвечает раз и замолкает.
+    const PROBE_HANG: agent_watch::Probe = agent_watch::Probe { every: Duration::from_millis(300), timeout: Duration::from_millis(300), start_grace: Duration::from_secs(10) };
+
+    /// Поднять ядро на своих канале и хосте: желаемый туннель `a` работает, агент — процесс тестов в роли `behaviour`.
+    fn start_core(behaviour: &str, probe: agent_watch::Probe) -> Rig {
+        start_core_delayed(behaviour, Duration::ZERO, probe)
+    }
+
+    /// То же; агент создаёт свой канал через `start_delay` после запуска процесса.
+    fn start_core_delayed(behaviour: &str, start_delay: Duration, probe: agent_watch::Probe) -> Rig {
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+        let tag = format!("{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::SeqCst));
+        let pipe = format!(r"\\.\pipe\awg-ui-test-core-{tag}");
+        let agent_pipe = format!(r"\\.\pipe\awg-ui-test-agent-{tag}");
+        assert!(pipe != super::super::pipe::NAME && agent_pipe != super::super::agent::PIPE_NAME);
+        let host = Arc::new(TimedHost::default());
+        lock(&host.running).push("a".into());
+        let core = core_saving_to(host.clone(), &["a"], None);
+        {
+            let mut config = lock(&core.config);
+            // Режим 1: сведения о туннелях — из памяти ядра, а не из хранилища режима 2 на диске.
+            config.mode = Mode::Overlay;
+            config.owner_sid = crate::win::current_user_sid().unwrap();
+        }
+        let tests = module_path!().split_once("::").map_or(module_path!(), |(_, path)| path);
+        let args = format!("--ignored --exact {tests}::fake_agent_process {FAKE_AGENT}{behaviour},{},{agent_pipe}", start_delay.as_millis());
+        let ends = Endpoints { pipe: pipe.clone(), agent: agent_watch::AgentSpec { args, pipe: agent_pipe.clone(), probe } };
+        let stop = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (serving, stopping, ready) = (core.clone(), stop.clone(), tx.clone());
+        std::thread::spawn(move || {
+            let result = serve_until_stopped(&serving, &stopping, || ready.send(Ok(())).unwrap_or(()), ends);
+            tx.send(result.map_err(|e| e.text().to_string())).unwrap_or(());
+        });
+        let ready_within = READY_TIMEOUT + Duration::from_secs(5);
+        let started = rx.recv_timeout(ready_within).unwrap_or_else(|e| panic!("core under test did not start within {ready_within:?}: {e}"));
+        started.unwrap_or_else(|e| panic!("core under test failed: {e}"));
+        Rig { core, host, pipe, agent_pipe, stop }
+    }
+
+    fn agent_pid(core: &Core) -> Option<u32> {
+        match core.agent.get() {
+            Some(AgentStatus::Up { pid }) => Some(pid),
+            _ => None,
+        }
+    }
+
+    fn agent_answers(pipe: &str) -> bool {
+        use super::super::agent::proto::{AgentRequest, AgentResponse};
+        let timeouts = super::super::pipe::Timeouts { send: Duration::from_secs(1), reply: Duration::from_secs(1) };
+        matches!(super::super::pipe::call_with::<_, AgentResponse>(pipe, &AgentRequest::Hello, timeouts), Ok(AgentResponse::Hello { .. }))
+    }
+
+    fn journal(core: &Core) -> Vec<String> {
+        core.shared.with_events(|log| log.since(0)).into_iter().map(|(_, e)| e.text).collect()
+    }
+
+    /// Ждать, пока `ready` вернёт значение.
+    fn wait_for<T>(within: Duration, what: &str, mut ready: impl FnMut() -> Option<T>) -> T {
+        let deadline = Instant::now() + within;
+        loop {
+            if let Some(value) = ready() {
+                return value;
+            }
+            assert!(Instant::now() < deadline, "{what}: deadline {within:?} missed");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    /// Переключать туннель `b` через канал ядра (подключить, отключить, …), пока `done` не вернёт значение. Каждый
+    /// ответ ядра — быстрее секунды: что бы ни делал агент, команды окна ядро не задерживает.
+    fn switching_until<T>(rig: &Rig, within: Duration, what: &str, mut done: impl FnMut() -> Option<T>) -> T {
+        let deadline = Instant::now() + within;
+        let mut answers = 0u32;
+        loop {
+            let plan = if answers % 2 == 0 { Plan::Connect } else { Plan::Disconnect };
+            let asked = Instant::now();
+            let result = PipeAt(&rig.pipe).ok(Request::Switch { tunnel: "b".into(), plan, multiple: true });
+            let took = asked.elapsed();
+            assert!(result.is_ok(), "{what}: Switch {plan:?}: {result:?}");
+            assert!(took < Duration::from_secs(1), "{what}: Switch {plan:?} answered in {took:?}");
+            answers += 1;
+            if let Some(value) = done() {
+                return value;
+            }
+            assert!(Instant::now() < deadline, "{what}: deadline {within:?} missed ({answers} Switch answers)");
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+
+    fn terminate(pid: u32, code: u32) {
+        use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+        use windows_sys::Win32::System::Threading::{OpenProcess, TerminateProcess, PROCESS_TERMINATE};
+        let raw = unsafe { OpenProcess(PROCESS_TERMINATE, 0, pid) };
+        assert!(!raw.is_null(), "OpenProcess {pid}: {}", std::io::Error::last_os_error());
+        let process = unsafe { OwnedHandle::from_raw_handle(raw) };
+        assert!(unsafe { TerminateProcess(process.as_raw_handle(), code) } != 0, "TerminateProcess {pid}: {}", std::io::Error::last_os_error());
+    }
+
+    /// Процесса больше нет (или он выходит в ближайшие 2 с).
+    fn exited(pid: u32) -> bool {
+        use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+        use windows_sys::Win32::Foundation::WAIT_OBJECT_0;
+        use windows_sys::Win32::System::Threading::{OpenProcess, WaitForSingleObject, PROCESS_SYNCHRONIZE};
+        let raw = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, 0, pid) };
+        if raw.is_null() {
+            return true;
+        }
+        let process = unsafe { OwnedHandle::from_raw_handle(raw) };
+        unsafe { WaitForSingleObject(process.as_raw_handle(), 2000) == WAIT_OBJECT_0 }
+    }
+
+    /// Агента убили (`TerminateProcess`), а желаемый туннель в тот же миг упал сам: ядро отвечает на Switch быстрее
+    /// секунды всё время, надзор поднимает туннель по своему расписанию, сторож запускает нового агента после первой
+    /// паузы перезапуска и пишет причину в журнал.
+    #[test]
+    fn isolation_killed_agent_is_respawned_and_the_core_keeps_working() {
+        let rig = start_core("serve", PROBE_SERVE);
+        let first = wait_for(START_BUDGET, "agent up and answering (start budget)", || agent_pid(&rig.core).filter(|_| agent_answers(&rig.agent_pipe)));
+        switching_until(&rig, Duration::from_secs(5), "before the kill", || Some(()));
+
+        let killed_at = Instant::now();
+        terminate(first, 77);
+        rig.host.crash("a");
+        // Новый pid виден, когда вернулся `CreateProcess` — после паузы сторожа и запуска процесса (срок запуска).
+        let respawn_within = agent_watch::RESTART_FIRST + START_BUDGET;
+        let second = switching_until(&rig, respawn_within, "agent respawned (restart pause + start budget)", || agent_pid(&rig.core).filter(|pid| *pid != first));
+        let respawned_in = killed_at.elapsed();
+        assert!(respawned_in >= agent_watch::RESTART_FIRST, "agent {second} respawned in {respawned_in:?}, before the restart pause");
+        assert!(exited(first), "the killed agent {first} is gone");
+        wait_for(START_BUDGET, "respawned agent answers (start budget)", || agent_answers(&rig.agent_pipe).then_some(()));
+
+        let schedule = retry::FAST_EVERY + Duration::from_secs(3);
+        let reconnected = switching_until(&rig, schedule + Duration::from_secs(2), "dropped tunnel reconnected", || rig.host.connected_after("a", killed_at));
+        assert!(reconnected - killed_at <= schedule, "reconnected {:?} after the drop", reconnected - killed_at);
+        let exit = agent_watch::describe_with(&AgentExit::Code(77), PROBE_SERVE);
+        assert!(journal(&rig.core).iter().any(|t| t.contains(&exit)), "journal names the exit ({exit}): {:?}", journal(&rig.core));
+    }
+
+    /// Агент перестал отвечать на `Hello`: сторож завершает его и запускает нового; ядро отвечает на Switch быстрее
+    /// секунды всё это время, работающий туннель не трогается.
+    #[test]
+    fn isolation_hung_agent_is_killed_and_respawned_without_slowing_the_core() {
+        let rig = start_core("hang", PROBE_HANG);
+        let started = Instant::now();
+        let first = wait_for(START_BUDGET, "agent up (start budget)", || agent_pid(&rig.core));
+        let second = switching_until(&rig, START_BUDGET, "hung agent replaced (start budget)", || agent_pid(&rig.core).filter(|pid| *pid != first));
+        assert!(exited(first), "the hung agent {first} is terminated, not left behind (new {second})");
+        let hung = agent_watch::describe_with(&AgentExit::Hung, PROBE_HANG);
+        assert!(journal(&rig.core).iter().any(|t| t.contains(&hung)), "journal names the hang ({hung}): {:?}", journal(&rig.core));
+        assert!(lock(&rig.host.running).iter().any(|t| t == "a"), "the working tunnel stays up");
+        assert!(rig.host.connected_after("a", started).is_none(), "the working tunnel is not reconnected");
+    }
+
+    /// Проверка самой обвязки: агент создаёт канал через 4 с после запуска (медленный первый запуск exe под
+    /// антивирусом). Тест его дожидается, сторож не принимает его за зависший — отвечает тот же процесс, о зависании
+    /// в журнале ничего, ядро всё это время отвечает на Switch быстрее секунды. При прежнем сроке сторожа (на запуск
+    /// 3 с) агент снимался бы как зависший.
+    #[test]
+    fn isolation_slow_agent_start_is_waited_for_not_taken_for_a_hang() {
+        let rig = start_core_delayed("serve", Duration::from_secs(4), PROBE_SERVE);
+        let first = wait_for(START_BUDGET, "agent up (start budget)", || agent_pid(&rig.core));
+        switching_until(&rig, START_BUDGET, "slow agent answers (start budget)", || agent_answers(&rig.agent_pipe).then_some(()));
+        assert_eq!(agent_pid(&rig.core), Some(first), "the slow agent was replaced; journal: {:?}", journal(&rig.core));
+        let hung = agent_watch::describe_with(&AgentExit::Hung, PROBE_SERVE);
+        assert!(!journal(&rig.core).iter().any(|t| t.contains(&hung)), "slow start taken for a hang: {:?}", journal(&rig.core));
     }
 }

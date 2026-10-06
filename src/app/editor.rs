@@ -4,19 +4,31 @@ use std::path::PathBuf;
 
 use eframe::egui;
 
+use crate::conf::{self, Issue};
 use crate::i18n::{tr, trf};
 use crate::settings::Mode;
 use crate::win;
 
-use super::dialog::{dialog_choice, dialog_window, window_escape};
-use super::modals::{Modal, Outcome, Turn};
-use super::theme::{GREEN, RED, YELLOW};
+use super::dialog::{dialog_buttons, dialog_choice, dialog_window, window_escape};
+use super::modals::{Modal, Modals, Outcome, Turn};
+use super::theme::{GREEN, RED};
 use super::watcher::Infos;
 use super::App;
 use crate::daemon::CoreApi;
 
 /// Окно редактора: `id` и для позиции, и для Esc верхнему окну.
 const EDITOR_ID: &str = "conf-editor";
+
+/// Сколько замечаний видно под редактором без прокрутки.
+const ISSUES_VISIBLE: usize = 5;
+
+/// Что сделать после записи конфига с ошибками, когда пользователь её подтвердил.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum AfterSave {
+    Stay,
+    Import,
+    Close,
+}
 
 /// Открытый в редакторе файл .conf пользователя.
 pub(super) struct Editor {
@@ -28,11 +40,15 @@ pub(super) struct Editor {
     pub(super) note: Option<(String, bool)>,
     /// Туннель хранилища встроенного движка: сохранение идёт в хранилище, а не в `path`.
     pub(super) tunnel: Option<String>,
+    /// Замечания `conf::check` к `text`: пересчитываются при каждой правке.
+    issues: Vec<Issue>,
+    /// Запись с ошибками подтверждена в диалоге: выполнить её в следующем кадре редактора, затем это действие.
+    confirmed: Option<AfterSave>,
 }
 
 impl Editor {
     pub(super) fn new(path: PathBuf, text: String, tunnel: Option<String>) -> Self {
-        Editor { path, saved: text.clone(), text, note: None, tunnel }
+        Editor { path, saved: text.clone(), issues: conf::check(&text), text, note: None, tunnel, confirmed: None }
     }
 
     fn dirty(&self) -> bool {
@@ -41,6 +57,21 @@ impl Editor {
 
     fn file_name(&self) -> String {
         self.path.file_name().map(|f| f.to_string_lossy().into_owned()).unwrap_or_default()
+    }
+
+    /// Текст изменён в поле редактора.
+    fn edited(&mut self) {
+        self.issues = conf::check(&self.text);
+    }
+
+    /// Можно ли записать без вопроса: в конфиге нет ошибок. Иначе открывается вопрос «Сохранить с ошибками?»
+    /// и запись ждёт ответа — молча не отказываем и молча не пишем.
+    fn may_save(&self, modals: &mut Modals, after: AfterSave) -> bool {
+        if self.issues.is_empty() {
+            return true;
+        }
+        modals.open(Modal::EditorInvalid(after));
+        false
     }
 
     /// Записать текст туда, откуда он: в хранилище ядра или в файл. Итог — в строке под кнопками; `true` — записан.
@@ -69,6 +100,16 @@ impl Editor {
     }
 }
 
+/// Замечание для показа: «Строка N: …»; замечание ко всему конфигу — без номера.
+fn issue_text(issue: &Issue) -> String {
+    let text = trf(issue.key, &[&issue.arg]);
+    if issue.line == 0 {
+        text
+    } else {
+        trf("chk.at_line", &[&issue.line.to_string(), &text])
+    }
+}
+
 impl App {
     /// Редактор исходного .conf пользователя: сохранить, сохранить как, импортировать в родной клиент.
     pub(super) fn show_editor(&mut self, ctx: &egui::Context) {
@@ -94,16 +135,28 @@ impl App {
                         close = ui.button(tr("btn.close")).on_hover_text("Esc").clicked();
                     });
                 });
-                if !ed.text.contains("[Interface]") {
-                    ui.colored_label(YELLOW, tr("ed.no_interface"));
-                }
                 if let Some((note, is_error)) = &ed.note {
                     ui.colored_label(if *is_error { RED } else { GREEN }, note);
                 }
                 ui.separator();
-                egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-                    ui.add(egui::TextEdit::multiline(&mut ed.text).code_editor().desired_width(f32::INFINITY).desired_rows(24));
+                // Место под замечаниями оставляется заранее: поле редактора иначе заняло бы всю высоту.
+                let row = ui.text_style_height(&egui::TextStyle::Body) + ui.spacing().item_spacing.y;
+                let issues_height = if ed.issues.is_empty() { 0.0 } else { row * ed.issues.len().min(ISSUES_VISIBLE) as f32 + 12.0 };
+                let editor_height = (ui.available_height() - issues_height).max(row * 4.0);
+                egui::ScrollArea::vertical().max_height(editor_height).auto_shrink([false, false]).show(ui, |ui| {
+                    let edit = egui::TextEdit::multiline(&mut ed.text).code_editor().desired_width(f32::INFINITY).desired_rows(24);
+                    if ui.add(edit).changed() {
+                        ed.edited();
+                    }
                 });
+                if !ed.issues.is_empty() {
+                    ui.separator();
+                    egui::ScrollArea::vertical().id_salt("conf-issues").max_height(row * ISSUES_VISIBLE as f32).show(ui, |ui| {
+                        for issue in &ed.issues {
+                            ui.colored_label(RED, issue_text(issue));
+                        }
+                    });
+                }
             });
         // Ctrl+S — сохранить, Esc — закрыть, если редактор верхнее окно (Enter в редакторе — перевод строки, не действие окна).
         let ctrl_s = ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::S));
@@ -125,9 +178,21 @@ impl App {
                 (None, _) => save = false,
             }
         }
-        // Импорт берёт файл с диска — несохранённое сначала сохраняем.
-        if (save || (import && dirty)) && !ed.save(core.as_ref(), &infos) {
-            import = false;
+        // Запись с ошибками подтверждена в прошлом кадре: записать и сделать то, ради чего записывали.
+        let confirmed = ed.confirmed.take();
+        if let Some(after) = confirmed {
+            save = true;
+            import |= after == AfterSave::Import;
+            close |= after == AfterSave::Close;
+        }
+        // Импорт берёт файл с диска — несохранённое сначала сохраняем. Конфиг с ошибками — только после вопроса.
+        if save || (import && dirty) {
+            let after = if import { AfterSave::Import } else { AfterSave::Stay };
+            let allowed = confirmed.is_some() || ed.may_save(&mut self.modals, after);
+            if !allowed || !ed.save(core.as_ref(), &infos) {
+                import = false;
+                close = false;
+            }
         }
         if import && engine {
             ed.note = Some(import_into_store(core.as_ref(), &ed.path));
@@ -170,15 +235,44 @@ impl App {
         let (enter, escape) = turn.keys(ctx);
         if save || enter {
             // Не записалось — редактор остаётся открытым с ошибкой под кнопками, текст не теряется.
+            // Конфиг с ошибками — сначала вопрос «Сохранить с ошибками?»; закрытие — после подтверждённой записи.
             let (core, infos) = (self.core.clone(), self.sources.infos_handle());
-            if self.editor.as_mut().is_some_and(|ed| ed.save(core.as_ref(), &infos)) {
-                self.editor = None;
+            if let Some(ed) = self.editor.as_mut() {
+                if ed.may_save(&mut self.modals, AfterSave::Close) && ed.save(core.as_ref(), &infos) {
+                    self.editor = None;
+                }
             }
             Outcome::Close
         } else if discard {
             self.editor = None;
             Outcome::Close
         } else if cancel || escape || !open {
+            Outcome::Close
+        } else {
+            Outcome::Keep
+        }
+    }
+
+    /// Запись конфига с ошибками: движок его не примет. Записать всё равно (и затем `after`) или вернуться к правке.
+    pub(super) fn show_editor_invalid(&mut self, ctx: &egui::Context, after: AfterSave, turn: Turn) -> Outcome {
+        let Some(ed) = self.editor.as_mut() else { return Outcome::Close };
+        // Ошибки исправили, пока висел вопрос, — спрашивать не о чем; Ctrl+S сохранит без вопроса.
+        let Some(first) = ed.issues.first().map(issue_text) else { return Outcome::Close };
+        let (mut yes, mut no) = (false, false);
+        let mut open = true;
+        dialog_window(ctx, tr("chk.title"), "editor-invalid", &mut open).show(ctx, |ui| {
+            ui.set_width(480.0);
+            ui.add(egui::Label::new(trf("chk.confirm", &[&ed.issues.len().to_string(), &first])).wrap());
+            ui.add_space(10.0);
+            (yes, no) = dialog_buttons(ui, &tr("chk.save_anyway"), true, Some(&tr("btn.cancel")));
+        });
+        let (enter, escape) = turn.keys(ctx);
+        if yes || enter {
+            // Запись — в кадре редактора: там же импорт и закрытие после неё.
+            ed.confirmed = Some(after);
+            ctx.request_repaint();
+            Outcome::Close
+        } else if no || escape || !open {
             Outcome::Close
         } else {
             Outcome::Keep
@@ -192,6 +286,7 @@ fn import_into_store(core: &dyn CoreApi, path: &std::path::Path) -> (String, boo
     match report {
         Ok(r) if !r.added.is_empty() => (trf("eng.imported", &[&r.added.len().to_string()]), false),
         Ok(r) if !r.existing.is_empty() => (trf("eng.import_existing", &[&r.existing.join(", ")]), true),
+        Ok(r) if !r.scripts.is_empty() => (trf("eng.import_scripts", &[&r.scripts.join(", ")]), true),
         Ok(r) => (trf("eng.import_bad_name", &[&r.bad_name.join(", ")]), true),
         Err(e) => (e, true),
     }
@@ -281,5 +376,32 @@ mod tests {
         let core = FakeCore::unreachable("core unavailable");
         assert_eq!(import_into_store(&core, &path), ("core unavailable".to_string(), true));
         std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn invalid_config_asks_before_saving_and_valid_one_does_not() {
+        let mut modals = Modals::default();
+        let bad = Editor::new(PathBuf::from("office.conf"), "[Interface]\nMTU = 10\n".into(), None);
+        assert!(!bad.issues.is_empty());
+        assert!(!bad.may_save(&mut modals, AfterSave::Import));
+        assert!(modals.is_open(|m| matches!(m, Modal::EditorInvalid(AfterSave::Import))));
+
+        let mut modals = Modals::default();
+        let text = "[Interface]\nPrivateKey = yAnz5TF+lXXJte14tji3zlMNq+hd2rYUIgJBgB3fBmk=\n";
+        let mut good = Editor::new(PathBuf::from("office.conf"), text.into(), None);
+        assert!(good.may_save(&mut modals, AfterSave::Stay));
+        assert!(!modals.any_open());
+        // Правка пересчитывает замечания.
+        good.text.push_str("Bogus = 1\n");
+        good.edited();
+        assert_eq!(good.issues.iter().map(|i| (i.line, i.key)).collect::<Vec<_>>(), vec![(3, "chk.unknown_interface")]);
+    }
+
+    #[test]
+    fn issue_text_has_the_line_number() {
+        let at = Issue { line: 7, key: "chk.mtu", arg: "10".into() };
+        assert_eq!(issue_text(&at), trf("chk.at_line", &["7", &trf("chk.mtu", &["10"])]));
+        let whole = Issue { line: 0, key: "chk.no_private_key", arg: String::new() };
+        assert_eq!(issue_text(&whole), tr("chk.no_private_key"));
     }
 }

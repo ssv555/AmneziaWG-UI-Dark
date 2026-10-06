@@ -1,13 +1,15 @@
 [package]
 name = "awg-ui"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2021"
 description = "Окно управления туннелями AmneziaWG поверх штатного amneziawg.exe"
 
 [dependencies]
-eframe = { version = "0.31", default-features = false, features = ["wgpu", "default_fonts"] }
-# Версия — та же, что у egui-wgpu; без этого в сборку на Windows попадает только GL.
-wgpu = { version = "24", default-features = false, features = ["dx12"] }
+# "links": с eframe 0.36 ссылки (окно «О программе», заметки к выпуску) открываются в браузере только с этой фичей.
+eframe = { version = "0.36", default-features = false, features = ["wgpu_no_default_features", "default_fonts", "links"] }
+# Версия — та же, что у egui-wgpu. Бэкенд wgpu выбираем сами — только DX12: фича eframe "wgpu" с 0.34 включает
+# все бэкенды wgpu по умолчанию (Vulkan, GL, Metal), поэтому у eframe фича без них, а DX12 включает эта строка.
+wgpu = { version = "30", default-features = false, features = ["dx12"] }
 raw-window-handle = "0.6"
 x25519-dalek = { version = "2", features = ["static_secrets"] }
 png = "0.17"
@@ -15,13 +17,13 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "std"
 # Импорт туннелей из zip и резервная копия с паролем (AES-256).
 zip = { version = "8.6", default-features = false, features = ["aes-crypto", "deflate"] }
 # Проверка файлов движка перед копированием для службы SYSTEM.
-sha2 = "0.10"
+sha2 = "0.11"
 # Обмен окна с ядром (служба) по именованному каналу.
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # Подпись манифеста наших релизов (обновление программы и движка): проверка Ed25519.
-ed25519-dalek = "2"
-windows-sys = { version = "0.59", features = [
+ed25519-dalek = "3"
+windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_Graphics_Dwm",
     "Win32_Graphics_Gdi",
@@ -38,22 +40,26 @@ windows-sys = { version = "0.59", features = [
     "Win32_System_Diagnostics_ToolHelp",
     "Win32_System_Environment",
     "Win32_System_IO",
+    "Win32_System_JobObjects",
     "Win32_System_LibraryLoader",
     "Win32_System_Pipes",
     "Win32_System_Registry",
     "Win32_System_RemoteDesktop",
     "Win32_System_Services",
+    "Win32_System_SystemInformation",
     "Win32_System_Threading",
     "Win32_UI_Controls_Dialogs",
+    "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_Shell",
     "Win32_UI_WindowsAndMessaging",
 ] }
-# UI Automation (COM) — управление родным окном AmneziaWG; та же версия, что уже тянет wgpu.
-windows = { version = "0.58", features = [
+# UI Automation (COM), панель задач, ярлыки. wgpu-hal 30 — на той же windows 0.62.
+windows = { version = "0.62", features = [
     "Win32_Foundation",
     "Win32_Storage_EnhancedStorage",
     "Win32_System_Com",
     "Win32_System_Com_StructuredStorage",
+    "Win32_System_Ole",
     "Win32_System_Variant",
     "Win32_UI_Accessibility",
     "Win32_UI_Input_KeyboardAndMouse",
@@ -69,4 +75,4 @@ strip = true
 
 [build-dependencies]
 winresource = "0.1"
-sha2 = "0.10"
+sha2 = "0.11"

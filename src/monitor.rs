@@ -1,19 +1,21 @@
 //! Фоновый опрос раз в секунду: список туннелей, состояние запущенных, история для графика,
-//! накопительная статистика, события, значок в трее. Работает и при скрытом окне.
+//! события, значок в трее. Работает и при скрытом окне.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::backend::TunnelHost;
 use crate::crash::lock;
+use crate::daemon::agent::client::AgentApi;
 use crate::daemon::proto::{CoreState, RetryState};
 use crate::events::{self, Event, EventLog, Severity};
 use crate::health::{self, Health, Level};
 use crate::i18n::{tr, trf};
 use crate::ping::PingState;
-use crate::stats::{self, Stats};
+use crate::stats::Stats;
 use crate::settings::Mode;
 use crate::tray;
 use crate::uapi::Status;
@@ -23,7 +25,6 @@ const PERIOD: Duration = Duration::from_secs(1);
 const RETRY_PERIOD: Duration = Duration::from_secs(3);
 /// Столько неудач подряд — связь с ядром потеряна (одиночный сбой — не повод менять всё окно).
 const LOST_AFTER: u32 = 2;
-const STATS_SAVE_EVERY: Duration = Duration::from_secs(15);
 /// Час истории при замере раз в секунду — максимум периода графика.
 pub const HISTORY_SECS: usize = 3600;
 
@@ -157,15 +158,42 @@ pub struct Shared {
     pending: Mutex<BTreeMap<String, &'static str>>,
     ping: Mutex<PingState>,
     options: Mutex<Options>,
-    events: Mutex<EventLog>,
+    /// Общий с потоком `events-writer`: он кладёт сюда сбои записи файла.
+    events: Arc<Mutex<EventLog>>,
+    /// Окно: статистика трафика из `State` агента (её ведёт агент, `daemon::agent::stats`); демо — выдуманная.
     stats: Mutex<Stats>,
-    stats_path: Option<PathBuf>,
     /// Состояние службы менеджера AmneziaWG — для строки состояния.
     service: Mutex<String>,
+    /// Окно: агент не ответил на последний опрос — пинга нет, на его месте «вторичная служба недоступна».
+    agent_down: AtomicBool,
     /// Окно: режим, о котором сообщило ядро.
     core_mode: Mutex<Option<Mode>>,
     /// Окно: до какого события дочитан журнал ядра.
     core_cursor: Mutex<events::Cursor>,
+    /// Окно: до какого события дочитан журнал агента (история файла и события самого агента).
+    agent_cursor: Mutex<events::Cursor>,
+    /// Окно: с какого момента оно видит ядро в нынешнем состоянии («Скопировать диагностику»).
+    core_seen: Mutex<Stamp>,
+    /// Окно: то же для агента.
+    agent_seen: Mutex<Stamp>,
+}
+
+/// Состояние связи («не отвечает» или нет) и с какого момента окно его видит. Окно не знает, когда процесс запущен на
+/// самом деле, — только когда оно само заметило перемену; для разбора жалоб этого достаточно, и это честно названо.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Stamp {
+    pub down: bool,
+    /// Unix-секунды; 0 — наблюдений ещё не было.
+    pub since: u64,
+}
+
+impl Stamp {
+    /// Очередное наблюдение: время сдвигается, только когда состояние сменилось (или это первое наблюдение).
+    pub fn observe(&mut self, down: bool, now: u64) {
+        if self.since == 0 || self.down != down {
+            *self = Stamp { down, since: now };
+        }
+    }
 }
 
 /// Всё, что окно рисует за кадр, снятое в одном порядке захвата. Снимок опроса удерживается, пока жив `FrameView`
@@ -176,6 +204,8 @@ pub struct FrameView<'a> {
     pub ping: PingState,
     pub stats: Stats,
     pub service: String,
+    /// Агент не ответил на последний опрос окна (`mirror_agent`).
+    pub agent_down: bool,
 }
 
 /// Пометка туннелей «заняты» на время команды; снимается в `Drop` — и при панике посреди переключения. Иначе
@@ -205,21 +235,32 @@ impl Drop for PendingGuard {
 }
 
 impl Shared {
-    pub fn new(host: Option<Arc<dyn TunnelHost>>, options: Options, stats_path: Option<PathBuf>, events_path: Option<PathBuf>) -> Shared {
-        let stats = stats_path.as_deref().map(stats::load).unwrap_or_default();
+    pub fn new(host: Option<Arc<dyn TunnelHost>>, options: Options, events_path: Option<PathBuf>) -> Shared {
+        let events = Arc::new(Mutex::new(EventLog::open(events_path)));
+        // Запись под блокировкой журнала не должна ждать диск: её ждали бы переключение туннелей и надзор. Ядро и окно
+        // файла не дают (его ведёт агент), тогда это ничего не делает.
+        EventLog::write_in_background(&events);
         Shared {
             host: RwLock::new(host),
             snapshot: Default::default(),
             pending: Default::default(),
             ping: Mutex::new(PingState { host: options.ping_host.clone(), ..Default::default() }),
             options: Mutex::new(options),
-            events: Mutex::new(EventLog::open(events_path)),
-            stats: Mutex::new(stats),
-            stats_path,
+            events,
+            stats: Default::default(),
             service: Default::default(),
+            agent_down: AtomicBool::new(false),
             core_mode: Default::default(),
             core_cursor: Default::default(),
+            agent_cursor: Default::default(),
+            core_seen: Default::default(),
+            agent_seen: Default::default(),
         }
+    }
+
+    /// Ядро и агент глазами окна: с каких пор в нынешнем состоянии.
+    pub fn link_stamps(&self) -> (Stamp, Stamp) {
+        (*lock(&self.core_seen), *lock(&self.agent_seen))
     }
 
     /// Окно с ядром — зеркало: своих туннелей нет, всё приходит от ядра.
@@ -236,14 +277,9 @@ impl Shared {
         *self.host.write().unwrap() = Some(host);
     }
 
-    pub fn save_stats(&self) {
-        if let Some(path) = &self.stats_path {
-            // Копия — чтобы не держать stats, пока берём snapshot (poll захватывает их в обратном порядке).
-            let stats = lock(&self.stats).clone();
-            if let Err(e) = stats::save(path, &stats) {
-                lock(&self.snapshot).error = Some(crate::fsutil::io_ctx(&path, e));
-            }
-        }
+    /// Паника шага вторичного потока (`crash::nonfatal_loop`): в журнал — с паузой до следующего шага.
+    pub fn report_secondary_panic(&self, panic: &str, wait: Duration) {
+        self.log("", Severity::Bad, &trf("core.secondary_failed", &[panic, &wait.as_secs().to_string()]));
     }
 
     pub fn log(&self, tunnel: &str, severity: Severity, text: &str) {
@@ -321,7 +357,8 @@ impl Shared {
         let ping = lock(&self.ping).clone();
         let stats = lock(&self.stats).clone();
         let service = lock(&self.service).clone();
-        FrameView { snap, pending, ping, stats, service }
+        let agent_down = self.agent_down.load(Ordering::SeqCst);
+        FrameView { snap, pending, ping, stats, service, agent_down }
     }
 
     /// Состояние для окна по каналу; окно-зеркало разбирает его в `mirror_core`.
@@ -343,7 +380,8 @@ impl Shared {
                 .map(|(n, l)| (n.clone(), l.status.clone().ok_or_else(|| l.error.clone().unwrap_or_default())))
                 .collect(),
             error: snap.error.clone(),
-            stats: lock(&self.stats).clone(),
+            // Статистику ведёт агент; пустая — для окна прежней версии, которое без поля ответа не разберёт.
+            stats: Stats::default(),
             ping,
             events,
             events_instance,
@@ -351,6 +389,8 @@ impl Shared {
             service: lock(&self.service).clone(),
             busy,
             retries: snap.retries.clone(),
+            // Агента знает сторож ядра, а не `Shared`: заполняет `server::Core::state`.
+            agent: None,
         }
     }
 
@@ -358,6 +398,11 @@ impl Shared {
 
     pub fn is_pending(&self, name: &str) -> bool {
         lock(&self.pending).contains_key(name)
+    }
+
+    /// Что сейчас делается с туннелем («подключение…»); `None` — не занят.
+    pub fn pending_label(&self, name: &str) -> Option<&'static str> {
+        lock(&self.pending).get(name).copied()
     }
 
     /// Пометить туннели занятыми; пометка снимается, когда охранник уничтожен (в том числе при панике).
@@ -394,12 +439,6 @@ impl Shared {
         std::mem::replace(&mut *lock(&self.options), new)
     }
 
-    pub fn set_ping_options(&self, enabled: bool, host: String) {
-        let mut o = lock(&self.options);
-        o.ping = enabled;
-        o.ping_host = host;
-    }
-
     // --- пинг
 
     pub fn update_ping<R>(&self, f: impl FnOnce(&mut PingState) -> R) -> R {
@@ -418,7 +457,7 @@ impl Shared {
         lock(&self.events).push(event);
     }
 
-    // Ð¢Ð¾Ð»ÑÐºÐ¾ Ð´Ð»Ñ Ð¿ÑÐ¾Ð²ÐµÑÐ¾Ðº: Ð¾ÐºÐ½Ð¾ Ð¸ ÑÐ´ÑÐ¾ ÑÐ¸ÑÐ°ÑÑ Ð¶ÑÑÐ½Ð°Ð» ÑÐµÐ»Ð¸ÐºÐ¾Ð¼ (`with_events`) Ð¸Ð»Ð¸ Ð¿Ð¾ÑÑÐ¸ÑÐ¼Ð¸ (`core_state`).
+    // Только для проверок: окно и ядро читают журнал целиком (`with_events`) или порциями (`core_state`).
     #[cfg(test)]
     pub fn events_since(&self, after: u64) -> Vec<(u64, Event)> {
         lock(&self.events).since(after)
@@ -451,12 +490,12 @@ impl Shared {
     }
 }
 
-/// Опрос раз в секунду. Окно с ядром — зеркало: состояние, статистика, пинг и события приходят от ядра,
-/// здесь только история для графика и трей. Ядро и демо-режим опрашивают сами и сами пишут события.
+/// Опрос раз в секунду. Окно с ядром — зеркало: состояние и события приходят от ядра (пинг и статистика — от агента,
+/// `spawn_agent`), здесь только история для графика и трей. Ядро и демо-режим опрашивают сами и сами пишут события.
+/// Статистики трафика у ядра нет: её ведёт агент по `State` ядра (`daemon::agent::stats`).
 pub fn spawn(shared: Arc<Shared>, on_update: Box<dyn Fn() + Send>) {
     crate::crash::spawn_named("monitor", move || {
         let mut watch = Watch::default();
-        let mut last_save = Instant::now();
         let mut link = CoreLink::default();
         loop {
             let host = shared.host();
@@ -464,16 +503,39 @@ pub fn spawn(shared: Arc<Shared>, on_update: Box<dyn Fn() + Send>) {
                 Some(host) => poll(&shared, host.as_ref()),
                 None => mirror_core(&shared, &mut link),
             }
+            let core_lost = lock(&shared.snapshot).core_lost;
+            lock(&shared.core_seen).observe(core_lost, unix_now());
             let (levels, user, supervised) = shared.levels();
             react(&shared, &mut watch, &levels, &user, &supervised, host.is_some());
-            if last_save.elapsed() >= STATS_SAVE_EVERY {
-                shared.save_stats();
-                last_save = Instant::now();
-            }
             on_update();
             std::thread::sleep(if link.lost { RETRY_PERIOD } else { PERIOD });
         }
     });
+}
+
+/// Окно: опрос агента раз в секунду, в своём потоке — зависший агент не задерживает состояние ядра.
+pub fn spawn_agent(shared: Arc<Shared>, agent: Arc<dyn AgentApi>, on_update: Box<dyn Fn() + Send>) {
+    crate::crash::spawn_named("agent-monitor", move || loop {
+        mirror_agent(&shared, agent.as_ref());
+        mirror_agent_events(&shared, agent.as_ref());
+        on_update();
+        std::thread::sleep(PERIOD);
+    });
+}
+
+/// Окно: забрать состояние у агента. Агент недоступен (перезапускается, ядро прежней версии без агента) — пинга и
+/// статистики нет (пустые, а не прежние: устаревшие числа выглядели бы живыми), на месте пинга окно показывает
+/// «вторичная служба недоступна». Ни «нет связи с ядром», ни записи в журнал: туннели
+/// от агента не зависят, а его остановки пишет в журнал сторож ядра.
+fn mirror_agent(shared: &Shared, agent: &dyn AgentApi) {
+    let (ping, stats, down) = match agent.state() {
+        Ok(state) => (crate::ping::PingState::from_dto(state.ping), state.stats, false),
+        Err(_) => (PingState { host: lock(&shared.options).ping_host.clone(), ..Default::default() }, Stats::default(), true),
+    };
+    *lock(&shared.ping) = ping;
+    *lock(&shared.stats) = stats;
+    shared.agent_down.store(down, Ordering::SeqCst);
+    lock(&shared.agent_seen).observe(down, unix_now());
 }
 
 /// Уровни туннелей между опросами → события журнала.
@@ -579,13 +641,11 @@ pub fn poll(shared: &Shared, backend: &dyn TunnelHost) {
 
     let now = Instant::now();
     let mut snap = lock(&shared.snapshot);
-    let mut stats = lock(&shared.stats);
     snap.error = [configs.as_ref().err(), running.as_ref().err()]
         .into_iter()
         .flatten()
         .map(|e| e.to_string())
         .reduce(|a, b| format!("{a}; {b}"));
-    let listed = configs.is_ok();
     if let Ok(configs) = configs {
         snap.tunnels = configs.into_iter().collect();
     }
@@ -595,8 +655,6 @@ pub fn poll(shared: &Shared, backend: &dyn TunnelHost) {
         let mut live = snap.running.remove(&name).unwrap_or_default();
         match result {
             Ok(st) => {
-                let dt = live.history.back().map(|s| now.duration_since(s.at).as_secs_f64());
-                stats.entry(name.clone()).or_default().observe(st.rx_bytes(), st.tx_bytes(), st.listen_port, dt, unix_now());
                 live.history.push_back(Sample { at: now, rx: st.rx_bytes(), tx: st.tx_bytes() });
                 while live.history.len() > HISTORY_SECS + 1 {
                     live.history.pop_front();
@@ -610,12 +668,6 @@ pub fn poll(shared: &Shared, backend: &dyn TunnelHost) {
     }
     snap.running = next;
     snap.polls += 1;
-    // Только по настоящему списку: при ошибке чтения списка туннелей все выглядели бы удалёнными.
-    let pruned = if listed { stats::prune(&mut stats, &snap.tunnels, unix_now()) } else { Vec::new() };
-    drop((snap, stats));
-    for name in pruned {
-        shared.log(&name, Severity::Info, &trf("stats.pruned", &[&name, &stats::KEEP_ABSENT_DAYS.to_string()]));
-    }
 }
 
 /// Окно: забрать состояние у ядра. История для графика копится здесь, по счётчикам из ответа.
@@ -668,20 +720,40 @@ fn mirror_core(shared: &Shared, link: &mut CoreLink) {
         snap.polls += 1;
     }
     report_link(shared, restored, "");
-    *lock(&shared.ping) = crate::ping::PingState::from_dto(state.ping);
-    *lock(&shared.stats) = state.stats;
     *lock(&shared.service) = state.service;
     *lock(&shared.core_mode) = state.mode;
     // Уведомления — только о новых событиях, не о тех, что пришли первой порцией при открытии окна;
     // а после перезапуска ядра курсор переставляется и новые события приходят со следующим опросом.
-    let batch = lock(&shared.core_cursor).accept(state.events_instance, state.events_loaded, state.events);
+    // Место в журнале ядра — при каждом событии: то же событие придёт и от агента, повтор не показывается.
+    let instance = state.events_instance;
+    let batch = lock(&shared.core_cursor).accept(instance, state.events_loaded, state.events);
+    let events = batch.events.into_iter().map(|(seq, e)| e.from_core(events::Origin { instance, seq }));
     let options = lock(&shared.options).clone();
-    record_and_notify(&shared.events, batch.events.into_iter().map(|(_, e)| e), !batch.quiet && options.notify && options.tray, &mut |e| toast(e));
+    record_and_notify(&shared.events, events, !batch.quiet && options.notify && options.tray, &mut |e| toast(e));
+}
+
+/// Окно: журнал агента. Первый ответ — история (файл журнала) в начало журнала окна, без уведомлений; дальше —
+/// новые события агента (обновления) и события ядра, которых окно ещё не видело. Агент недоступен или прежней
+/// версии (без `Events`) — журнал окна только от ядра; о недоступности агента окно уже говорит (`agent_down`).
+fn mirror_agent_events(shared: &Shared, agent: &dyn AgentApi) {
+    let after = lock(&shared.agent_cursor).after();
+    let Ok(answer) = agent.events(after) else { return };
+    let batch = lock(&shared.agent_cursor).accept(answer.instance, answer.loaded, answer.events);
+    let events: Vec<Event> = batch.events.into_iter().map(|(_, e)| e).collect();
+    if batch.quiet {
+        // Пустой «тихий» ответ — и перезапуск агента (курсор переставлен): историю окно уже показало.
+        if !events.is_empty() {
+            lock(&shared.events).merge_history(events, answer.core);
+        }
+        return;
+    }
+    let options = lock(&shared.options).clone();
+    record_and_notify(&shared.events, events, options.notify && options.tray, &mut |e| toast(e));
 }
 
 /// Показать событие уведомлением Windows.
 fn toast(e: &Event) {
-    tray::notify(crate::APP_TITLE, &format!("{} — {}", e.tunnel, e.text), e.severity != Severity::Info);
+    tray::notify_tunnel(&e.tunnel, crate::APP_TITLE, &format!("{} — {}", e.tunnel, e.text), e.severity != Severity::Info);
 }
 
 /// Записать события в журнал, а уведомить о них — уже после того, как блокировка журнала отпущена: `notify` идёт
@@ -692,10 +764,11 @@ fn record_and_notify(log: &Mutex<EventLog>, events: impl IntoIterator<Item = Eve
     {
         let mut log = lock(log);
         for e in events {
-            if enabled && e.notify {
-                to_show.push(e.clone());
+            let shown = enabled && e.notify;
+            // Событие ядра, уже пришедшее другим путём (от ядра или от агента), — без повтора и без второго уведомления.
+            if log.push_unique(e.clone()) && shown {
+                to_show.push(e);
             }
-            log.push(e);
         }
     }
     for e in &to_show {
@@ -736,6 +809,19 @@ pub fn unix_now() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stamp_moves_only_when_the_state_changes() {
+        let mut s = Stamp::default();
+        s.observe(false, 100);
+        s.observe(false, 200);
+        assert_eq!(s, Stamp { down: false, since: 100 }, "то же состояние — время прежнее");
+        s.observe(true, 300);
+        s.observe(true, 400);
+        assert_eq!(s, Stamp { down: true, since: 300 });
+        s.observe(false, 500);
+        assert_eq!(s, Stamp { down: false, since: 500 });
+    }
 
     fn event(text: &str, notify: bool) -> Event {
         Event::new(1, "a", Severity::Warn, text, notify)
@@ -827,6 +913,88 @@ mod tests {
         snap
     }
 
+    /// Агента нет (перезапуск, ядро прежней версии): пинг пуст, отмечено «агент недоступен», и только это — ни
+    /// «нет связи с ядром», ни записи в журнал, ни ошибки в строке состояния.
+    #[test]
+    fn absent_agent_shows_no_ping_and_no_error() {
+        use crate::daemon::agent::client::FakeAgent;
+        let shared = Shared::new(None, Options { ping: true, ping_host: "1.1.1.1".into(), notify: true, tray: true, taskbar: false }, None);
+        *lock(&shared.snapshot) = snapshot_with_running();
+        shared.update_ping(|p| p.fails = 5);
+        shared.update_stats(|s| {
+            s.insert("a".into(), Default::default());
+        });
+        mirror_agent(&shared, &FakeAgent::unreachable("pipe: not found"));
+        let view = shared.frame_view();
+        assert!(view.agent_down);
+        assert!(view.stats.is_empty(), "без агента статистика пустая, а не прежняя");
+        assert_eq!((view.ping.host.as_str(), view.ping.last.clone(), view.ping.fails, view.ping.history.len()), ("1.1.1.1", None, 0, 0));
+        assert!(!view.snap.core_lost && view.snap.error.is_none());
+        drop(view);
+        assert!(lock(&shared.events).items.is_empty(), "в журнал окна — ничего");
+        let without_ping = lock(&shared.snapshot).health("a", None, None).level;
+        assert_eq!(shared.levels().0["a"].level, without_ping, "прежние неудачи пинга не портят здоровье туннеля");
+    }
+
+    #[test]
+    fn agent_state_brings_the_ping_and_stats_and_clears_the_mark() {
+        use crate::daemon::agent::client::FakeAgent;
+        use crate::daemon::agent::proto::{AgentResponse, AgentState};
+        use crate::daemon::proto::PingDto;
+        let shared = Shared::new(None, Options { ping: true, ping_host: "1.1.1.1".into(), notify: false, tray: false, taskbar: false }, None);
+        mirror_agent(&shared, &FakeAgent::unreachable("pipe: not found"));
+        let ping = PingDto { host: "9.9.9.9".into(), last: Some(Ok(21)), fails: 0, history: vec![(1.0, Some(21))] };
+        let mut office = crate::stats::TunnelStats::default();
+        office.observe(4_096, 512, 1, None, 1);
+        let stats: Stats = [("office".to_string(), office)].into();
+        let agent = FakeAgent(Box::new(move |_| Ok(AgentResponse::State(Box::new(AgentState { ping: ping.clone(), stats: stats.clone() })))));
+        mirror_agent(&shared, &agent);
+        let view = shared.frame_view();
+        assert!(!view.agent_down);
+        assert_eq!((view.ping.host.as_str(), view.ping.last.clone(), view.ping.history.len()), ("9.9.9.9", Some(Ok(21)), 1));
+        assert_eq!((view.stats["office"].rx, view.stats["office"].tx), (4_096, 512), "статистика — из состояния агента");
+    }
+
+    /// Журнал окна из двух источников: история агента — в начало, события ядра, пришедшие и от ядра, и от агента, —
+    /// по одному разу; события самого агента (обновления) видны на ходу, без перезапуска ядра.
+    #[test]
+    fn window_journal_merges_agent_history_and_core_events_without_duplicates() {
+        use crate::daemon::agent::client::FakeAgent;
+        use crate::daemon::agent::proto::{AgentEvents, AgentResponse};
+        use events::Origin;
+        let shared = shared();
+        let at = |instance, seq| Origin { instance, seq };
+        let core_event = |seq: u64| Event::new(seq, "t", Severity::Info, &format!("core {seq}"), true);
+        // Ядро ответило раньше агента: всё его кольцо (номера 5..=7) — первой, тихой порцией.
+        let first = (5..=7).map(|n| core_event(n).from_core(at(9, n)));
+        record_and_notify(&shared.events, first, false, &mut |_| panic!("первая порция без уведомлений"));
+        // История агента: старое из файла (до перезапуска ядра) и события ядра 5..=6 — 6 прочитано из файла без
+        // метки (номера нет), но входит в «полно до 9/6».
+        let history = vec![
+            (1, Event::new(1, "t", Severity::Info, "old", false)),
+            (2, core_event(5).from_core(at(9, 5))),
+            (3, core_event(6)),
+        ];
+        let answers = Arc::new(Mutex::new(vec![
+            AgentEvents { instance: 4, loaded: 3, events: history, core: Some(at(9, 6)) },
+            // Дальше: своё событие агента и событие ядра 7, которое окно уже получило от ядра.
+            AgentEvents {
+                instance: 4,
+                loaded: 3,
+                events: vec![(4, Event::new(8, "", Severity::Warn, "update failed", false)), (5, core_event(7).from_core(at(9, 7)))],
+                core: Some(at(9, 7)),
+            },
+        ]));
+        let agent = FakeAgent(Box::new(move |_| Ok(AgentResponse::Events(Box::new(answers.lock().unwrap().remove(0))))));
+        mirror_agent_events(&shared, &agent);
+        mirror_agent_events(&shared, &agent);
+        // Ядро повторяет 6 (окно спросило с прежнего номера) и шлёт новое 8.
+        let late = [6, 8].map(|n| core_event(n).from_core(at(9, n)));
+        record_and_notify(&shared.events, late, false, &mut |_| {});
+        let texts: Vec<String> = shared.events_since(0).into_iter().map(|(_, e)| e.text).collect();
+        assert_eq!(texts, ["old", "core 5", "core 6", "core 7", "update failed", "core 8"]);
+    }
+
     #[test]
     fn lost_core_is_unknown_not_disconnected() {
         let mut snap = snapshot_with_running();
@@ -838,7 +1006,7 @@ mod tests {
 
     #[test]
     fn unreachable_core_marks_state_and_logs_one_quiet_event() {
-        let shared = Shared::new(None, Options { ping: false, ping_host: String::new(), notify: true, tray: true, taskbar: false }, None, None);
+        let shared = Shared::new(None, Options { ping: false, ping_host: String::new(), notify: true, tray: true, taskbar: false }, None);
         *lock(&shared.snapshot) = snapshot_with_running();
         let mut link = CoreLink::default();
         core_unreachable(&shared, &mut link, "pipe: gone");
@@ -856,9 +1024,36 @@ mod tests {
         assert_eq!(log.items[0].severity, Severity::Warn);
     }
 
+    /// Диск, который стоит, пока тест не отпустит (зависший диск, антивирус, занятый файл).
+    struct StalledDisk(Arc<Mutex<()>>);
+
+    impl events::Sink for StalledDisk {
+        fn write(&mut self, _: &Event) -> Vec<String> {
+            drop(lock(&self.0));
+            Vec::new()
+        }
+    }
+
+    #[test]
+    fn log_does_not_wait_for_a_stalled_disk() {
+        let shared = shared();
+        let disk = Arc::new(Mutex::new(()));
+        let stalled = lock(&disk);
+        EventLog::start_writer(&shared.events, Box::new(StalledDisk(disk.clone())), 8);
+        for i in 0..50 {
+            let started = Instant::now();
+            shared.log("a", Severity::Info, &format!("e{i}"));
+            assert!(started.elapsed() < Duration::from_millis(10), "запись {i} ждала диск: {:?}", started.elapsed());
+        }
+        assert_eq!(shared.events_since(0).len(), 50);
+        drop(stalled);
+        let feed = lock(&shared.events).feed().expect("журнал с потоком записи");
+        assert!(feed.flush(Duration::from_secs(10)), "диск отпущен — очередь дописана");
+    }
+
     fn shared() -> Arc<Shared> {
         let options = Options { ping: false, ping_host: String::new(), notify: false, tray: false, taskbar: false };
-        Arc::new(Shared::new(None, options, None, None))
+        Arc::new(Shared::new(None, options, None))
     }
 
     #[test]
@@ -970,5 +1165,44 @@ mod tests {
         assert_eq!(shared.core_state(Mode::Engine, 0).retries["c"], retry(true));
         shared.reset_snapshot();
         assert!(shared.retrying_names().is_empty(), "смена режима — переподключать нечего");
+    }
+
+    /// Один туннель; список конфигов читается или нет — по флагу.
+    struct OneTunnel {
+        listed: bool,
+    }
+
+    impl TunnelHost for OneTunnel {
+        fn configs(&self) -> std::io::Result<Vec<String>> {
+            if self.listed {
+                Ok(vec!["t".into()])
+            } else {
+                Err(std::io::Error::other("no list"))
+            }
+        }
+        fn running(&self) -> std::io::Result<Vec<String>> {
+            Ok(vec!["t".into()])
+        }
+        fn query(&self, _: &str) -> std::io::Result<Status> {
+            Ok(Status::default())
+        }
+        fn connect(&self, _: &str) -> Result<(), String> {
+            Ok(())
+        }
+        fn disconnect(&self, _: &str) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    /// Статистику ведёт агент: опрос ядра её не считает, а `State` ядра несёт пустую (поле — для окна прежней версии).
+    #[test]
+    fn core_poll_keeps_no_stats() {
+        let shared = shared();
+        poll(&shared, &OneTunnel { listed: true });
+        poll(&shared, &OneTunnel { listed: false });
+        let state = shared.core_state(Mode::Engine, 0);
+        assert!(state.running.contains_key("t") && state.error.is_some());
+        assert!(state.stats.is_empty());
+        assert!(shared.update_stats(|s| s.is_empty()));
     }
 }

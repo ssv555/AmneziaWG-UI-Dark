@@ -7,6 +7,8 @@ use std::time::{Duration, Instant};
 
 use eframe::egui::{self, RichText};
 
+use crate::daemon::agent::client::AgentApi;
+use crate::daemon::agent::proto::AgentRequest;
 use crate::daemon::CoreApi;
 use crate::events::Severity;
 use crate::groups;
@@ -143,6 +145,7 @@ impl App {
     fn run_delete_tunnel(&self, tunnel: String, copy: Option<PathBuf>) {
         let (core, shared, error, notice, deleted) =
             (self.core.clone(), self.shared.clone(), self.action_error.clone(), self.notice.clone(), self.deleted.clone());
+        let agent = self.agent.clone();
         let (running_key, done_key, copy_key) = match self.s.mode() {
             Mode::Engine => ("eng.deleting", "eng.deleted", "eng.deleted_copy"),
             Mode::Overlay => ("del.running", "del.done", "del.done_copy"),
@@ -154,6 +157,7 @@ impl App {
                 None => trf(done_key, &[&tunnel]),
             });
             if report_outcome(result, &tunnel, Severity::Warn, &shared, &notice, &error) {
+                follow_stats(agent.as_deref(), &shared, StatsChange::Forget(tunnel.clone()));
                 deleted.lock().unwrap().push(tunnel);
             }
         });
@@ -263,6 +267,32 @@ fn delete_tunnel(core: &dyn CoreApi, tunnel: &str, copy: Option<&Path>) -> Resul
     core.delete_tunnel(tunnel)
 }
 
+/// Что ядро сделало с туннелем — то же надо сделать со статистикой.
+pub(super) enum StatsChange {
+    Rename { old: String, new: String },
+    Forget(String),
+}
+
+/// Ядро подтвердило переименование или удаление туннеля: статистику ведёт агент, ему сообщается то же
+/// (`StatsRename`/`StatsForget`). Агент недоступен — запись в журнал окна; старое имя тогда уберёт чистка статистики
+/// через `stats::KEEP_ABSENT_DAYS`. Агента нет (демо) — меняется статистика самого окна.
+pub(super) fn follow_stats(agent: Option<&dyn AgentApi>, shared: &Shared, change: StatsChange) {
+    let Some(agent) = agent else {
+        shared.update_stats(|stats| match &change {
+            StatsChange::Rename { old, new } => crate::stats::rename(stats, old, new),
+            StatsChange::Forget(tunnel) => drop(stats.remove(tunnel)),
+        });
+        return;
+    };
+    let (tunnel, request) = match change {
+        StatsChange::Rename { old, new } => (old.clone(), AgentRequest::StatsRename { old, new }),
+        StatsChange::Forget(tunnel) => (tunnel.clone(), AgentRequest::StatsForget(tunnel)),
+    };
+    if let Err(e) = agent.ok(request) {
+        shared.log(&tunnel, Severity::Warn, &trf("agent.stats_not_updated", &[&tunnel, &e]));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -315,6 +345,53 @@ mod tests {
     fn delete_with_unreachable_core_is_an_error() {
         let core = FakeCore::unreachable("core unavailable");
         assert_eq!(delete_tunnel(&core, "office", None), Err("core unavailable".to_string()));
+    }
+
+    fn quiet_shared() -> Shared {
+        Shared::new(None, crate::monitor::Options { ping: false, ping_host: String::new(), notify: false, tray: false, taskbar: false }, None)
+    }
+
+    /// После ответа ядра агенту уходит то же изменение статистики, ровно одним запросом.
+    #[test]
+    fn stats_change_goes_to_the_agent() {
+        use crate::daemon::agent::client::FakeAgent;
+        use crate::daemon::agent::proto::AgentResponse;
+        let sent = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let s = sent.clone();
+        let agent = FakeAgent(Box::new(move |req| {
+            s.lock().unwrap().push(format!("{req:?}"));
+            Ok(AgentResponse::Ok)
+        }));
+        let shared = quiet_shared();
+        follow_stats(Some(&agent), &shared, StatsChange::Rename { old: "a".into(), new: "b".into() });
+        follow_stats(Some(&agent), &shared, StatsChange::Forget("c".into()));
+        assert_eq!(*sent.lock().unwrap(), [r#"StatsRename { old: "a", new: "b" }"#, r#"StatsForget("c")"#]);
+        assert!(shared.events_since(0).is_empty(), "удачно — без записей");
+    }
+
+    /// Агент недоступен: туннель уже переименован ядром, окно не мешает — одна запись в журнал с причиной.
+    #[test]
+    fn stats_change_with_absent_agent_is_logged_not_an_error() {
+        use crate::daemon::agent::client::FakeAgent;
+        let shared = quiet_shared();
+        follow_stats(Some(&FakeAgent::unreachable("pipe: not found")), &shared, StatsChange::Forget("office".into()));
+        let events = shared.events_since(0);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].1.severity, Severity::Warn);
+        assert!(events[0].1.text.contains("office") && events[0].1.text.contains("pipe: not found"), "{}", events[0].1.text);
+    }
+
+    /// Демо (агента нет): меняется статистика самого окна.
+    #[test]
+    fn stats_change_without_an_agent_edits_the_window_stats() {
+        let shared = quiet_shared();
+        shared.update_stats(|s| {
+            s.insert("a".into(), Default::default());
+            s.insert("c".into(), Default::default());
+        });
+        follow_stats(None, &shared, StatsChange::Rename { old: "a".into(), new: "b".into() });
+        follow_stats(None, &shared, StatsChange::Forget("c".into()));
+        assert_eq!(shared.update_stats(|s| s.keys().cloned().collect::<Vec<_>>()), ["b"]);
     }
 
     #[test]

@@ -452,4 +452,15 @@ mod tests {
     fn non_ascii_text_is_not_cut() {
         assert_eq!(inlines("Исправлено **тоннель** — см. [док](https://a.io)"), vec![text("Исправлено "), Inline::Bold("тоннель".into()), text(" — см. "), lnk("док", "https://a.io")]);
     }
+
+    // eframe 0.36 вынес открытие ссылок в фичу "links"; без неё щелчок по ссылке молча ничего не делает (только warn).
+    #[test]
+    fn eframe_opens_links_in_browser() {
+        let manifest = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml"));
+        let eframe = manifest
+            .lines()
+            .find(|l| l.split_once('=').is_some_and(|(key, _)| key.trim() == "eframe"))
+            .expect("строка eframe в Cargo.toml");
+        assert!(eframe.contains("\"links\""), "у eframe нет фичи links: {eframe}");
+    }
 }

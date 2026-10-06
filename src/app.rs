@@ -11,6 +11,7 @@ use eframe::egui;
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 
 use crate::daemon::proto::{NativeOp, Plan, Request, Response};
+use crate::daemon::agent::client::{AgentApi, AgentPipe, Routed};
 use crate::daemon::{CoreApi, PipeClient};
 use crate::fmt;
 use crate::groups;
@@ -24,9 +25,11 @@ mod about;
 mod core_ui;
 mod demo_core;
 mod details;
+mod diagnostics;
 mod dialog;
 mod editor;
 mod engine_mode;
+mod event_log;
 mod errors;
 mod exit;
 mod graph;
@@ -35,9 +38,11 @@ mod list;
 mod markdown;
 mod menu;
 mod modals;
+mod reminder;
 mod sources;
 mod status;
 mod theme;
+mod tray_menu;
 mod updates;
 mod watcher;
 mod window;
@@ -52,7 +57,8 @@ use menu::menu_bar;
 use modals::{Modal, Modals, Outcome, Turn};
 use sources::Confirm;
 use updates::UpdatesWindow;
-use status::{event_log, status_bar, StatusBar};
+use event_log::{event_log, LogFilter};
+use status::{status_bar, StatusBar};
 use theme::*;
 use watcher::SourceWatcher;
 use window::WindowState;
@@ -102,9 +108,13 @@ enum Action {
     AddLanguage,
     OpenLangFolder,
     About,
+    /// Справка → «Скопировать диагностику» (и кнопка в «О программе»).
+    CopyDiagnostics,
     /// Справка → «Проверить обновления…».
     CheckUpdates,
     ShowLog,
+    /// Журнал → «Сохранить как…»: видимые строки в файл, который укажет пользователь.
+    SaveLog(String),
     ClearNotice,
     DesktopShortcut,
     Confirm(Confirm),
@@ -140,6 +150,10 @@ pub struct App {
     autostart: Option<bool>,
     action_error: ErrorSink,
     search: String,
+    /// Фильтр и поиск панели журнала событий.
+    log_filter: LogFilter,
+    /// Клавиша меню (Apps) -> Shift+F10 для контекстных меню (`menu::context_menu`).
+    menu_key: menu::MenuKey,
     /// Кадры, скрытый запуск, масштаб, запись настроек, снимок.
     window: WindowState,
     /// Связь с ядром: полоса «установить / обновить», сверка в фоне.
@@ -157,6 +171,10 @@ pub struct App {
     updates: UpdatesWindow,
     /// Ядро, с которым говорит окно (в демо — `DemoCore`).
     core: Core,
+    /// Агент (пинг; по плану core-split — и остальное вторичное). `None` — демо-режим: пинг выдуманный, прямо в окне.
+    agent: Option<Arc<dyn AgentApi>>,
+    /// Группы и «несколько сразу» для меню трея: оно строится и при скрытом окне, без кадра.
+    tray_layout: tray_menu::SharedLayout,
 }
 
 impl App {
@@ -173,7 +191,16 @@ impl App {
                     _ => 15.0,
                 };
             }
+            // egui 0.34 затеняет края прокручиваемых областей; нижняя строка списка выглядела бы недорисованной.
+            s.spacing.scroll.fade.strength = 0.0;
+            // egui 0.35 замедлил анимации до 0,2 с; меню и подсказки появлялись бы заметно медленнее, чем раньше.
+            s.animation_time = 0.1;
+            // egui 0.35 обрезает содержимое прокрутки ровно по краю, а 0.36 убрал clip_rect_margin; без отступа внутри
+            // прокрутки подсветка крайних строк списка срезалась бы.
+            s.spacing.scroll.content_margin = egui::Margin::same(3);
         });
+        // egui 0.34 закрывает окно по Ctrl+Q. У нас закрытие — по крестику и из меню, с вопросом про туннели и трей.
+        ctx.options_mut(|o| o.quit_shortcuts.clear());
         let exit_request = Arc::new(AtomicBool::new(false));
         let hwnd = match cc.window_handle().map(|h| h.as_raw()) {
             Ok(RawWindowHandle::Win32(w)) => w.hwnd.get(),
@@ -181,28 +208,13 @@ impl App {
         };
         if hwnd != 0 {
             win::dark_title_bar(hwnd);
-            // «Выход» в трее — как в меню: при подключённых туннелях окно спросит, отключать ли их.
-            // Скрытое окно кадров не рисует — его сначала показываем; без туннелей выходим сразу.
-            let (request, repaint, on_exit_shared) = (exit_request.clone(), ctx.clone(), shared.clone());
-            let on_exit = Box::new(move || {
-                if !on_exit_shared.any_running() {
-                    on_exit_shared.save_stats();
-                    tray::remove();
-                    std::process::exit(0);
-                }
-                request.store(true, std::sync::atomic::Ordering::SeqCst);
-                tray::show_window();
-                repaint.request_repaint();
-            });
-            tray::install(hwnd, ctx.clone(), start.settings.tray && start.snapshot_file.is_none(), on_exit);
         }
-        let repaint = ctx.clone();
-        monitor::spawn(shared.clone(), Box::new(move || repaint.request_repaint()));
-        // Пинг и служба менеджера AmneziaWG — забота ядра; в демо пинг выдуманный, прямо в окне.
+        // Служба менеджера AmneziaWG — забота ядра, пинг — агента; в демо пинг выдуманный, прямо в окне.
         let action_error = ErrorSink::new(shared.clone(), ctx.clone());
         let core: Core = match &start.demo {
             Some(demo) => Arc::new(demo_core::DemoCore(demo.clone())),
-            None => Arc::new(PipeClient),
+            // Конфиги туннелей и родное окно AmneziaWG — у агента; `Routed` отправляет туда эти запросы.
+            None => Arc::new(Routed::new(Arc::new(PipeClient), Arc::new(AgentPipe))),
         };
         // Журнал в памяти пропадёт вместе с окном — ошибки действий ещё и в файл рядом с `crash.log` (в демо не пишем).
         let action_error = if start.demo.is_some() {
@@ -215,18 +227,38 @@ impl App {
         if let Some(problem) = &start.settings_problem {
             action_error.push(problem.text());
         }
-        let core_link = if start.demo.is_some() { CoreLink::demo() } else { CoreLink::checking() };
-        if start.demo.is_some() {
-            crate::ping::spawn(shared.clone());
-        } else {
-            core_link.check(core.clone(), ctx.clone(), action_error.clone(), Probe::Start);
+        // Трей — когда ядро и журнал ошибок готовы: его меню переключает туннели тем же `Switcher`, что и окно.
+        let tray_layout: tray_menu::SharedLayout = Arc::new(Mutex::new(tray_menu::Layout::of(&start.settings)));
+        if hwnd != 0 {
+            let hooks = tray_menu::TrayHooks {
+                layout: tray_layout.clone(),
+                switcher: Switcher { shared: shared.clone(), core: core.clone(), error: action_error.clone(), ctx: ctx.clone() },
+                exit_request: exit_request.clone(),
+            };
+            tray::install(hwnd, ctx.clone(), start.settings.tray && start.snapshot_file.is_none(), Box::new(hooks));
+        }
+        let repaint = ctx.clone();
+        monitor::spawn(shared.clone(), Box::new(move || repaint.request_repaint()));
+        let core_link =if start.demo.is_some() { CoreLink::demo() } else { CoreLink::checking() };
+        let agent: Option<Arc<dyn AgentApi>> = start.demo.is_none().then(|| Arc::new(AgentPipe) as Arc<dyn AgentApi>);
+        match &agent {
+            None => {
+                // Демо: пинг и статистику окно считает само по выдуманным туннелям (у настоящего окна их ведёт агент).
+                crate::ping::spawn(shared.clone());
+                demo_core::spawn_stats(shared.clone());
+            }
+            Some(agent) => {
+                core_link.check(core.clone(), ctx.clone(), action_error.clone(), Probe::Start);
+                let repaint = ctx.clone();
+                monitor::spawn_agent(shared.clone(), agent.clone(), Box::new(move || repaint.request_repaint()));
+            }
         }
         let mut modals = Modals::default();
         if start.about {
             modals.open(Modal::About);
         }
         let notice = Arc::<Mutex<Option<String>>>::default();
-        let updates = UpdatesWindow::new(updates::Link::new(core.clone(), action_error.clone(), notice.clone(), ctx.clone(), shared.clone()));
+        let updates = UpdatesWindow::new(updates::Link::new(agent.clone(), action_error.clone(), notice.clone(), ctx.clone()));
         let start_hidden = start.hidden && start.settings.tray;
         let saved_text = if start.settings_path.exists() { start.settings.to_ini().to_text() } else { String::new() };
         App {
@@ -242,6 +274,8 @@ impl App {
             notice,
             action_error,
             search: String::new(),
+            log_filter: LogFilter::default(),
+            menu_key: menu::MenuKey::default(),
             window: WindowState::new(start.settings_path, saved_text, start.snapshot_file, start_hidden),
             core_link,
             hwnd,
@@ -251,16 +285,30 @@ impl App {
             modals,
             updates,
             core,
+            agent,
+            tray_layout,
+        }
+    }
+
+    /// Щелчок по уведомлению Windows: окно уже поднято треем, остаётся открыть «Обновления и откаты» или выбрать
+    /// туннель, о котором было уведомление.
+    fn handle_toast_click(&mut self, ctx: &egui::Context) {
+        match tray::take_click() {
+            Some(tray::Clicked::Update) => self.updates.open(),
+            Some(tray::Clicked::Tunnel(name)) => tray_menu::select_from_toast(&mut self.s.book, &name, ctx),
+            None => {}
         }
     }
 
     /// Окно обновлений и его подтверждение: поведение — в `UpdatesWindow`, здесь только то, что принадлежит App
     /// (настройки, скрытое в трей окно, диалоги `Modals`).
     fn show_updates_window(&mut self, ctx: &egui::Context) {
-        let fresh = self.updates.tick(&mut self.s.update_notified);
-        let hidden = tray::window_hidden() || self.window.hide_pending();
-        if !fresh.is_empty() && hidden && self.s.notify {
-            tray::notify(crate::APP_TITLE, &updates::news_text(&fresh), false);
+        // Сообщение об обновлении (первое и суточные напоминания) — уведомление Windows и в окне, при видимом окне
+        // тоже; уведомление Windows подчиняется настройке «уведомления».
+        if let Some(text) = self.updates.tick(&mut self.s.update_notified, &mut self.s.update_reminded, monitor::unix_now()) {
+            if self.s.notify {
+                tray::notify_update(crate::APP_TITLE, &text);
+            }
         }
         self.updates.show_news(ctx);
         let frame = self.updates.show(ctx, self.modals.is_open(updates::is_updates_confirm));
@@ -316,6 +364,7 @@ impl App {
                 s.view.log = true;
                 self.unseen_error = false;
             }
+            Action::SaveLog(text) => self.save_log(&text),
             Action::ClearNotice => *self.notice.lock().unwrap() = None,
             Action::Confirm(c) => self.modals.open(Modal::Confirm(c)),
             Action::ReadNative(tunnel) => {
@@ -363,6 +412,7 @@ impl App {
                 }
             }
             Action::About => self.modals.open(Modal::About),
+            Action::CopyDiagnostics => self.copy_diagnostics(),
             Action::CheckUpdates => self.updates.open(),
             Action::AddConf => {
                 if let Some(path) = win::pick_conf(false, None) {
@@ -457,28 +507,15 @@ impl App {
             Modal::Confirm(c) => self.show_confirm(ctx, c, turn),
             Modal::UpdatesConfirm(c) => self.updates.show_confirm(ctx, c, turn),
             Modal::EditorUnsaved => self.show_editor_unsaved(ctx, turn),
+            Modal::EditorInvalid(after) => self.show_editor_invalid(ctx, *after, turn),
             Modal::About => self.show_about(ctx, turn),
         }
     }
 
-    /// Подключить, отключить или переподключить. Всё переключение — одна команда ядру: без «несколько сразу» оно
-    /// снимает остальные туннели, как родной клиент, подключает и ждёт службу.
+    /// Подключить, отключить или переподключить (таблица, сведения, клавиши) — тем же `Switcher`, что и меню трея.
     fn switch(&self, name: String, plan: Plan) {
-        let label = match plan {
-            Plan::Connect => "busy.connect",
-            Plan::Disconnect => "busy.disconnect",
-            Plan::Reconnect => "busy.reconnect",
-        };
-        // Повторное нажатие, пока туннель переключается, — ничего не делать. Пометка снимается охранником —
-        // и тогда, когда поток переключения упал.
-        let Some(busy) = self.shared.try_pending_guard(&name, label) else { return };
-        let (core, error, ctx) = (self.core.clone(), self.action_error.clone(), self.ctx.clone());
-        let multiple = self.s.multiple;
-        std::thread::spawn(move || {
-            switch_through_core(core.as_ref(), &name, plan, multiple, &error);
-            drop(busy);
-            ctx.request_repaint();
-        });
+        let switcher = Switcher { shared: self.shared.clone(), core: self.core.clone(), error: self.action_error.clone(), ctx: self.ctx.clone() };
+        switcher.switch(name, plan, self.s.multiple);
     }
 
     /// «Повторить» у туннеля, который ядро переподключает раз в 10 минут: расписание с начала, попытка сразу.
@@ -493,12 +530,16 @@ impl App {
 }
 
 impl eframe::App for App {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    /// Всё, что не рисует. eframe зовёт это каждый кадр, а `ui` — только когда окно видно (не свёрнуто):
+    /// закрытие, выход из трея, связь с ядром и правки .conf из внешнего редактора не ждут, пока окно развернут.
+    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // eframe показывает окно после первых кадров — прячем после него, иначе он покажет снова.
         if self.window.begin_frame() {
             tray::hide_window();
         }
         self.handle_close(ctx);
+        self.handle_toast_click(ctx);
+        tray_menu::publish(&self.tray_layout, &self.s);
         self.track_window(ctx);
         self.sync_zoom(ctx);
         self.sync_mode();
@@ -506,11 +547,22 @@ impl eframe::App for App {
         self.watch_core();
         self.drain_errors();
         self.check_exit_request();
+        self.check_watched();
+        // Настройки меняет и ядро (режим) — сохранить, даже если `ui` в этом кадре не позовут.
+        self.push_options();
+        self.save_settings(ctx);
+    }
 
+    fn raw_input_hook(&mut self, _ctx: &egui::Context, raw_input: &mut egui::RawInput) {
+        self.menu_key.hook(raw_input);
+    }
+
+    fn ui(&mut self, root: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        let ctx = &root.ctx().clone();
         let mut actions = Vec::new();
         {
             let shared = self.shared.clone();
-            let FrameView { snap, pending, ping, stats, service } = shared.frame_view();
+            let FrameView { snap, pending, ping, stats, service, agent_down } = shared.frame_view();
             self.refresh_source_info();
             self.refresh_store_info(&snap);
             self.apply_deleted();
@@ -528,13 +580,13 @@ impl eframe::App for App {
             }
             self.s.book.drop_stale_group(self.s.view.groups);
             let typing = ctx.memory(|m| m.focused()).is_some_and(|id| egui::TextEdit::load_state(ctx, id).is_some());
-            let popup = ctx.memory(|m| m.any_popup_open());
+            let popup = egui::Popup::is_any_open(ctx);
             let keys = table_keys(&self.modals, self.updates.is_open(), self.editor.as_ref(), typing, popup);
 
             let updates_new = self.updates.has_new();
-            egui::TopBottomPanel::top("menu").show(ctx, |ui| menu_bar(ui, &mut self.s, self.autostart, &self.base_dir.join("lang"), updates_new, &mut actions));
-            self.core_banner(ctx, &mut actions);
-            egui::TopBottomPanel::bottom("status").show(ctx, |ui| {
+            egui::Panel::top("menu").show(root, |ui| menu_bar(ui, &mut self.s, self.autostart, &self.base_dir.join("lang"), updates_new, &mut actions));
+            self.core_banner(root, &mut actions);
+            egui::Panel::bottom("status").show(root, |ui| {
                 let bar = StatusBar {
                     mode: self.s.mode(),
                     service: &service,
@@ -544,24 +596,26 @@ impl eframe::App for App {
                 };
                 status_bar(ui, &bar, &mut actions)
             });
+            // Простой show, не show_collapsible: с 0.35 тот даёт закрыть панель перетаскиванием края или двойным щелчком,
+            // а список туннелей не скрывается вовсе, журнал — только из меню «Вид».
             if self.s.view.log {
-                let resp = egui::TopBottomPanel::bottom("log")
+                let resp = egui::Panel::bottom("log")
                     .resizable(true)
-                    .default_height(self.s.log_height)
-                    .height_range(60.0..=600.0)
-                    .show(ctx, |ui| event_log(ui, &shared));
+                    .default_size(self.s.log_height)
+                    .size_range(60.0..=600.0)
+                    .show(root, |ui| event_log(ui, &shared, &mut self.log_filter, self.s.book.tunnel(), &mut actions));
                 self.s.log_height = resp.response.rect.height();
             }
-            let resp = egui::SidePanel::left("tunnels")
+            let resp = egui::Panel::left("tunnels")
                 .resizable(true)
-                .default_width(self.s.left_width)
-                .width_range(260.0..=1200.0)
-                .show(ctx, |ui| {
+                .default_size(self.s.left_width)
+                .size_range(260.0..=1200.0)
+                .show(root, |ui| {
                     let list = List { snap: &snap, healths: &healths, stats: &stats, keys };
                     tunnel_list(ui, &mut self.s, &mut self.search, &list, &mut actions)
                 });
             self.s.left_width = resp.response.rect.width();
-            egui::CentralPanel::default().show(ctx, |ui| match self.s.book.tunnel().map(str::to_string) {
+            egui::CentralPanel::default().show(root, |ui| match self.s.book.tunnel().map(str::to_string) {
                 Some(name) => {
                     let ctx = Detail {
                         name: &name,
@@ -569,10 +623,12 @@ impl eframe::App for App {
                         health: healths.get(&name).cloned().unwrap_or(Health { level: Level::Off, text: tr("health.off") }),
                         busy: pending.contains_key(&name),
                         ping: &ping,
+                        ping_unavailable: agent_down,
                         stats: &stats,
                         info: infos.get(&name),
                         info_loading: info_loading.contains(&name),
                         retry_slow: snap.retries.get(&name).is_some_and(|r| r.slow),
+                        core_lost: snap.core_lost,
                     };
                     details(ui, &ctx, &mut self.s, &mut actions)
                 }
@@ -581,7 +637,6 @@ impl eframe::App for App {
                 }
             });
         }
-        self.check_watched();
         // Модальные диалоги — раньше окна обновлений и редактора: верхний забирает Enter и Esc, те их уже не видят.
         self.show_modals(ctx);
         self.show_updates_window(ctx);
@@ -597,7 +652,6 @@ impl eframe::App for App {
 
 impl Drop for App {
     fn drop(&mut self) {
-        self.shared.save_stats();
         tray::remove();
     }
 }
@@ -612,6 +666,35 @@ fn table_keys(modals: &Modals, updates_open: bool, editor: Option<&Editor>, typi
 
 /// Ядро, с которым говорит окно: канал к службе, в демо — `DemoCore`, в тестах — `FakeCore`.
 type Core = Arc<dyn CoreApi>;
+
+/// Переключение туннеля — одно для окна и меню трея: пометка «занят», один запрос ядру в своём потоке, ошибка — в
+/// журнал окна. Без «несколько сразу» ядро само снимает остальные туннели, как родной клиент.
+#[derive(Clone)]
+struct Switcher {
+    shared: Arc<Shared>,
+    core: Core,
+    error: ErrorSink,
+    ctx: egui::Context,
+}
+
+impl Switcher {
+    fn switch(&self, name: String, plan: Plan, multiple: bool) {
+        let label = match plan {
+            Plan::Connect => "busy.connect",
+            Plan::Disconnect => "busy.disconnect",
+            Plan::Reconnect => "busy.reconnect",
+        };
+        // Повторное нажатие, пока туннель переключается, — ничего не делать. Пометка снимается охранником —
+        // и тогда, когда поток переключения упал.
+        let Some(busy) = self.shared.try_pending_guard(&name, label) else { return };
+        let (core, error, ctx) = (self.core.clone(), self.error.clone(), self.ctx.clone());
+        std::thread::spawn(move || {
+            switch_through_core(core.as_ref(), &name, plan, multiple, &error);
+            drop(busy);
+            ctx.request_repaint();
+        });
+    }
+}
 
 /// Переключить туннель через ядро. Ошибку самого переключения ядро пишет в журнал — она придёт с состоянием;
 /// а если до ядра не достучались, оно отказало, не взяв запрос (`Refused`: занято), или ответ не тот, не напишет
@@ -652,7 +735,7 @@ mod testkit {
 
     pub(super) fn sink() -> (Arc<Shared>, ErrorSink) {
         let options = Options { ping: false, ping_host: String::new(), notify: false, tray: false, taskbar: false };
-        let shared = Arc::new(Shared::new(None, options, None, None));
+        let shared = Arc::new(Shared::new(None, options, None));
         (shared.clone(), ErrorSink::new(shared, eframe::egui::Context::default()))
     }
 

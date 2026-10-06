@@ -71,6 +71,10 @@ fn main() {
         // Отодвинутые обновлением файлы прошлой версии служба удаляет сама — когда новое ядро уже отвечает.
         std::process::exit(daemon::service::main());
     }
+    // Агент — второй процесс; его запускает и сторожит ядро (`daemon::agent_watch`).
+    if has(daemon::agent::AGENT_FLAG) {
+        std::process::exit(daemon::agent::main());
+    }
     // Перезапуск ядра после обновления сборки (его запускает само ядро, от SYSTEM).
     if has(update::ours::RESTART_FLAG) {
         std::process::exit(update::ours::restart_core());
@@ -177,13 +181,13 @@ fn main() {
         std::process::exit(print_core_status());
     }
     if let Some(tunnel) = value("--core-details") {
-        let result = daemon::PipeClient.info(daemon::proto::Request::Details(tunnel.clone())).map(|i| (i.addresses.len(), i.peers.len()));
+        let result = tunnel_client().info(daemon::proto::Request::Details(tunnel.clone())).map(|i| (i.addresses.len(), i.peers.len()));
         println!("core-details {tunnel}: (addresses, peers) = {result:?}");
         std::process::exit(i32::from(result.is_err()));
     }
     if has("--core-take-native") {
-        let result = daemon::PipeClient.report(daemon::proto::Request::TakeNative).map(|r| (r.added.len(), r.existing.len(), r.bad_name.len()));
-        println!("core-take-native: (added, existing, bad name) = {result:?}");
+        let result = tunnel_client().report(daemon::proto::Request::TakeNative).map(|r| (r.added.len(), r.existing.len(), r.bad_name.len(), r.scripts.len()));
+        println!("core-take-native: (added, existing, bad name, scripts) = {result:?}");
         std::process::exit(i32::from(result.is_err()));
     }
     for (flag, plan) in [("--core-connect", daemon::proto::Plan::Connect), ("--core-disconnect", daemon::proto::Plan::Disconnect)] {
@@ -202,8 +206,9 @@ fn main() {
         std::process::exit(i32::from(result.is_err()));
     }
     // Проверка менеджера обновлений: `state` — без сети; `check` — проверка источников, ждёт её конца (до 2 мин);
-    // `restore <id>` — помощник окна с правами администратора: отправить возврат ядру и выйти, ход виден в окне.
+    // `restore <id>` — помощник окна с правами администратора: отправить возврат агенту и выйти, ход виден в окне.
     if let Some(pos) = args.iter().position(|a| a == update::CLI_FLAG) {
+        use daemon::agent::client::{AgentApi, AgentPipe};
         use update::UpdateOp;
         let op = match update::parse_cli(&args[pos + 1..]) {
             Ok(op) => op,
@@ -216,11 +221,11 @@ fn main() {
             std::process::exit(restore_helper(id, value(elevated::RESULT_FLAG).as_deref()));
         }
         let what = &args[pos + 1];
-        let mut result = daemon::PipeClient.updates(op);
+        let mut result = AgentPipe.updates(op).map_err(|e| e.to_string());
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
         while matches!(&result, Ok(s) if s.busy.is_some()) && std::time::Instant::now() < deadline {
             std::thread::sleep(std::time::Duration::from_secs(1));
-            result = daemon::PipeClient.updates(UpdateOp::State);
+            result = AgentPipe.updates(UpdateOp::State).map_err(|e| e.to_string());
         }
         match &result {
             Ok(s) => {
@@ -267,12 +272,12 @@ fn main() {
         tray: settings.tray,
         taskbar: settings.taskbar,
     };
-    // Окно — клиент ядра: туннели, статистика и журнал живут там. Демо — выдуманное ядро прямо в окне.
+    // Окно — клиент ядра (туннели, журнал) и агента (пинг, статистика). Демо — выдуманное ядро прямо в окне.
     // Одни и те же выдуманные туннели — у опроса окна (`Shared`) и у демо-ядра, которому окно шлёт команды.
     let demo = demo.then(|| Arc::new(Demo::new()));
     let shared = match &demo {
-        Some(d) => Arc::new(Shared::new(Some(d.clone()), options, Some(dir.join("Stats.ini")), None)),
-        None => Arc::new(Shared::new(None, options, None, None)),
+        Some(d) => Arc::new(Shared::new(Some(d.clone()), options, None)),
+        None => Arc::new(Shared::new(None, options, None)),
     };
     if let Some(d) = &demo {
         seed_demo(&shared, d);
@@ -361,14 +366,20 @@ fn seed_demo(shared: &Shared, demo: &Demo) {
     });
 }
 
-/// Помощник «Вернуть» (с правами администратора): отправить ядру возврат `id`, не дожидаясь его конца, итог — в
-/// канал окна `result` (без консоли окну больше негде его увидеть). Код выхода: 0 — ядро приняло возврат.
+/// Помощник «Вернуть» (с правами администратора): отправить агенту возврат `id`, не дожидаясь его конца, итог — в
+/// канал окна `result` (без консоли окну больше негде его увидеть). Код выхода: 0 — агент принял возврат.
 fn restore_helper(id: u64, result: Option<&str>) -> i32 {
-    let sent = daemon::PipeClient.updates(update::UpdateOp::Restore(id));
+    use daemon::agent::client::{AgentApi, AgentPipe};
+    let sent = AgentPipe.updates(update::UpdateOp::Restore(id)).map_err(|e| e.to_string());
     println!("core-updates restore {id}: {:?}", sent.as_ref().map(|s| s.busy.clone()));
     let sent = sent.map(|_| String::new());
     elevated::report(result, &sent);
     i32::from(sent.is_err())
+}
+
+/// Ядро и агент так же, как их видит окно: сведения и «Забрать всё» обслуживает агент.
+fn tunnel_client() -> daemon::agent::client::Routed {
+    daemon::agent::client::Routed::new(Arc::new(daemon::PipeClient), Arc::new(daemon::agent::client::AgentPipe))
 }
 
 /// Ядро глазами окна: версия, режим, туннели, подключённые (без ключей и адресов).
@@ -385,6 +396,7 @@ fn print_core_status() -> i32 {
         Ok(Response::State(s)) => {
             println!("tunnels: {}, running: {:?}, events: {}, error: {:?}", s.tunnels.len(), s.running.keys().collect::<Vec<_>>(), s.events.len(), s.error);
             println!("service: {}", s.service);
+            println!("agent: {}", agent_text(s.agent.as_ref()));
             0
         }
         other => {
@@ -398,7 +410,7 @@ fn print_core_status() -> i32 {
 fn print_status() -> i32 {
     let options = Options { ping: false, ping_host: String::new(), notify: false, tray: false, taskbar: false };
     let host = Arc::new(Real::new());
-    let shared = Shared::new(Some(host.clone()), options, None, None);
+    let shared = Shared::new(Some(host.clone()), options, None);
     monitor::poll(&shared, host.as_ref());
     let snap = shared.snapshot_clone();
     if let Some(e) = &snap.error {
@@ -422,5 +434,31 @@ fn print_status() -> i32 {
         }
     }
     println!("autostart: {}", win::autostart_enabled());
+    print_agent_status();
     i32::from(snap.error.is_some())
+}
+
+/// Агент глазами ядра (его PID нужен ручной проверке сторожа). Ядро не отвечает — так и сказать; на код выхода
+/// `--status` это не влияет: он про туннели.
+fn print_agent_status() {
+    use daemon::proto::{Request, Response};
+    let timeouts = daemon::pipe::Timeouts { send: std::time::Duration::from_secs(5), reply: std::time::Duration::from_secs(10) };
+    match daemon::pipe::call_to(daemon::pipe::NAME, &Request::State { events_after: u64::MAX }, timeouts) {
+        Ok(Response::State(s)) => println!("agent: {}", agent_text(s.agent.as_ref())),
+        Ok(other) => println!("agent: unexpected core answer {other:?}"),
+        Err(e) => println!("agent: core unavailable: {e}"),
+    }
+}
+
+fn agent_text(status: Option<&daemon::proto::AgentStatus>) -> String {
+    use daemon::proto::AgentStatus;
+    match status {
+        None => "not reported (core without an agent supervisor)".into(),
+        Some(AgentStatus::Starting) => "starting".into(),
+        Some(AgentStatus::Up { pid }) => format!("up, pid {pid}"),
+        Some(AgentStatus::Down { since, last_exit }) => {
+            let ago = monitor::unix_now().saturating_sub(*since);
+            format!("down for {ago} s, last exit: {}", daemon::agent_watch::describe(last_exit))
+        }
+    }
 }

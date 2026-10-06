@@ -7,14 +7,17 @@
 //! После каждой работы — пределы хранилища: `HISTORY_MAX` строк, `BACKUPS_MAX` копий на компонент, `LOGS_MAX`
 //! журналов.
 
+use std::ops::ControlFlow;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
 use super::{feed, sign};
 use super::clock::{check_due, Clock, SystemClock, TICK};
 use super::component::{ComponentOps, Components, Journal, RestoreJob};
+use super::core_link::CoreLink;
 use super::sources::{GithubSources, OursError, Sources};
 use super::{Action, Component, HistoryEntry, UpdateOp, UpdatesState, ORDER};
 use super::jsonstore::{load_json, load_or_default, rotate_logs, safe_name, save_json};
@@ -40,6 +43,10 @@ pub(super) const DOWNLOADS: &str = "downloads";
 const LOGS: &str = "logs";
 /// Номер строки истории идущего возврата AmneziaWG; остался после остановки ядра — возврат прерван.
 const STARTED: &str = "started.json";
+/// Компоненты, чей шаг после замены (`after_change`, у движка — `ReconnectEngine` ядру) ещё не принят: отметка
+/// ставится до замены файлов и снимается только после ответа ядра. Агент умер между заменой и запросом или ядро
+/// перезапускалось — при следующем запуске (на такте планировщика) шаг повторяется.
+const OWED: &str = "after_change.json";
 
 /// Что сохраняется между запусками, кроме истории.
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
@@ -84,6 +91,14 @@ pub struct Manager {
     /// Идущая работа; `Some` — занято. Текст для окна собирается при чтении (`state`).
     busy: Mutex<Option<Busy>>,
     data: Mutex<Data>,
+    /// Отметка `OWED`; держится на время самого шага, чтобы такт планировщика и работа не слали его вразнобой.
+    owed: Mutex<Owed>,
+}
+
+/// Невыполненные шаги после замены и было ли уже в журнале, что повтор не удался (пишется один раз до успеха).
+struct Owed {
+    components: Vec<Component>,
+    failure_logged: bool,
 }
 
 /// Конец работы (и при панике): загрузки убраны, занятость снята.
@@ -97,13 +112,20 @@ impl Drop for JobDone<'_> {
 }
 
 impl Manager {
-    /// Менеджер ядра (создаётся один раз) с ежедневной проверкой в фоне.
-    pub fn new(shared: Arc<Shared>, on_engine_changed: Box<dyn Fn() + Send + Sync>) -> Arc<Manager> {
-        let components = Components::real(on_engine_changed);
+    /// Менеджер ядра (создаётся один раз) с ежедневной проверкой в фоне; туннели трогает только через `core`.
+    pub fn new(shared: Arc<Shared>, core: Arc<dyn CoreLink>) -> Arc<Manager> {
+        let components = Components::real(core);
         let m = Arc::new(Manager::open(store_dir(), shared, components, Arc::new(GithubSources), Arc::new(SystemClock::new())));
         let daily = m.clone();
         crate::crash::spawn_named("update-daily", move || daily.daily());
         m
+    }
+
+    /// Менеджер для тестов ядра: хранилище во временной папке, без фоновой проверки и без обращений в сеть.
+    #[cfg(test)]
+    pub(crate) fn for_core_tests(shared: Arc<Shared>) -> Arc<Manager> {
+        let dir = std::env::temp_dir().join(format!("awg-core-test-{}", std::process::id()));
+        Arc::new(Manager::open(dir, shared, Components::real(Arc::new(super::core_link::fake::RecordingCore::default())), Arc::new(GithubSources), Arc::new(SystemClock::new())))
     }
 
     /// Менеджер над хранилищем `dir`, без фоновой проверки.
@@ -117,7 +139,9 @@ impl Manager {
             shared.log("", Severity::Warn, &fixed);
         }
         let data = Data { saved: load_or_default(&dir.join(STATE), &shared), history };
-        let m = Manager { shared, components, dir, sources, clock, busy: Mutex::new(None), data: Mutex::new(data) };
+        // Отметка пишется атомарно; испорченная — чужая правка: событие в журнале и пусто (`load_or_default`).
+        let owed = Mutex::new(Owed { components: load_or_default(&dir.join(OWED), &shared), failure_logged: false });
+        let m = Manager { shared, components, dir, sources, clock, busy: Mutex::new(None), data: Mutex::new(data), owed };
         for sub in [BACKUPS, DOWNLOADS, LOGS] {
             if let Err(e) = std::fs::create_dir_all(m.dir.join(sub)) {
                 m.shared.log("", Severity::Bad, &crate::fsutil::io_ctx(m.dir.join(sub), e));
@@ -127,7 +151,17 @@ impl Manager {
         m.clean_downloads();
         m.mark_interrupted();
         m.tidy();
+        m.announce_owed();
         m
+    }
+
+    /// Прошлый запуск не довёл шаг после замены: строка в журнал. Сам повтор — на такте планировщика (`settle_owed`),
+    /// не здесь: ядро в этот момент может ещё запускаться.
+    fn announce_owed(&self) {
+        let names: Vec<String> = lock(&self.owed).components.iter().map(|c| self.name(*c)).collect();
+        if !names.is_empty() {
+            self.shared.log("", Severity::Warn, &trf("updm.after_change_owed", &[&names.join(", ")]));
+        }
     }
 
     /// Возврат AmneziaWG, оборванный остановкой ядра: его строка истории становится ошибкой «прервано».
@@ -157,6 +191,72 @@ impl Manager {
 
     pub(super) fn ops(&self, c: Component) -> &dyn ComponentOps {
         self.components.get(c)
+    }
+
+    /// Перед заменой `c`: шаг после замены становится долгом, пока его не примут (`after_change`).
+    fn owe(&self, c: Component) {
+        if !self.ops(c).owes_after_change() {
+            return;
+        }
+        let mut owed = lock(&self.owed);
+        if !owed.components.contains(&c) {
+            owed.components.push(c);
+            self.save(OWED, &owed.components);
+        }
+    }
+
+    /// Замена `c` вернулась с ошибкой: файлы не заменены или откачены, шаг после замены не нужен.
+    fn forgive(&self, c: Component) {
+        let mut owed = lock(&self.owed);
+        if owed.components.contains(&c) {
+            owed.components.retain(|x| *x != c);
+            self.save(OWED, &owed.components);
+        }
+    }
+
+    /// Шаг после удачной замены компонента; не удался — в журнал, долг остаётся и повторяется на такте планировщика
+    /// (уже без новой строки в журнале); сама замена остаётся удачной.
+    fn after_change(&self, c: Component) {
+        let mut owed = lock(&self.owed);
+        match self.ops(c).after_change() {
+            Ok(()) => self.settled(&mut owed, c),
+            Err(e) => {
+                self.shared.log("", Severity::Bad, &trf("updm.after_change_failed", &[&self.name(c), &e]));
+                owed.failure_logged = true;
+            }
+        }
+    }
+
+    /// Повтор невыполненных шагов после замены (такт планировщика). Идёт работа — пропуск: свою отметку она снимет
+    /// сама, а запрос посреди замены файлов снял бы её раньше времени. Неудача пишется в журнал один раз до
+    /// ближайшего успеха.
+    fn settle_owed(&self) {
+        let mut owed = lock(&self.owed);
+        if owed.components.is_empty() || lock(&self.busy).is_some() {
+            return;
+        }
+        for c in owed.components.clone() {
+            match self.ops(c).after_change() {
+                Ok(()) => {
+                    self.shared.log("", Severity::Info, &trf("updm.after_change_resent", &[&self.name(c)]));
+                    self.settled(&mut owed, c);
+                }
+                Err(e) if !owed.failure_logged => {
+                    self.shared.log("", Severity::Warn, &trf("updm.after_change_retry", &[&self.name(c), &e]));
+                    owed.failure_logged = true;
+                }
+                Err(_) => {}
+            }
+        }
+    }
+
+    /// Шаг после замены `c` принят: долг снят и на диске.
+    fn settled(&self, owed: &mut Owed, c: Component) {
+        owed.components.retain(|x| *x != c);
+        if owed.components.is_empty() {
+            owed.failure_logged = false;
+        }
+        self.save(OWED, &owed.components);
     }
 
     /// Название компонента для журнала и строки занятости.
@@ -244,16 +344,29 @@ impl Manager {
 
     /// Фоновый поток: раз в `TICK` решает, пора ли проверять (`daily_tick`).
     fn daily(self: Arc<Self>) {
+        self.daily_until(&|| false);
+    }
+
+    /// Цикл планировщика — вторичный (`crash::nonfatal_loop`): паника шага вне самой проверки (часы, чтение
+    /// состояния, уборка загрузок) — запись в журнал и пауза, а не остановка ядра. `done` — только для проверок:
+    /// в ядре цикл идёт, пока жив процесс.
+    fn daily_until(&self, done: &dyn Fn() -> bool) {
         let mut first = true;
-        loop {
-            self.clock.sleep(TICK);
+        let report = |panic: &str, wait: Duration| self.shared.report_secondary_panic(panic, wait);
+        crate::crash::nonfatal_loop(TICK, &|d| self.clock.sleep(d), &report, || {
             self.daily_tick(&mut first);
-        }
+            if done() {
+                ControlFlow::Break(())
+            } else {
+                ControlFlow::Continue(())
+            }
+        });
     }
 
     /// Один шаг планировщика: первая проверка — через `FIRST_CHECK` после запуска, дальше — когда с последней прошли
     /// сутки. Занято другой работой — шаг пропускается, `first` не меняется. Возвращает, была ли проверка.
     fn daily_tick(&self, first: &mut bool) -> bool {
+        self.settle_owed();
         let checked = lock(&self.data).saved.checked_at;
         if !check_due(*first, self.clock.uptime(), checked, self.clock.now()) || !self.begin(Busy::Checking) {
             return false;
@@ -366,13 +479,17 @@ impl Manager {
         let id = self.next_id();
         let mut entry = entry(id, c, Action::Update, Some(from.clone()), Some(to.clone()));
         entry.prior_backup = Some(backup_id);
+        self.owe(c);
         let result = self.run_journaled(ops.journal(Action::Update), entry, || ops.update(self, f, &to, id));
         match result {
             Ok(()) => {
                 self.shared.log("", Severity::Info, &trf("updm.updated", &[&ops.name(), &from, &to]));
-                ops.after_change();
+                self.after_change(c);
             }
-            Err(e) => self.shared.log("", Severity::Bad, &trf("updm.update_failed", &[&ops.name(), &e])),
+            Err(e) => {
+                self.forgive(c);
+                self.shared.log("", Severity::Bad, &trf("updm.update_failed", &[&ops.name(), &e]));
+            }
         }
     }
 
@@ -418,12 +535,16 @@ impl Manager {
         let mut entry = entry(id, c, Action::Restore, current, Some(info.version.clone()));
         entry.prior_backup = current_backup.as_ref().map(|(backup_id, _)| *backup_id);
         let job = RestoreJob { id, name, dir: &dir, info, current_backup: current_backup.as_ref().map(|(_, n)| n.as_str()) };
+        self.owe(c);
         match self.run_journaled(ops.journal(Action::Restore), entry, || ops.restore(self, &job)) {
             Ok(()) => {
                 self.shared.log("", Severity::Info, &trf("updm.restored", &[&ops.name(), &info.version]));
-                ops.after_change();
+                self.after_change(c);
             }
-            Err(e) => self.shared.log("", Severity::Bad, &trf("updm.restore_failed", &[&ops.name(), &e])),
+            Err(e) => {
+                self.forgive(c);
+                self.shared.log("", Severity::Bad, &trf("updm.restore_failed", &[&ops.name(), &e]));
+            }
         }
     }
 
@@ -552,6 +673,7 @@ mod tests {
     use super::super::clock::{CHECK_EVERY, FIRST_CHECK};
     use super::super::sources::fake::FakeSources;
     use super::super::component::fake::{components, Calls, FakeOps};
+    use super::super::core_link::fake::RecordingCore;
     use super::super::ours;
     use super::super::Available;
     use std::path::Path;
@@ -559,13 +681,13 @@ mod tests {
     use crate::monitor::Options;
 
     fn manager(dir: &Path) -> Arc<Manager> {
-        with_ops(dir, Components::real(Box::new(|| {})))
+        with_ops(dir, Components::real(Arc::new(RecordingCore::default())))
     }
 
     /// Менеджер с заданными компонентами (обычно подделками `FakeOps`); источники недоступны.
     fn with_ops(dir: &Path, components: Components) -> Arc<Manager> {
         let options = Options { ping: false, ping_host: String::new(), notify: false, tray: false, taskbar: false };
-        let shared = Arc::new(Shared::new(None, options, None, None));
+        let shared = Arc::new(Shared::new(None, options, None));
         Arc::new(Manager::open(dir.to_path_buf(), shared, components, Arc::new(FakeSources::down()), Arc::new(FakeClock::new(1_000))))
     }
 
@@ -672,9 +794,9 @@ mod tests {
     /// Менеджер с подделками источников и часов (в `Clock` — unix-время `at`).
     fn faked(dir: &Path, sources: FakeSources, at: u64) -> (Arc<Manager>, Arc<FakeSources>, Arc<FakeClock>) {
         let options = Options { ping: false, ping_host: String::new(), notify: false, tray: false, taskbar: false };
-        let shared = Arc::new(Shared::new(None, options, None, None));
+        let shared = Arc::new(Shared::new(None, options, None));
         let (sources, clock) = (Arc::new(sources), Arc::new(FakeClock::new(at)));
-        let m = Manager::open(dir.to_path_buf(), shared, Components::real(Box::new(|| {})), sources.clone(), clock.clone());
+        let m = Manager::open(dir.to_path_buf(), shared, Components::real(Arc::new(RecordingCore::default())), sources.clone(), clock.clone());
         (Arc::new(m), sources, clock)
     }
 
@@ -744,7 +866,7 @@ mod tests {
     /// Менеджер с подделками источников и компонентов: движок установлен `3.1.20260814`, программа `0.3.0`.
     fn faked_engine(dir: &Path, sources: FakeSources) -> (Arc<Manager>, Arc<FakeSources>) {
         let options = Options { ping: false, ping_host: String::new(), notify: false, tray: false, taskbar: false };
-        let shared = Arc::new(Shared::new(None, options, None, None));
+        let shared = Arc::new(Shared::new(None, options, None));
         let calls = Calls::default();
         let comps = components(
             FakeOps::new(Component::Native, Some("3.1.0"), "3.1.0", &calls),
@@ -857,7 +979,7 @@ mod tests {
     /// метке через `FakeSources`); движок `3.1.20260814`, программа `0.3.0`.
     fn with_native(dir: &Path, installed: &str, sources: FakeSources) -> (Arc<Manager>, Arc<FakeSources>) {
         let options = Options { ping: false, ping_host: String::new(), notify: false, tray: false, taskbar: false };
-        let shared = Arc::new(Shared::new(None, options, None, None));
+        let shared = Arc::new(Shared::new(None, options, None));
         let calls = Calls::default();
         let comps = components(
             FakeOps::real(Component::Native, Some(installed), &calls),
@@ -972,6 +1094,22 @@ mod tests {
         assert_eq!(lock(&m.busy).as_ref(), Some(&Busy::Backup { what: Component::App, version: "other job".into() }), "чужую занятость не снимает");
         drop(JobDone(&m));
         assert!(m.daily_tick(&mut first), "освободилось — проверка идёт");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Паника шага планировщика вне самой проверки (здесь — часы) — запись в журнал и следующий шаг, а не сбой ядра:
+    /// первая проверка всё равно проходит по расписанию.
+    #[test]
+    fn daily_loop_survives_a_panic_and_still_checks() {
+        let dir = temp("daily-panic");
+        let (m, sources, clock) = faked(&dir, FakeSources::down(), 1_000_000);
+        *clock.panics.lock().unwrap() = 1;
+        let calls = || *sources.latest_calls.lock().unwrap();
+        m.daily_until(&|| calls() >= 1);
+        assert_eq!(calls(), 1);
+        assert!(crate::crash::core_failure().is_none());
+        assert!(logged(&m).iter().any(|(s, t)| *s == Severity::Bad && t.contains("clock edge")), "{:?}", logged(&m));
+        assert!(lock(&m.busy).is_none(), "занятость снята");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1305,6 +1443,156 @@ mod tests {
         let state = |id| data.history.entries().iter().find(|e| e.id == id).map(|e| (e.ok, e.error.clone())).unwrap();
         assert_eq!((state(6), state(7)), ((true, None), (false, Some("boom".to_string()))));
         drop(data);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Движок с настоящим шагом после замены (`ReconnectEngine` в `core`); `dies` — процесс обрывается посреди замены
+    /// файлов (паника вместо возврата), `fails` — замена вернулась с ошибкой.
+    struct EngineFake {
+        core: Arc<RecordingCore>,
+        dies: bool,
+        fails: bool,
+    }
+
+    impl ComponentOps for EngineFake {
+        fn name(&self) -> String {
+            "engine".into()
+        }
+        fn installed(&self) -> Option<String> {
+            Some("3.1".into())
+        }
+        fn found(&self, _f: &Fetched) -> Result<String, String> {
+            Ok("3.2".into())
+        }
+        fn backup_into(&self, _m: &Manager, _version: &str, _dir: &Path) -> Result<(), String> {
+            Ok(())
+        }
+        fn update(&self, m: &Manager, _f: &Fetched, _to: &str, _id: u64) -> Result<(), String> {
+            assert_eq!(owed_on_disk(&m.dir), [Component::Engine], "долг записан до замены файлов");
+            if self.dies {
+                panic!("agent killed while replacing the engine");
+            }
+            if self.fails {
+                return Err("locked".into());
+            }
+            Ok(())
+        }
+        fn restore(&self, _m: &Manager, _job: &RestoreJob) -> Result<(), String> {
+            Ok(())
+        }
+        fn after_change(&self) -> Result<(), String> {
+            self.core.reconnect_engine()
+        }
+        fn owes_after_change(&self) -> bool {
+            true
+        }
+    }
+
+    fn with_engine(dir: &Path, core: &Arc<RecordingCore>, dies: bool, fails: bool) -> Arc<Manager> {
+        let calls = Calls::default();
+        let engine = EngineFake { core: core.clone(), dies, fails };
+        let native = FakeOps::new(Component::Native, Some("1.0"), "1.0", &calls);
+        let app = FakeOps::new(Component::App, Some("0.4.0"), "0.4.0", &calls);
+        with_ops(dir, Components::new(Box::new(native), Box::new(engine), Box::new(app)))
+    }
+
+    fn owed_on_disk(dir: &Path) -> Vec<Component> {
+        load_json(&dir.join(OWED)).unwrap()
+    }
+
+    fn update_engine(m: &Manager) {
+        m.apply_one(Component::Engine, &Fetched { native: Err("off".into()), ours: Err("off".into()) }, "3.2");
+    }
+
+    fn count(m: &Manager, severity: Severity, text: &str) -> usize {
+        logged(m).iter().filter(|(s, t)| *s == severity && t == text).count()
+    }
+
+    /// Агент умер после замены файлов движка, до `ReconnectEngine`: отметка на диске; следующий запуск пишет об этом
+    /// в журнал и на такте планировщика шлёт запрос один раз, затем снимает отметку.
+    #[test]
+    fn agent_killed_after_engine_replace_resends_reconnect_once_on_next_start() {
+        let dir = temp("owed-killed");
+        let first = Arc::new(RecordingCore::default());
+        let m = with_engine(&dir, &first, true, false);
+        let killed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| update_engine(&m)));
+        assert!(killed.is_err());
+        assert!(first.calls().is_empty(), "запрос так и не ушёл");
+        drop(m);
+
+        let core = Arc::new(RecordingCore::default());
+        let m = with_engine(&dir, &core, false, false);
+        assert_eq!(count(&m, Severity::Warn, &trf("updm.after_change_owed", &["engine"])), 1, "{:?}", logged(&m));
+        assert!(core.calls().is_empty(), "при открытии не шлёт: ядро может ещё запускаться");
+        assert!(!m.daily_tick(&mut true), "проверке ещё рано");
+        assert_eq!(core.calls(), ["reconnect engine"], "такт планировщика повторил запрос");
+        assert!(owed_on_disk(&dir).is_empty());
+        assert_eq!(count(&m, Severity::Info, &trf("updm.after_change_resent", &["engine"])), 1);
+        m.settle_owed();
+        assert_eq!(core.calls().len(), 1, "принятый запрос не повторяется");
+        drop(m);
+        let m = with_engine(&dir, &core, false, false);
+        assert!(logged(&m).is_empty(), "долга больше нет: {:?}", logged(&m));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Ядро недоступно: отметка остаётся, повтор на каждом такте, в журнале — одна строка до успеха; идёт работа —
+    /// повтор ждёт её конца.
+    #[test]
+    fn unreachable_core_keeps_the_record_retries_and_logs_once() {
+        let dir = temp("owed-down");
+        std::fs::create_dir_all(&dir).unwrap();
+        save_json(&dir.join(OWED), &[Component::Engine]).unwrap();
+        let core = Arc::new(RecordingCore::default());
+        core.refuse_reconnect.store(true, std::sync::atomic::Ordering::SeqCst);
+        let m = with_engine(&dir, &core, false, false);
+        for _ in 0..3 {
+            m.settle_owed();
+        }
+        assert_eq!(core.calls().len(), 3);
+        assert_eq!(owed_on_disk(&dir), [Component::Engine], "не принято — отметка остаётся");
+        let retry = trf("updm.after_change_retry", &["engine", "core: pipe unavailable"]);
+        assert_eq!(count(&m, Severity::Warn, &retry), 1, "{:?}", logged(&m));
+
+        core.refuse_reconnect.store(false, std::sync::atomic::Ordering::SeqCst);
+        assert!(m.begin(Busy::Checking));
+        m.settle_owed();
+        assert_eq!(core.calls().len(), 3, "идёт работа — повтор ждёт");
+        drop(JobDone(&m));
+        m.settle_owed();
+        assert_eq!(core.calls().len(), 4);
+        assert!(owed_on_disk(&dir).is_empty());
+        m.settle_owed();
+        assert_eq!(core.calls().len(), 4);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Обычная работа: удачная замена с принятым запросом и неудачная замена долга не оставляют; запрос после удачной
+    /// замены не дошёл — одна строка `after_change_failed`, отметка остаётся до повтора без новых строк.
+    #[test]
+    fn engine_update_clears_its_record_only_after_the_core_accepted() {
+        let dir = temp("owed-job");
+        let core = Arc::new(RecordingCore::default());
+        update_engine(&with_engine(&dir, &core, false, true));
+        assert!(owed_on_disk(&dir).is_empty() && core.calls().is_empty(), "неудачная замена — шаг не нужен");
+        update_engine(&with_engine(&dir, &core, false, false));
+        assert!(owed_on_disk(&dir).is_empty());
+        assert_eq!(core.calls(), ["reconnect engine"]);
+
+        core.refuse_reconnect.store(true, std::sync::atomic::Ordering::SeqCst);
+        let m = with_engine(&dir, &core, false, false);
+        update_engine(&m);
+        assert_eq!(owed_on_disk(&dir), [Component::Engine]);
+        // Конец работы (занятость снята) — дальше такты планировщика.
+        drop(JobDone(&m));
+        m.settle_owed();
+        assert_eq!(core.calls().len(), 3, "повтор был");
+        let failed = trf("updm.after_change_failed", &["engine", "core: pipe unavailable"]);
+        assert_eq!(count(&m, Severity::Bad, &failed), 1);
+        assert!(!logged(&m).iter().any(|(s, _)| *s == Severity::Warn), "повтор не пишет второй раз: {:?}", logged(&m));
+        core.refuse_reconnect.store(false, std::sync::atomic::Ordering::SeqCst);
+        m.settle_owed();
+        assert!(owed_on_disk(&dir).is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

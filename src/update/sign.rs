@@ -298,6 +298,9 @@ mod tests {
     const SIG_OTHER_NS: &str = include_str!("../../tests/fixtures/update/manifest.other-namespace.sig");
     const TEST_KEY: &str = include_str!("../../tests/fixtures/update/test_key.pub");
     const OTHER_KEY: &str = include_str!("../../tests/fixtures/update/other_key.pub");
+    // Настоящий манифест релиза v0.4.0 и его подпись ключом UPDATE_KEY, байт в байт как на странице релиза.
+    const RELEASE_MANIFEST: &[u8] = include_bytes!("../../tests/fixtures/update/release-0.4.0.update-manifest.json");
+    const RELEASE_SIG: &str = include_str!("../../tests/fixtures/update/release-0.4.0.update-manifest.json.sig");
 
     #[test]
     fn valid_signature() {
@@ -307,6 +310,21 @@ mod tests {
         assert_eq!(m.app.name, "awg-ui.exe");
         assert_eq!(m.engine.version, "3.1.20260814");
         assert_eq!(m.engine.files.len(), 2);
+    }
+
+    /// Обновление зависимостей подписи (ed25519-dalek, sha2) не должно перестать принимать уже выпущенные релизы.
+    #[test]
+    fn real_release_manifest_verifies_with_update_key() {
+        assert_eq!(verify(RELEASE_MANIFEST, RELEASE_SIG, UPDATE_KEY), Ok(()));
+        let m = manifest(RELEASE_MANIFEST, RELEASE_SIG).unwrap();
+        assert_eq!(m.version, "0.4.0");
+        assert_eq!(m.engine.version, "3.1.20260814");
+        // Тот же манифест с одним изменённым байтом подпись уже не проходит.
+        let mut bad = RELEASE_MANIFEST.to_vec();
+        let i = bad.iter().position(|&c| c == b'4').unwrap();
+        bad[i] = b'5';
+        assert!(verify(&bad, RELEASE_SIG, UPDATE_KEY).is_err());
+        assert!(verify(RELEASE_MANIFEST, RELEASE_SIG, TEST_KEY).is_err(), "подпись релиза не принимается чужим ключом");
     }
 
     #[test]

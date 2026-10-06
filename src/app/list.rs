@@ -111,9 +111,14 @@ pub(super) struct List<'a> {
     pub(super) keys: Keys,
 }
 
-/// Метка в памяти egui: выделение сменили клавишами — прокрутить к нему.
+/// Метка в памяти egui: выделение сменили клавишами или снаружи (щелчок по уведомлению) — прокрутить к нему.
 fn scroll_flag() -> egui::Id {
     egui::Id::new("tunnel-list-scroll")
+}
+
+/// Прокрутить список к выделенной строке на ближайшем кадре.
+pub(super) fn reveal_selection(ctx: &egui::Context) {
+    ctx.data_mut(|d| d.insert_temp(scroll_flag(), true));
 }
 
 pub(super) fn tunnel_list(ui: &mut Ui, s: &mut Settings, search: &mut String, l: &List, actions: &mut Vec<Action>) {
@@ -215,6 +220,63 @@ fn activation_plan(level: Level) -> Option<Plan> {
     (level == Level::Off).then_some(Plan::Connect)
 }
 
+/// Главное действие с туннелем — одно решение для кнопки карточки, меню строки таблицы и меню трея. Карточка
+/// раньше решала сама, по живому интерфейсу: туннель, который ядро переподключает (интерфейса нет, ядро повторяет),
+/// там был «Подключить», а в меню — «Отключить».
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Primary {
+    /// Отключён: «Подключить».
+    Connect,
+    /// Подключён или его держит и переподключает ядро: «Отключить» (останавливает и повторы).
+    Disconnect,
+    /// Уже переключается: «Отключить», но недоступно.
+    Busy,
+    /// Нет связи с ядром — состояние неизвестно: не показан подключённым, действие недоступно (подсказка — почему).
+    Unknown,
+}
+
+impl Primary {
+    /// `core_lost` — нет связи с ядром (`Snapshot::core_lost`); уровень тогда «неизвестно», а не состояние туннеля.
+    pub(super) fn of(level: Level, core_lost: bool) -> Primary {
+        if core_lost {
+            return Primary::Unknown;
+        }
+        match level {
+            Level::Off => Primary::Connect,
+            Level::Busy => Primary::Busy,
+            Level::Ok | Level::Warn | Level::Bad => Primary::Disconnect,
+        }
+    }
+
+    /// Запрос ядру; `None` — действие сейчас недоступно (пункт и кнопка серые).
+    pub(super) fn plan(self) -> Option<Plan> {
+        match self {
+            Primary::Connect => Some(Plan::Connect),
+            Primary::Disconnect => Some(Plan::Disconnect),
+            Primary::Busy | Primary::Unknown => None,
+        }
+    }
+
+    /// Туннель показан включённым: отметка в трее, «Отключить» на кнопке и в меню, счёт активных у группы.
+    pub(super) fn is_on(self) -> bool {
+        matches!(self, Primary::Disconnect | Primary::Busy)
+    }
+
+    /// Подсказка к недоступному действию, если серость надо объяснить.
+    pub(super) fn hint(self) -> Option<&'static str> {
+        (self == Primary::Unknown).then_some("health.core_lost")
+    }
+
+    /// Ключ подписи кнопки и пункта меню.
+    pub(super) fn label(self) -> &'static str {
+        if self.is_on() {
+            "act.disconnect"
+        } else {
+            "act.connect"
+        }
+    }
+}
+
 /// Клавиши на выделенной строке: ↑/↓ — соседняя строка, ←/→ — свернуть/раскрыть или к родителю,
 /// Enter — подключить туннель (отключение — только кнопкой или меню) или свернуть группу, F2 — переименовать группу, Delete — удалить группу.
 fn list_keys(ui: &Ui, rows: &[Row], s: &Settings, l: &List, actions: &mut Vec<Action>) {
@@ -237,7 +299,7 @@ fn list_keys(ui: &Ui, rows: &[Row], s: &Settings, l: &List, actions: &mut Vec<Ac
             Row::Ungrouped { .. } => Action::SelectGroup(UNGROUPED.to_string()),
             Row::Tunnel { name, .. } => Action::Select(name.clone()),
         });
-        ui.ctx().data_mut(|d| d.insert_temp(scroll_flag(), true));
+        reveal_selection(ui.ctx());
     };
     if up || down {
         let next = match current {
@@ -336,6 +398,44 @@ mod tests {
         for running in [Level::Ok, Level::Warn, Level::Bad, Level::Busy] {
             assert_eq!(activation_plan(running), None, "{running:?}");
         }
+    }
+
+    #[test]
+    fn toggle_connects_off_disconnects_the_rest_and_waits_while_busy() {
+        assert_eq!(Primary::of(Level::Off, false).plan(), Some(Plan::Connect));
+        for on in [Level::Ok, Level::Warn, Level::Bad] {
+            assert_eq!(Primary::of(on, false).plan(), Some(Plan::Disconnect), "{on:?}: подключён или переподключается");
+        }
+        assert_eq!(Primary::of(Level::Busy, false).plan(), None);
+        assert_eq!(Primary::of(Level::Busy, false).label(), "act.disconnect");
+    }
+
+    /// Ядро держит туннель и повторяет подключение (живого интерфейса нет): главное действие — «Отключить»,
+    /// оно останавливает повторы. Карточка раньше предлагала здесь «Подключить».
+    #[test]
+    fn tunnel_the_core_retries_offers_disconnect() {
+        use crate::daemon::proto::RetryState;
+        let mut snap = crate::monitor::Snapshot { tunnels: ["a".to_string()].into_iter().collect(), polls: 1, ..Default::default() };
+        for slow in [false, true] {
+            snap.retries.insert("a".into(), RetryState { attempt: 3, next_in_s: 5, last_error: "timeout".into(), slow });
+            let primary = Primary::of(snap.health("a", None, None).level, snap.core_lost);
+            assert_eq!((primary, primary.label(), primary.plan()), (Primary::Disconnect, "act.disconnect", Some(Plan::Disconnect)), "slow={slow}");
+            assert!(primary.is_on(), "в трее отмечен");
+        }
+    }
+
+    /// Нет связи с ядром: состояние неизвестно — ни подключённым, ни отключённым туннель не показан, действие
+    /// недоступно и объяснено. Раньше такой туннель выглядел подключённым и предлагал «Отключить».
+    #[test]
+    fn unknown_state_does_not_look_connected() {
+        let mut snap = crate::monitor::Snapshot { tunnels: ["a".to_string()].into_iter().collect(), polls: 1, core_lost: true, ..Default::default() };
+        let retry = crate::daemon::proto::RetryState { attempt: 1, next_in_s: 5, last_error: String::new(), slow: false };
+        snap.retries.insert("a".into(), retry);
+        let primary = Primary::of(snap.health("a", None, None).level, snap.core_lost);
+        assert_eq!(primary, Primary::Unknown);
+        assert!(!primary.is_on());
+        assert_eq!((primary.plan(), primary.hint()), (None, Some("health.core_lost")));
+        assert_eq!(Primary::of(Level::Off, false).hint(), None);
     }
 
 

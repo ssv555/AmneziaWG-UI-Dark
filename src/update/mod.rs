@@ -21,6 +21,8 @@ mod backup;
 mod busy;
 /// Что у каждого компонента своё: версии, копия, установка, возврат (стратегия для `Manager`).
 mod component;
+/// Что обновлениям нужно от ядра над туннелями (аренда на время MSI, переподключение после замены движка).
+pub mod core_link;
 /// Часы планировщика ежедневной проверки.
 mod clock;
 mod history;
@@ -50,7 +52,7 @@ pub enum Component {
 }
 
 /// Строка компонента в окне.
-#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default)]
 pub struct ComponentState {
     pub component: Option<Component>,
     /// Установленная версия; `None` — не установлен (AmneziaWG) или неизвестна.
@@ -144,7 +146,7 @@ pub enum Action {
 }
 
 /// Строка истории: резервная копия, обновление или возврат.
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct HistoryEntry {
     pub id: u64,
     pub at: u64,
@@ -164,7 +166,7 @@ pub struct HistoryEntry {
 }
 
 /// Всё, что показывает окно «Обновления и откаты».
-#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default)]
 pub struct UpdatesState {
     pub components: Vec<ComponentState>,
     /// Новые сверху.
@@ -180,7 +182,7 @@ pub struct UpdatesState {
 }
 
 /// Команды окна ядру.
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub enum UpdateOp {
     /// Текущее состояние, без сети.
     State,
@@ -217,12 +219,34 @@ pub fn restore_args(id: u64) -> String {
     format!("{CLI_FLAG} restore {id}")
 }
 
+/// Возврат компонента к версии из копии — только по запросу с правами администратора (подтверждение UAC): иначе
+/// любая программа учётной записи владельца молча откатила бы компонент к старой версии с известными дырами.
+/// Правило — для любого возврата, а не только к более старой версии: версии сравнимы не всегда (AmneziaWG может
+/// быть не установлен, номер сборки — неизвестен), а простое правило нечем обойти. Одно правило для каждого, кто
+/// обслуживает `Updates` (ядро, агент).
+pub fn updates_allowed(op: &UpdateOp, elevated: bool) -> Result<(), String> {
+    match op {
+        UpdateOp::Restore(_) if !elevated => Err(crate::i18n::tr("core.restore_needs_admin")),
+        _ => Ok(()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn args(line: &str) -> Vec<String> {
         line.split_whitespace().map(String::from).collect()
+    }
+
+    #[test]
+    fn restore_needs_elevated_caller() {
+        use crate::i18n::tr;
+        assert_eq!(updates_allowed(&UpdateOp::Restore(3), false), Err(tr("core.restore_needs_admin")), "без UAC — отказ");
+        assert_eq!(updates_allowed(&UpdateOp::Restore(3), true), Ok(()));
+        for op in [UpdateOp::State, UpdateOp::Check, UpdateOp::Apply(vec![])] {
+            assert_eq!(updates_allowed(&op, false), Ok(()), "{op:?} — без прав администратора, как раньше");
+        }
     }
 
     #[test]

@@ -15,7 +15,7 @@ jobs:
       run:
         shell: pwsh
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           # Job has contents: write; keep the token out of .git/config so build scripts cannot read it.
           persist-credentials: false

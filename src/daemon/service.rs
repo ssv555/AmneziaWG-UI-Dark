@@ -60,6 +60,13 @@ unsafe extern "system" fn service_main(_argc: u32, _argv: *mut *mut u16) {
         // Новое ядро отвечает — отодвинутые обновлением файлы (exe, DLL) прошлой версии больше не нужны. Удаляются
         // только теперь: если новая версия не поднимется, прежняя остаётся рядом. Занятые ещё кем-то — до следующего раза.
         super::install::remove_old_copies(&crate::engine::install_dir());
+    }, |tail| {
+        // События последних мгновений ядра, которых агент не успел забрать (он гибнет вместе со службой), — прямо в
+        // файл, как и причина сбоя ниже: служба уже не работает, живых путей здесь нет.
+        let file = super::events_file();
+        if let Err(err) = crate::events::append_events(&file, &tail) {
+            eprintln!("service: cannot write {} ({} events): {err}", file.display(), tail.len());
+        }
     });
     if let Err(e) = &result {
         // Причина — в журнал событий ядра, код — диспетчеру.

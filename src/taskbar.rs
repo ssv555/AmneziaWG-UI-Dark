@@ -10,13 +10,13 @@ use std::cell::{Cell, RefCell};
 use std::mem::ManuallyDrop;
 use std::path::PathBuf;
 
-use windows::core::{HSTRING, PCWSTR, PROPVARIANT};
+use windows::core::{HSTRING, PCWSTR};
 use windows::Win32::Foundation::{HWND, RPC_E_CHANGED_MODE};
 use windows::Win32::Storage::EnhancedStorage::{
     PKEY_AppUserModel_ID, PKEY_AppUserModel_RelaunchCommand, PKEY_AppUserModel_RelaunchDisplayNameResource,
     PKEY_AppUserModel_RelaunchIconResource,
 };
-use windows::Win32::System::Com::StructuredStorage::{PropVariantChangeType, PVCHF_DEFAULT};
+use windows::Win32::System::Com::StructuredStorage::{PropVariantChangeType, PROPVARIANT, PVCHF_DEFAULT};
 use windows::Win32::System::Com::{CoCreateInstance, CoInitializeEx, CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED};
 use windows::Win32::System::Variant::VT_LPWSTR;
 use windows::Win32::UI::Shell::PropertiesSystem::{IPropertyStore, SHGetPropertyStoreForWindow};
@@ -254,7 +254,7 @@ mod tests {
     #[test]
     fn string_value_is_lpwstr() {
         let v = string_value("AmneziaWG.UIDark.Engine").unwrap();
-        assert_eq!(unsafe { v.as_raw().Anonymous.Anonymous.vt }, VT_LPWSTR.0);
+        assert_eq!(v.vt(), VT_LPWSTR);
         assert_eq!(v.to_string(), "AmneziaWG.UIDark.Engine");
     }
 }

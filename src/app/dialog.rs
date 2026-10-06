@@ -18,7 +18,7 @@ pub(super) fn dialog_window<'a>(ctx: &egui::Context, title: impl Into<egui::Widg
         .collapsible(false)
         .resizable(false)
         .pivot(Align2::CENTER_CENTER)
-        .default_pos(ctx.screen_rect().center())
+        .default_pos(ctx.content_rect().center())
 }
 
 /// Esc для немодального окна `id`: забирается из ввода, только если это окно верхнее (его последним щёлкнули
@@ -103,7 +103,7 @@ fn take_enter(events: &mut Vec<egui::Event>) -> bool {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
 
     fn key(key: egui::Key, pressed: bool, repeat: bool, modifiers: egui::Modifiers) -> egui::Event {
@@ -182,7 +182,7 @@ mod tests {
         line.match_indices(needle).any(|(i, _)| !line[..i].ends_with(|c: char| c.is_alphanumeric() || c == '_'))
     }
 
-    fn collect_rs(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+    pub(in crate::app) fn collect_rs(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
         for entry in std::fs::read_dir(dir).unwrap_or_else(|e| panic!("{}: {e}", dir.display())) {
             let path = entry.unwrap_or_else(|e| panic!("{}: {e}", dir.display())).path();
             if path.is_dir() {

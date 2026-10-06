@@ -11,8 +11,9 @@ use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use std::ptr::{null, null_mut};
 use std::time::{Duration, Instant};
 
+use windows_sys::core::BOOL;
 use windows_sys::Win32::Foundation::{
-    GetLastError, LocalFree, BOOL, ERROR_ACCESS_DENIED, ERROR_BROKEN_PIPE, ERROR_IO_PENDING, ERROR_PIPE_BUSY, ERROR_PIPE_CONNECTED,
+    GetLastError, LocalFree, ERROR_ACCESS_DENIED, ERROR_BROKEN_PIPE, ERROR_IO_PENDING, ERROR_PIPE_BUSY, ERROR_PIPE_CONNECTED,
     GENERIC_READ, GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE, WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
 use windows_sys::Win32::Security::Authorization::{ConvertStringSecurityDescriptorToSecurityDescriptorW, GetSecurityInfo, SDDL_REVISION_1, SE_KERNEL_OBJECT};
@@ -34,6 +35,7 @@ use windows_sys::Win32::System::IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED
 use super::proto::{Request, Response};
 use crate::win::wide;
 
+/// Имя канала ядра. Второй процесс (агент) держит свой канал под другим именем: `Server::new` и `call_to` принимают имя.
 pub const NAME: &str = r"\\.\pipe\AmneziaWG-UI-Dark-Core";
 const BUFFER: u32 = 1 << 16;
 /// Предел запроса к ядру (импорт сотни туннелей — сотни килобайт).
@@ -159,10 +161,19 @@ pub struct ServerConn {
 
 impl ServerConn {
     pub fn read(&mut self) -> Result<Request, String> {
-        read_json(&mut self.pipe.until(self.read_by), MAX_REQUEST)
+        self.read_as()
     }
 
     pub fn reply(&mut self, r: &Response) -> Result<(), String> {
+        self.reply_with(r)
+    }
+
+    /// То же с чужим протоколом: у агента свои `AgentRequest`/`AgentResponse`, а срок, предел и разбор строки общие.
+    pub fn read_as<T: serde::de::DeserializeOwned>(&mut self) -> Result<T, String> {
+        read_json(&mut self.pipe.until(self.read_by), MAX_REQUEST)
+    }
+
+    pub fn reply_with<T: serde::Serialize>(&mut self, r: &T) -> Result<(), String> {
         write_json(&mut self.pipe.until(Instant::now() + SERVER_IO_TIMEOUT), r)
     }
 
@@ -197,8 +208,24 @@ fn pipe_sddl(owner_sid: &str) -> (String, Option<String>) {
     }
 }
 
+/// Владелец канала, которому верят обе стороны: служба (SYSTEM).
+#[cfg(not(test))]
+fn trusted_owner() -> &'static str {
+    crate::win::LOCAL_SYSTEM_SID
+}
+
+/// Тестовая сборка работает от учётной записи разработчика и создать канал с владельцем SYSTEM не может: у неё
+/// владелец канала — она сама. Так ядро и поддельный агент проверяются настоящими каналами под тестовыми именами
+/// (`server::tests`, тест изоляции); в сборку программы это не попадает.
+#[cfg(test)]
+fn trusted_owner() -> &'static str {
+    static OWNER: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    OWNER.get_or_init(|| crate::win::current_user_sid().unwrap_or_else(|e| panic!("test pipe owner SID: {e}")))
+}
+
 /// Сервер: каждый вызов ждёт следующего клиента.
 pub struct Server {
+    name: String,
     sddl: String,
     first: bool,
 }
@@ -206,9 +233,11 @@ pub struct Server {
 impl Server {
     /// Канал владельца окна. SID берётся из ini и попадает прямо в SDDL, поэтому негодный (не `is_sid`) не вставляется:
     /// канал остаётся только у администраторов и SYSTEM, а отвергнутая строка возвращается для журнала ядра.
-    pub fn new(owner_sid: &str) -> (Server, Option<String>) {
+    pub fn new(name: &str, owner_sid: &str) -> (Server, Option<String>) {
         let (sddl, rejected) = pipe_sddl(owner_sid);
-        (Server { sddl, first: true }, rejected)
+        #[cfg(test)]
+        let sddl = sddl.replacen("O:SY", &format!("O:{}", trusted_owner()), 1);
+        (Server { name: name.to_string(), sddl, first: true }, rejected)
     }
 
     pub fn accept(&mut self) -> Result<ServerConn, AcceptError> {
@@ -220,7 +249,7 @@ impl Server {
             let sa = SECURITY_ATTRIBUTES { nLength: size_of::<SECURITY_ATTRIBUTES>() as u32, lpSecurityDescriptor: sd, bInheritHandle: 0 };
             let open = PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED | if self.first { FILE_FLAG_FIRST_PIPE_INSTANCE } else { 0 };
             let mode = PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS;
-            let h = CreateNamedPipeW(wide(NAME).as_ptr(), open, mode, PIPE_UNLIMITED_INSTANCES, BUFFER, BUFFER, 0, &sa);
+            let h = CreateNamedPipeW(wide(&self.name).as_ptr(), open, mode, PIPE_UNLIMITED_INSTANCES, BUFFER, BUFFER, 0, &sa);
             let created = std::io::Error::last_os_error();
             LocalFree(sd);
             if h == INVALID_HANDLE_VALUE {
@@ -232,7 +261,7 @@ impl Server {
             let pipe = Pipe::new(h).map_err(AcceptError::other)?;
             // Все экземпляры канала закрылись, и имя успел занять кто-то другой — наш экземпляр встал бы в его
             // канал с его правами. Не служим такому каналу и начинаем заново с первого экземпляра.
-            if owner_of(h).as_deref() != Some(crate::win::LOCAL_SYSTEM_SID) {
+            if owner_of(h).as_deref() != Some(trusted_owner()) {
                 self.first = true;
                 return Err(AcceptError { text: crate::i18n::tr("core.pipe_taken"), taken: true });
             }
@@ -311,15 +340,42 @@ unsafe fn owner_of(h: HANDLE) -> Option<String> {
     sid
 }
 
-/// Один запрос к ядру. Ядро не запущено, на том конце не наше ядро или оно не ответило в срок — ошибка.
-pub fn call(req: &Request) -> Result<Response, String> {
-    let pipe = connect()?;
-    write_json(&mut pipe.until(Instant::now() + CLIENT_SEND_TIMEOUT), req)?;
-    read_json(&mut pipe.until(Instant::now() + CLIENT_REPLY_TIMEOUT), MAX_RESPONSE)
+/// Сроки одного запроса: сколько ждать, пока сервер примет запрос, и сколько — его ответа.
+#[derive(Clone, Copy, Debug)]
+pub struct Timeouts {
+    pub send: Duration,
+    pub reply: Duration,
 }
 
-fn connect() -> Result<Pipe, String> {
-    let name = wide(NAME);
+impl Timeouts {
+    /// Для канала ядра: ответ ждём дольше самого долгого законного запроса.
+    pub const CORE: Timeouts = Timeouts { send: CLIENT_SEND_TIMEOUT, reply: CLIENT_REPLY_TIMEOUT };
+
+    /// Обычный срок отправки и свой срок ответа (внутренние запросы ядру ждут ответа коротко).
+    pub const fn with_reply(reply: Duration) -> Timeouts {
+        Timeouts { send: CLIENT_SEND_TIMEOUT, reply }
+    }
+}
+
+/// Один запрос к ядру. Ядро не запущено, на том конце не наше ядро или оно не ответило в срок — ошибка.
+pub fn call(req: &Request) -> Result<Response, String> {
+    call_to(NAME, req, Timeouts::CORE)
+}
+
+/// Один запрос к каналу с заданным именем и сроками (канал ядра — `NAME`, `Timeouts::CORE`).
+pub fn call_to(name: &str, req: &Request, timeouts: Timeouts) -> Result<Response, String> {
+    call_with(name, req, timeouts)
+}
+
+/// То же для канала со своими типами запроса и ответа (канал агента — `agent::proto`).
+pub fn call_with<Q: serde::Serialize, R: serde::de::DeserializeOwned>(name: &str, req: &Q, timeouts: Timeouts) -> Result<R, String> {
+    let pipe = connect(name)?;
+    write_json(&mut pipe.until(Instant::now() + timeouts.send), req)?;
+    read_json(&mut pipe.until(Instant::now() + timeouts.reply), MAX_RESPONSE)
+}
+
+fn connect(name: &str) -> Result<Pipe, String> {
+    let name = wide(name);
     for _ in 0..20 {
         unsafe {
             // Уровень «идентификация»: ядро узнаёт, кто мы, но действовать от нашего имени не может.
@@ -329,7 +385,7 @@ fn connect() -> Result<Pipe, String> {
                 let pipe = Pipe::new(h)?;
                 // Владелец канала — SYSTEM: его создала служба, а не подставная программа пользователя.
                 let owner = owner_of(h);
-                if owner.as_deref() != Some(crate::win::LOCAL_SYSTEM_SID) {
+                if owner.as_deref() != Some(trusted_owner()) {
                     return Err(crate::i18n::trf("core.foreign", &[owner.as_deref().unwrap_or("?")]));
                 }
                 return Ok(pipe);
@@ -393,6 +449,15 @@ mod tests {
             assert!(connected.is_ok() || connected.as_ref().err().and_then(|e| e.raw_os_error()) == Some(ERROR_PIPE_CONNECTED as i32));
             (server, Pipe::new(c).unwrap())
         }
+    }
+
+    #[test]
+    fn call_to_a_missing_pipe_fails_fast() {
+        let name = format!(r"\\.\pipe\awg-ui-test-missing-{}", std::process::id());
+        let started = Instant::now();
+        let e = call_to(&name, &Request::Hello, Timeouts { send: Duration::from_secs(1), reply: Duration::from_secs(1) }).unwrap_err();
+        assert!(started.elapsed() < Duration::from_secs(5), "{:?}", started.elapsed());
+        assert_eq!(e, crate::i18n::trf("core.unavailable", &[&std::io::Error::from_raw_os_error(2).to_string()]), "нет канала — «ядро недоступно»");
     }
 
     #[test]

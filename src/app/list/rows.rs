@@ -5,7 +5,7 @@ use std::sync::Arc;
 use eframe::egui::{self, Align2, Color32, FontId, Pos2, Rect, RichText, Sense, Stroke, Ui, Vec2};
 
 use crate::app::theme::{level_color, BLUE, NUM_FONT, RED};
-use crate::app::{Action, Confirm, Dialog};
+use crate::app::{menu, Action, Confirm, Dialog};
 use crate::daemon::proto::Plan;
 use crate::groups::{self, Agg, Verdict, UNGROUPED};
 use crate::health::{Health, Level};
@@ -13,7 +13,13 @@ use crate::i18n::{tr, trf};
 use crate::settings::{Mode, Settings, SortKey};
 use crate::stats::{self, TunnelStats};
 
-use super::{activation_plan, cell_value, cells, scroll_flag, Drag, List, INDENT, ROW_H};
+use super::{activation_plan, cell_value, cells, scroll_flag, Drag, List, Primary, INDENT, ROW_H};
+
+/// Строка — цель Shift+F10 и клавиши меню: в таблице клавиши — у выделенной строки (как стрелки и Enter), если таблица
+/// их сейчас принимает и фокус egui не стоит на другом элементе (значение в карточке, строка журнала).
+fn keyboard_target(ui: &Ui, l: &List, selected: bool, resp: &egui::Response) -> bool {
+    selected && l.keys.list && ui.memory(|m| m.focused().is_none_or(|f| f == resp.id))
+}
 
 /// Подсветка цели под перетаскиваемым и сам перенос при отпускании. `target` — группа (`None` — верхний
 /// уровень / «Без группы»). Недопустимое (группа в своего потомка, занятое имя) — красная рамка и запрещающий курсор.
@@ -84,7 +90,7 @@ fn triangle_right(painter: &egui::Painter, c: Pos2, r: f32, color: Color32) {
 fn truncated(ui: &Ui, text: &str, font: FontId, color: Color32, width: f32) -> Arc<egui::Galley> {
     let mut job = egui::text::LayoutJob::single_section(text.to_string(), egui::TextFormat::simple(font, color));
     job.wrap = egui::text::TextWrapping::truncate_at_width(width.max(10.0));
-    ui.fonts(|f| f.layout_job(job))
+    ui.painter().layout_job(job)
 }
 
 /// Строка группы (или «Без группы») в дереве.
@@ -142,7 +148,7 @@ pub(super) fn group_row(ui: &mut Ui, g: &GroupLine, cols: &[(SortKey, &str, f32)
     let mut agg = Agg::default();
     for t in g.members {
         let st = l.stats.get(t).cloned().unwrap_or_default();
-        let active = l.healths.get(t).is_some_and(|h| h.level != Level::Off);
+        let active = l.healths.get(t).is_some_and(|h| Primary::of(h.level, l.snap.core_lost).is_on());
         agg.add(active, st.rx, st.tx, st.peak_rx, stats::share(l.stats, t));
     }
     let shown = if real { groups::leaf(g.key).to_string() } else { tr("app.ungrouped") };
@@ -174,36 +180,36 @@ pub(super) fn group_row(ui: &mut Ui, g: &GroupLine, cols: &[(SortKey, &str, f32)
         return;
     }
     let path = g.key;
-    resp.context_menu(|ui| {
+    menu::context_menu(&resp, keyboard_target(ui, l, g.selected, &resp), |ui| {
         if ui.button(tr("grp.new_sub")).clicked() {
             actions.push(Action::Open(Dialog::NewGroup { parent: Some(path.to_string()), name: String::new(), assign: None }));
-            ui.close_menu();
+            ui.close();
         }
         if ui.add(egui::Button::new(tr("grp.rename")).shortcut_text("F2")).clicked() {
             actions.push(Action::Open(Dialog::Rename { old: path.to_string(), name: groups::leaf(path).to_string() }));
-            ui.close_menu();
+            ui.close();
         }
         ui.separator();
         if ui.add_enabled(s.book.can_move(path, -1), egui::Button::new(tr("grp.up"))).clicked() {
             actions.push(Action::MoveGroup(path.to_string(), -1));
-            ui.close_menu();
+            ui.close();
         }
         if ui.add_enabled(s.book.can_move(path, 1), egui::Button::new(tr("grp.down"))).clicked() {
             actions.push(Action::MoveGroup(path.to_string(), 1));
-            ui.close_menu();
+            ui.close();
         }
         if g.depth > 0 {
             let verdict = s.book.check_reparent(path, None);
             let top = ui.add_enabled(verdict == Verdict::Valid, egui::Button::new(tr("grp.to_top")));
             if top.on_disabled_hover_text(tr("grp.to_top_taken")).clicked() {
                 actions.push(Action::Reparent(path.to_string(), None));
-                ui.close_menu();
+                ui.close();
             }
         }
         ui.separator();
         if ui.add(egui::Button::new(tr("grp.delete")).shortcut_text("Del")).clicked() {
             actions.push(Action::Confirm(Confirm::DeleteGroup(path.to_string())));
-            ui.close_menu();
+            ui.close();
         }
     });
 }
@@ -227,7 +233,7 @@ fn group_menu(ui: &mut Ui, s: &Settings, of: Option<&str>, tunnel: &str, actions
         }
         if assign {
             actions.push(Action::Assign(tunnel.to_string(), Some(g.clone())));
-            ui.close_menu();
+            ui.close();
         }
     }
 }
@@ -283,27 +289,33 @@ pub(super) fn tunnel_row(
     if resp.clicked() {
         actions.push(Action::Select(name.clone()));
     }
-    let running = h.level != Level::Off;
+    let primary = Primary::of(h.level, l.snap.core_lost);
+    let running = primary.is_on();
     let busy = h.level == Level::Busy;
-    let plan = if running { Plan::Disconnect } else { Plan::Connect };
     if let Some(plan) = activation_plan(h.level).filter(|_| resp.double_clicked()) {
         actions.push(Action::Switch(name.clone(), plan));
     }
-    resp.context_menu(|ui| {
-        let main = egui::Button::new(tr(if running { "act.disconnect" } else { "act.connect" }));
-        let main = if running { main } else { main.shortcut_text("Enter") };
-        if ui.add_enabled(!busy, main).clicked() {
+    menu::context_menu(&resp, keyboard_target(ui, l, selected, &resp), |ui| {
+        let main = egui::Button::new(tr(primary.label()));
+        let main = if primary == Primary::Connect { main.shortcut_text("Enter") } else { main };
+        let toggle = primary.plan();
+        let item = ui.add_enabled(toggle.is_some(), main);
+        let item = match primary.hint() {
+            Some(hint) => item.on_disabled_hover_text(tr(hint)),
+            None => item,
+        };
+        if let (true, Some(plan)) = (item.clicked(), toggle) {
             actions.push(Action::Switch(name.clone(), plan));
-            ui.close_menu();
+            ui.close();
         }
         if running && ui.add_enabled(!busy, egui::Button::new(tr("act.reconnect"))).clicked() {
             actions.push(Action::Switch(name.clone(), Plan::Reconnect));
-            ui.close_menu();
+            ui.close();
         }
         // Ядро не подключило туннель за 10 минут и пробует раз в 10 минут — повторить сразу, расписание с начала.
         if l.snap.retries.get(name).is_some_and(|r| r.slow) && ui.add_enabled(!busy, egui::Button::new(tr("act.retry"))).clicked() {
             actions.push(Action::Retry(name.clone()));
-            ui.close_menu();
+            ui.close();
         }
         ui.menu_button(tr("act.to_group"), |ui| {
             group_menu(ui, s, None, name, actions);
@@ -313,40 +325,40 @@ pub(super) fn tunnel_row(
             let loose = s.book.group_of(name).is_none();
             if ui.add(egui::Button::new(tr("app.ungrouped")).selected(loose)).clicked() {
                 actions.push(Action::Assign(name.clone(), None));
-                ui.close_menu();
+                ui.close();
             }
             if ui.button(tr("act.new_group")).clicked() {
                 actions.push(Action::Open(Dialog::NewGroup { parent: None, name: String::new(), assign: Some(name.clone()) }));
-                ui.close_menu();
+                ui.close();
             }
         });
         if s.mode() == Mode::Engine {
             // Встроенный движок: туннели в своём хранилище, правка — во встроенном редакторе.
             if ui.button(tr("eng.edit")).clicked() {
                 actions.push(Action::EngineEdit(name.clone()));
-                ui.close_menu();
+                ui.close();
             }
             if ui.add_enabled(!running, egui::Button::new(tr("eng.rename"))).on_disabled_hover_text(tr("eng.rename_hint")).clicked() {
                 actions.push(Action::EngineRename(name.clone()));
-                ui.close_menu();
+                ui.close();
             }
             ui.separator();
             let delete = egui::Button::new(RichText::new(tr("del.tunnel_menu")).color(RED)).shortcut_text("Del");
             if ui.add(delete).clicked() {
                 actions.push(Action::Confirm(Confirm::DeleteTunnel(name.clone())));
-                ui.close_menu();
+                ui.close();
             }
             return;
         }
         if ui.button(tr("act.edit_native")).clicked() {
             actions.push(Action::EditNative(name.clone()));
-            ui.close_menu();
+            ui.close();
         }
         ui.separator();
         // Источники — незашифрованные .conf пользователя, из которых туннели импортированы в AmneziaWG.
         if ui.button(tr("act.add_conf")).clicked() {
             actions.push(Action::AddConf);
-            ui.close_menu();
+            ui.close();
         }
         let source = s.book.source(name);
         let edit = ui.add_enabled(source.is_some(), egui::Button::new(tr("act.edit_source")));
@@ -356,28 +368,28 @@ pub(super) fn tunnel_row(
         };
         if edit.clicked() {
             actions.push(Action::EditSource(name.clone()));
-            ui.close_menu();
+            ui.close();
         }
         if source.is_none() {
             if ui.button(tr("act.set_source")).clicked() {
                 actions.push(Action::SetSource(name.clone()));
-                ui.close_menu();
+                ui.close();
             }
         } else {
             // Источник привязан — пункт становится подменю синхронизации.
             ui.menu_button(tr("act.set_source"), |ui| {
                 if ui.button(tr("sync.to_source")).on_hover_text(tr("sync.to_source_hint")).clicked() {
                     actions.push(Action::Confirm(Confirm::ToSource(name.clone())));
-                    ui.close_menu();
+                    ui.close();
                 }
                 if ui.button(tr("sync.to_native")).on_hover_text(tr("sync.to_native_hint")).clicked() {
                     actions.push(Action::Confirm(Confirm::ToNative(name.clone())));
-                    ui.close_menu();
+                    ui.close();
                 }
                 ui.separator();
                 if ui.button(tr("sync.other_file")).clicked() {
                     actions.push(Action::SetSource(name.clone()));
-                    ui.close_menu();
+                    ui.close();
                 }
             });
         }
@@ -385,7 +397,7 @@ pub(super) fn tunnel_row(
         let delete = egui::Button::new(RichText::new(tr("del.tunnel_menu")).color(RED)).shortcut_text("Del");
         if ui.add(delete).clicked() {
             actions.push(Action::Confirm(Confirm::DeleteTunnel(name.clone())));
-            ui.close_menu();
+            ui.close();
         }
     });
 }

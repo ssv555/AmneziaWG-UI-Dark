@@ -35,13 +35,18 @@
   Numbers use a monospaced font in fixed-width cells, so nothing jumps around when values change.
 - Speed graph (2 min / 10 min / 1 h) with a ping strip underneath.
 - Per-tunnel statistics since the first launch: traffic, peak speed, time connected and its share of the total.
-- Event log: connections, disconnections, lost and restored links.
+- Event log: connections, disconnections, lost and restored links; filter by severity and tunnel, search, copy, save to a file.
 - If the core stops answering, the tunnels show "Unknown: no connection to the core" instead of a guess, the tray icon and
   the status bar warn, and everything returns by itself once the core answers again.
 
 **Convenience**
 - A coloured dot on the tray icon and on the taskbar button (overlay badge) shows the state; Windows notifications when a link
-  drops or comes back.
+  drops or comes back. Clicking a notification opens the window on that tunnel.
+- **Tray menu** (right click on the tray icon): Open window, the tunnels (in their groups when the window shows groups;
+  connected ones are checked) and Exit. Clicking a tunnel connects or disconnects it exactly like the window does,
+  including the "several tunnels at once" setting. Without a connection to the core the state is unknown: the menu
+  says so on top, no tunnel is checked and none can be clicked (the window shows "Unknown: no connection to the core"
+  and greys out the Connect / Disconnect button).
 - **The working mode is visible at a glance**: in the built-in engine mode the icon (window, taskbar, tray) is yellow,
   separators and frames are neon yellow and the status bar says so.
 - **Several tunnels at once** (Settings): independent tunnels run side by side; a tunnel that cannot run together with
@@ -53,6 +58,7 @@
   every 10 s for 3 minutes, every minute up to 10 minutes, then every 10 minutes, and at once when the network changes.
 - **Exit asks about the VPN** when tunnels are connected: disconnect and exit, or exit and keep the VPN running. The
   choice can be remembered; **Settings → Show hidden dialogs again** brings the question back.
+- **Copy diagnostics** (**Help → Copy diagnostics**, also a button in **About**): a plain-text report for bug reports goes to the clipboard - versions, mode, Windows, core and agent status, tunnel names with state, the last 50 events, component versions. Keys, addresses, host names, user and computer names are removed, the profile path becomes `%USERPROFILE%`.
 - **Updates and rollbacks** (**Help → Check for updates…**): the original AmneziaWG client, the built-in engine and
   the app itself, each separately or all at once. Before every update and every rollback the current version is
   backed up automatically; the history table has a **Restore** button for each backup (a rollback asks for
@@ -155,6 +161,7 @@ Start `awg-ui.exe`. Select a tunnel and use **Connect / Disconnect** (or **Recon
 | `Enter` | Connect a tunnel (it never disconnects; use the button or the menu), or collapse / expand a group |
 | `F2` | Rename the selected group |
 | `Delete` | Delete the selected group or tunnel (with confirmation) |
+| `Shift+F10` / Menu key | Context menu of the selected row, or of the focused card value or log line (`Tab` moves the focus) |
 | `Ctrl+S` | Save in the built-in config editor |
 | `Ctrl+Plus` / `Ctrl+Minus` / `Ctrl+0` | Larger / smaller interface / back to 100 % |
 | `Enter` / `Esc` in dialogs | Primary button / cancel; `Esc` and the title-bar close button cancel or close any window |
@@ -205,7 +212,8 @@ lists the tunnels that will be disconnected; the core switches without restartin
      folder, so no ordinary program can read the keys or swap a config the tunnel service runs. The engine files are
      copied there as well - only if their checksums match the ones built into the app.
    - **File -> Import tunnels** takes `.conf` files and `.zip` archives (several at once); **Take all tunnels from
-     AmneziaWG** exports them from an installed AmneziaWG in one click.
+     AmneziaWG** exports them from an installed AmneziaWG in one click. Configs with `PreUp` / `PostUp` / `PreDown` /
+     `PostDown` commands are not imported by either path; the notice names them.
    - **File -> Backup** saves all tunnels into one zip encrypted with AES-256 and your password - for a new PC or a
      reinstalled Windows; **Restore from backup** brings them back. The zip also opens in 7-Zip and WinRAR.
    - **File -> New tunnel** creates a config with a fresh private key; the tunnel menu has **Edit**, **Rename** and
@@ -292,7 +300,7 @@ folder. Statistics and time connected are counted by the core all the time, whet
 Contributions of every size are welcome: bug reports, feature ideas, UI and UX suggestions, code, documentation and
 translations. If you use AmneziaWG on Windows and something could be nicer, please join in - open an
 [issue](https://github.com/ssv555/AmneziaWG-UI-Dark/issues) or send a pull request. How to build, test and submit a
-change is described in [CONTRIBUTING.md](CONTRIBUTING.md).
+change is described in [CONTRIBUTING.md](CONTRIBUTING.md). Documentation: [docs/](docs/README.md).
 
 <p align="center">
   <img src="img/about.png" alt="The About window" width="640">

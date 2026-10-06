@@ -4,7 +4,8 @@ use eframe::egui::{self, Color32, RichText, Ui, Vec2};
 
 use super::graph::{graph, stale_ping};
 use super::theme::{dot, level_color, mono, BLUE, GRAY, GREEN, RED, VIOLET};
-use super::{Action, ROW_H};
+use super::list::Primary;
+use super::{menu, Action, ROW_H};
 use crate::conf::{PeerInfo, TunnelInfo};
 use crate::daemon::proto::Plan;
 use crate::fmt;
@@ -21,12 +22,16 @@ pub(super) struct Detail<'a> {
     pub(super) health: Health,
     pub(super) busy: bool,
     pub(super) ping: &'a PingState,
+    /// Агент (он ведёт пинг) не отвечает: вместо значения — «вторичная служба недоступна», полосы пинга нет.
+    pub(super) ping_unavailable: bool,
     pub(super) stats: &'a Stats,
     /// Сведения о конфиге из источника или родного окна и откуда они.
     pub(super) info: Option<&'a (TunnelInfo, String)>,
     pub(super) info_loading: bool,
     /// Ядро не смогло подключить туннель за 10 минут и пробует раз в 10 минут: можно повторить сразу.
     pub(super) retry_slow: bool,
+    /// Нет связи с ядром: состояние туннеля неизвестно, главное действие недоступно.
+    pub(super) core_lost: bool,
 }
 
 /// Подключённый туннель: сведения из службы (UAPI), адреса/DNS/MTU — из конфига, если он известен.
@@ -67,7 +72,11 @@ fn fixed_grid(ui: &mut Ui, id: &str, rows: &[[RichText; 4]]) {
                     egui::Layout::left_to_right(egui::Align::Center)
                 };
                 ui.allocate_ui_with_layout(Vec2::new(col, ROW_H - 4.0), layout, |ui| {
-                    ui.add(egui::Label::new(cell.clone()).truncate());
+                    let resp = ui.add(egui::Label::new(cell.clone()).truncate().sense(egui::Sense::click()));
+                    // Значения (нечётные колонки) копируются правым щелчком; секретов в таблице состояния нет.
+                    if i % 2 == 1 && !cell.text().is_empty() {
+                        copy_menu(&resp, cell.text());
+                    }
                 });
             }
             ui.end_row();
@@ -85,12 +94,19 @@ pub(super) fn details(ui: &mut Ui, d: &Detail, s: &mut Settings, actions: &mut V
     egui::Frame::group(ui.style()).inner_margin(egui::Margin::same(12)).show(ui, |ui| {
         ui.set_width(ui.available_width());
         ui.horizontal(|ui| {
-            ui.label(RichText::new(d.name).size(18.0).strong());
+            let name = ui.add(egui::Label::new(RichText::new(d.name).size(18.0).strong()).sense(egui::Sense::click()));
+            copy_menu(&name, d.name);
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let text = tr(if running { "act.disconnect" } else { "act.connect" });
-                let main = egui::Button::new(RichText::new(text).size(16.0)).min_size(Vec2::new(140.0, 32.0));
-                if ui.add_enabled(!d.busy, main).clicked() {
-                    let plan = if running { Plan::Disconnect } else { Plan::Connect };
+                // То же решение, что у меню строки и трея: туннель, который ядро переподключает, — «Отключить».
+                let primary = Primary::of(d.health.level, d.core_lost);
+                let main = egui::Button::new(RichText::new(tr(primary.label())).size(16.0)).min_size(Vec2::new(140.0, 32.0));
+                let plan = primary.plan().filter(|_| !d.busy);
+                let button = ui.add_enabled(plan.is_some(), main);
+                let button = match primary.hint() {
+                    Some(hint) => button.on_disabled_hover_text(tr(hint)),
+                    None => button,
+                };
+                if let (true, Some(plan)) = (button.clicked(), plan) {
                     actions.push(Action::Switch(d.name.to_string(), plan));
                 }
                 if d.retry_slow {
@@ -136,6 +152,7 @@ pub(super) fn details(ui: &mut Ui, d: &Detail, s: &mut Settings, actions: &mut V
             if s.view.ping {
                 // Нет ответа — прошлое значение и «н/д» красным; причина видна в состоянии и на полосе пинга.
                 let value = match &d.ping.last {
+                    _ if d.ping_unavailable => mono(tr("agent.unavailable"), GRAY),
                     None => mono("…", GRAY),
                     Some(Ok(ms)) => mono(trf("unit.ms", &[&ms.to_string()]), VIOLET),
                     Some(Err(_)) => mono(stale_ping(d.ping), RED),
@@ -165,7 +182,7 @@ pub(super) fn details(ui: &mut Ui, d: &Detail, s: &mut Settings, actions: &mut V
 
         if let (true, Some(live)) = (s.view.graph, d.live) {
             ui.add_space(8.0);
-            graph(ui, live, s.view.ping.then_some(d.ping), s);
+            graph(ui, live, (s.view.ping && !d.ping_unavailable).then_some(d.ping), s);
         }
     });
 
@@ -200,48 +217,114 @@ pub(super) fn details(ui: &mut Ui, d: &Detail, s: &mut Settings, actions: &mut V
     });
 }
 
+/// Строка раздела сведений: подпись, значение и можно ли его скопировать (правый щелчок -> «Копировать»).
+#[derive(Debug, PartialEq)]
+struct InfoRow {
+    label: String,
+    value: String,
+    copy: bool,
+}
+
+impl InfoRow {
+    fn new(label: String, value: String, copy: bool) -> Self {
+        InfoRow { label, value, copy }
+    }
+}
+
+/// Раздел «Интерфейс». Приватного ключа в `TunnelInfo` нет (`conf::parse` хранит только открытый) — копировать нечего.
+fn interface_rows(info: &TunnelInfo) -> Vec<InfoRow> {
+    let awg: Vec<String> = info.awg.iter().map(|(k, v)| format!("{k}={v}")).collect();
+    vec![
+        InfoRow::new(tr("det.pubkey"), info.public_key.clone(), true),
+        InfoRow::new(tr("det.addresses"), info.addresses.join(", "), true),
+        InfoRow::new(tr("det.dns"), info.dns.join(", "), true),
+        InfoRow::new(tr("det.port"), info.listen_port.clone(), true),
+        InfoRow::new(tr("det.mtu"), info.mtu.clone(), false),
+        InfoRow::new("AWG".to_string(), awg.join("  "), false),
+    ]
+}
+
+/// Раздел «Пир». Общий ключ (PSK) — секрет: показывается только «есть / нет» и не копируется.
+fn peer_rows(peer: &PeerInfo) -> Vec<InfoRow> {
+    let keepalive = match peer.keepalive.parse::<f64>() {
+        Ok(k) if k > 0.0 => fmt::duration(k),
+        _ => tr("det.off"),
+    };
+    vec![
+        InfoRow::new(tr("det.pubkey"), peer.public_key.clone(), true),
+        InfoRow::new(tr("st.endpoint"), peer.endpoint.clone(), true),
+        InfoRow::new(tr("det.keepalive"), keepalive, false),
+        InfoRow::new(tr("det.preshared"), tr(if peer.preshared { "det.yes" } else { "det.no" }), false),
+    ]
+}
+
+/// Правый щелчок или Shift+F10 / клавиша меню на значении под фокусом (Tab) -> «Копировать» в буфер обмена.
+fn copy_menu(resp: &egui::Response, value: &str) {
+    menu::context_menu(resp, resp.has_focus(), |ui| {
+        if ui.button(tr("det.copy")).clicked() {
+            ui.ctx().copy_text(value.to_string());
+            ui.close();
+        }
+    });
+}
+
+/// Значение моноширинным шрифтом с переносом; копируемое — с меню «Копировать».
+fn value_label(ui: &mut Ui, value: &str, copy: bool) {
+    let resp = ui.add(egui::Label::new(RichText::new(value).monospace()).wrap().sense(egui::Sense::click()));
+    if copy {
+        copy_menu(&resp, value);
+    }
+}
+
 /// Разделы «Интерфейс» и «Пир»; `origin` — откуда сведения, если туннель не подключён.
 fn config_sections(ui: &mut Ui, info: &TunnelInfo, origin: Option<&str>) {
     if let Some(o) = origin {
         ui.weak(o);
         ui.add_space(4.0);
     }
-    let row = |ui: &mut Ui, name: String, value: &str| {
-        if !value.is_empty() {
-            ui.weak(name);
-            ui.add(egui::Label::new(RichText::new(value).monospace()).wrap());
+    let grid = |ui: &mut Ui, rows: Vec<InfoRow>| {
+        for row in rows.into_iter().filter(|r| !r.value.is_empty()) {
+            ui.weak(row.label);
+            value_label(ui, &row.value, row.copy);
             ui.end_row();
         }
     };
     egui::CollapsingHeader::new(RichText::new(tr("det.interface")).strong()).default_open(true).show(ui, |ui| {
-        egui::Grid::new("iface").num_columns(2).spacing([16.0, 4.0]).show(ui, |ui| {
-            row(ui, tr("det.pubkey"), &info.public_key);
-            row(ui, tr("det.addresses"), &info.addresses.join(", "));
-            row(ui, tr("det.dns"), &info.dns.join(", "));
-            row(ui, tr("det.port"), &info.listen_port);
-            row(ui, tr("det.mtu"), &info.mtu);
-            let awg: Vec<String> = info.awg.iter().map(|(k, v)| format!("{k}={v}")).collect();
-            row(ui, "AWG".to_string(), &awg.join("  "));
-        });
+        egui::Grid::new("iface").num_columns(2).spacing([16.0, 4.0]).show(ui, |ui| grid(ui, interface_rows(info)));
     });
     for (i, peer) in info.peers.iter().enumerate() {
         egui::CollapsingHeader::new(RichText::new(tr("det.peer")).strong()).id_salt(("peer", i)).default_open(true).show(ui, |ui| {
-            egui::Grid::new(("peer-grid", i)).num_columns(2).spacing([16.0, 4.0]).show(ui, |ui| {
-                row(ui, tr("det.pubkey"), &peer.public_key);
-                row(ui, tr("st.endpoint"), &peer.endpoint);
-                let keepalive = match peer.keepalive.parse::<f64>() {
-                    Ok(k) if k > 0.0 => fmt::duration(k),
-                    _ => tr("det.off"),
-                };
-                row(ui, tr("det.keepalive"), &keepalive);
-                row(ui, tr("det.preshared"), &tr(if peer.preshared { "det.yes" } else { "det.no" }));
-            });
+            egui::Grid::new(("peer-grid", i)).num_columns(2).spacing([16.0, 4.0]).show(ui, |ui| grid(ui, peer_rows(peer)));
             egui::CollapsingHeader::new(trf("det.allowed", &[&peer.allowed_ips.len().to_string()]))
                 .id_salt(("ips", i))
                 .default_open(false)
-                .show(ui, |ui| {
-                    ui.add(egui::Label::new(RichText::new(peer.allowed_ips.join(", ")).monospace()).wrap());
-                });
+                .show(ui, |ui| value_label(ui, &peer.allowed_ips.join(", "), true));
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Пример из man wg(8) с общим ключом: ни приватный, ни общий ключ в строки сведений не попадают.
+    const PRIVATE: &str = "yAnz5TF+lXXJte14tji3zlMNq+hd2rYUIgJBgB3fBmk=";
+    const PRESHARED: &str = "FpCyhws9cxwWoV4xELtfJvjJN+zQVRPISllRWgeopVE=";
+
+    #[test]
+    fn copyable_values_never_include_secrets() {
+        let text = format!(
+            "[Interface]\nPrivateKey = {PRIVATE}\nAddress = 10.0.0.2/32\nListenPort = 51820\n[Peer]\n\
+             PublicKey = xTIBA5rboUvnH4htodjb6e697QjLERt1NAB4mZqp8Dg=\nPresharedKey = {PRESHARED}\nEndpoint = 203.0.113.5:51820\n"
+        );
+        let info = crate::conf::parse(&text);
+        let rows: Vec<InfoRow> = interface_rows(&info).into_iter().chain(info.peers.iter().flat_map(peer_rows)).collect();
+        for row in &rows {
+            assert!(!row.value.contains(PRIVATE) && !row.value.contains(PRESHARED), "secret in {row:?}");
+        }
+        let copyable: Vec<&str> = rows.iter().filter(|r| r.copy).map(|r| r.value.as_str()).collect();
+        assert_eq!(copyable, vec!["HIgo9xNzJMWLKASShiTqIybxZ0U3wGLiUeJ1PKf8ykw=", "10.0.0.2/32", "", "51820", "xTIBA5rboUvnH4htodjb6e697QjLERt1NAB4mZqp8Dg=", "203.0.113.5:51820"]);
+        let psk = rows.iter().find(|r| r.label == tr("det.preshared")).expect("preshared row");
+        assert_eq!((psk.value.as_str(), psk.copy), (tr("det.yes").as_str(), false));
     }
 }

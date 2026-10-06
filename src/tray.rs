@@ -19,10 +19,11 @@ use windows_sys::Win32::UI::Shell::{
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, ChangeWindowMessageFilterEx, CreateIconIndirect, CreatePopupMenu, DestroyMenu, GetCursorPos,
-    GetSystemMetrics, IsIconic, IsWindowVisible, PostMessageW, RegisterWindowMessageW, SetForegroundWindow, ShowWindow,
-    TrackPopupMenu, ICONINFO, MF_SEPARATOR, MF_STRING, ICON_BIG, ICON_SMALL, MSGFLT_ALLOW, SM_CXICON, SM_CXSMICON,
-    SW_HIDE, SW_RESTORE, SW_SHOW, TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTBUTTON, WM_APP, WM_DESTROY, WM_LBUTTONDBLCLK,
-    WM_LBUTTONUP, WM_NULL, WM_RBUTTONUP, WM_SETICON,
+    GetSystemMetrics, IsIconic, IsWindowVisible, PostMessageW, RegisterWindowMessageW, SetForegroundWindow,
+    SetMenuDefaultItem, ShowWindow, TrackPopupMenu, HMENU, ICONINFO, MF_CHECKED, MF_GRAYED, MF_POPUP, MF_SEPARATOR,
+    MF_STRING, ICON_BIG, ICON_SMALL, MSGFLT_ALLOW, SM_CXICON, SM_CXSMICON, SW_HIDE, SW_RESTORE, SW_SHOW, TPM_NONOTIFY,
+    TPM_RETURNCMD, TPM_RIGHTBUTTON, WM_APP, WM_DESTROY, WM_LBUTTONDBLCLK, WM_LBUTTONUP, WM_NULL, WM_RBUTTONUP,
+    WM_SETICON,
 };
 
 use crate::health::Level;
@@ -41,6 +42,54 @@ const TASKBAR_BUTTON: usize = 4;
 const SUBCLASS_ID: usize = 0x4157_4755; // "AWGU"
 const CMD_OPEN: usize = 1;
 const CMD_EXIT: usize = 2;
+/// Серая строка-пояснение: выбрать её нельзя, а 0 — тот же ответ, что «меню закрыто без выбора».
+const CMD_NOTE: usize = 0;
+/// Пункты туннелей: `CMD_TUNNEL + i`, `i` — индекс в списке имён, который возвращает `layout`.
+const CMD_TUNNEL: usize = 100;
+
+/// Строка меню трея, как её видит окно: туннель или группа с вложенными строками.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Entry {
+    Tunnel {
+        name: String,
+        /// Не отключён: подключён, переключается или его переподключает ядро (отметка у пункта).
+        connected: bool,
+        /// Можно переключить (не занят другим переключением).
+        enabled: bool,
+    },
+    Group { title: String, entries: Vec<Entry> },
+    /// Серая строка-пояснение без действия (например, «нет связи с ядром» над серыми туннелями): у пунктов
+    /// Win32-меню нет подсказок, поэтому причина серости — отдельной строкой.
+    Note(String),
+}
+
+/// Что меню трея берёт у окна. Зовётся в потоке окна, в том числе когда окно скрыто и кадров не рисует, — поэтому
+/// не через кадр, а напрямую.
+pub trait Hooks: Send + Sync {
+    /// Туннели для меню на момент щелчка правой кнопкой.
+    fn entries(&self) -> Vec<Entry>;
+    /// Пункт туннеля выбран: подключить или отключить — тем же запросом, что и окно.
+    fn toggle(&self, tunnel: &str);
+    /// Пункт «Выход».
+    fn exit(&self);
+}
+
+/// О чём последнее показанное уведомление — от этого зависит, что откроет щелчок по нему.
+#[derive(Clone, Debug, PartialEq)]
+enum Balloon {
+    None,
+    /// О неустановленном обновлении: щелчок открывает «Обновления и откаты».
+    Update,
+    /// О туннеле: щелчок выбирает его в окне.
+    Tunnel(String),
+}
+
+/// Щелчок по уведомлению, который окно ещё не обработало (`take_click`).
+#[derive(Clone, Debug, PartialEq)]
+pub enum Clicked {
+    Update,
+    Tunnel(String),
+}
 
 struct Tray {
     hwnd: isize,
@@ -53,11 +102,16 @@ struct Tray {
     taskbar_created: u32,
     taskbar_button_created: u32,
     ctx: egui::Context,
-    on_exit: Box<dyn Fn() + Send + Sync>,
+    hooks: Box<dyn Hooks>,
     state: Mutex<State>,
     /// Один вызов `Shell_NotifyIconW` за раз: решение, вызов и запись результата идут как одно целое. Без этого два
     /// потока оба решили бы «добавить», и неудача второго (значок уже есть) сбросила бы `visible` у живого значка.
     shell: Mutex<()>,
+    /// О чём последнее показанное уведомление. Каждое новое заменяет прежнее, чтобы щелчок по сообщению о туннеле
+    /// не открыл обновления, и наоборот.
+    balloon: Mutex<Balloon>,
+    /// Щелчок по уведомлению, который окно ещё не обработало (`take_click`).
+    clicked: Mutex<Option<Clicked>>,
 }
 
 struct State {
@@ -76,8 +130,8 @@ struct State {
 
 static TRAY: OnceLock<Tray> = OnceLock::new();
 
-/// Подключить трей к окну. `on_exit` вызывается пунктом «Выход».
-pub fn install(hwnd: isize, ctx: egui::Context, visible: bool, on_exit: Box<dyn Fn() + Send + Sync>) {
+/// Подключить трей к окну. `hooks` — туннели для меню, их переключение и «Выход».
+pub fn install(hwnd: isize, ctx: egui::Context, visible: bool, hooks: Box<dyn Hooks>) {
     let size = unsafe { GetSystemMetrics(SM_CXSMICON) }.max(16) as u32;
     let dots = [icon::GRAY, icon::GREEN, icon::YELLOW, icon::RED];
     let icons = [false, true].map(|engine| dots.map(|c| make_icon(size, &icon::rgba_with_dot(size, engine, c))));
@@ -94,9 +148,11 @@ pub fn install(hwnd: isize, ctx: egui::Context, visible: bool, on_exit: Box<dyn 
         taskbar_created,
         taskbar_button_created,
         ctx,
-        on_exit,
+        hooks,
         state: Mutex::new(State { wanted: false, visible: false, level: Level::Off, tip: crate::APP_TITLE.to_string(), overlay: None, engine: None }),
         shell: Mutex::new(()),
+        balloon: Mutex::new(Balloon::None),
+        clicked: Mutex::new(None),
     };
     if TRAY.set(tray).is_err() {
         return;
@@ -273,8 +329,25 @@ fn apply_taskbar(t: &Tray, what: usize) {
     }
 }
 
-/// Всплывающее уведомление Windows (в Windows 10/11 показывается как toast).
-pub fn notify(title: &str, text: &str, warning: bool) {
+/// Всплывающее уведомление Windows о туннеле (в Windows 10/11 показывается как toast); щелчок по нему поднимает
+/// окно и выбирает туннель (`take_click`). Пустое имя — уведомление ни о каком туннеле: щелчок только поднимает окно.
+pub fn notify_tunnel(tunnel: &str, title: &str, text: &str, warning: bool) {
+    let about = if tunnel.is_empty() { Balloon::None } else { Balloon::Tunnel(tunnel.to_string()) };
+    balloon(title, text, warning, about);
+}
+
+/// Уведомление о неустановленном обновлении: показывается и при видимом окне; щелчок по нему поднимает окно и
+/// открывает «Обновления и откаты» (`take_click`). Без значка в трее показать его нечем.
+pub fn notify_update(title: &str, text: &str) {
+    balloon(title, text, false, Balloon::Update);
+}
+
+/// Щелчок по уведомлению, который окну надо обработать: открыть обновления или выбрать туннель. Читается один раз.
+pub fn take_click() -> Option<Clicked> {
+    TRAY.get().and_then(|t| t.clicked.lock().unwrap().take())
+}
+
+fn balloon(title: &str, text: &str, warning: bool, about: Balloon) {
     let Some(t) = TRAY.get() else { return };
     // Тот же порядок вызовов оболочки, что у `step`: уведомление не вклинивается между его решением и вызовом.
     // Состояние — только прочитать; вызывающий не должен держать чужих блокировок (`monitor::record_and_notify`).
@@ -287,7 +360,27 @@ pub fn notify(title: &str, text: &str, warning: bool) {
     copy(&mut data.szInfoTitle, title);
     copy(&mut data.szInfo, text);
     data.dwInfoFlags = if warning { NIIF_WARNING } else { NIIF_INFO };
-    unsafe { Shell_NotifyIconW(NIM_MODIFY, &data) };
+    // Признак — до вызова: щелчок по уведомлению может прийти сразу, а окно разберёт его уже по этому признаку.
+    *t.balloon.lock().unwrap() = about;
+    if unsafe { Shell_NotifyIconW(NIM_MODIFY, &data) } == 0 {
+        eprintln!("трей: уведомление не показано: {title}");
+    }
+}
+
+/// Сообщение трея `NIN_BALLOONUSERCLICK` (WM_USER + 5): пользователь щёлкнул по всплывшему уведомлению.
+const NIN_BALLOONUSERCLICK: u32 = 0x0400 + 5;
+
+/// Что сделать окну по сообщению значка: щелчок по уведомлению об обновлении открывает обновления, о туннеле —
+/// выбирает туннель; иначе — ничего, кроме подъёма окна (`None`).
+fn balloon_click(tray_message: u32, last: &Balloon) -> Option<Clicked> {
+    if tray_message != NIN_BALLOONUSERCLICK {
+        return None;
+    }
+    match last {
+        Balloon::None => None,
+        Balloon::Update => Some(Clicked::Update),
+        Balloon::Tunnel(name) => Some(Clicked::Tunnel(name.clone())),
+    }
 }
 
 pub fn show_window() {
@@ -298,13 +391,6 @@ pub fn show_window() {
         SetForegroundWindow(hwnd);
     }
     t.ctx.request_repaint();
-}
-
-/// Окно скрыто в трей или свёрнуто: его не видно, всплывающее уведомление уместно.
-pub fn window_hidden() -> bool {
-    let Some(t) = TRAY.get() else { return false };
-    let hwnd = t.hwnd as HWND;
-    unsafe { IsWindowVisible(hwnd) == 0 || IsIconic(hwnd) != 0 }
 }
 
 pub fn hide_window() {
@@ -348,9 +434,16 @@ unsafe extern "system" fn subclass_proc(
 ) -> LRESULT {
     if let Some(t) = TRAY.get() {
         if msg == WM_TRAY {
-            match lparam as u32 {
+            let message = lparam as u32;
+            match message {
                 WM_LBUTTONUP | WM_LBUTTONDBLCLK => show_window(),
                 WM_RBUTTONUP => menu(t, hwnd),
+                NIN_BALLOONUSERCLICK => {
+                    let clicked = balloon_click(message, &t.balloon.lock().unwrap());
+                    // Сначала признак, потом показ: первый кадр поднятого окна его уже увидит.
+                    *t.clicked.lock().unwrap() = clicked;
+                    show_window();
+                }
                 _ => {}
             }
             return 0;
@@ -380,21 +473,111 @@ unsafe extern "system" fn subclass_proc(
     DefSubclassProc(hwnd, msg, wparam, lparam)
 }
 
+/// Строка Win32-меню: команда со своим номером, подменю или разделитель.
+#[derive(Debug, PartialEq)]
+enum Item {
+    Command { id: usize, text: String, checked: bool, enabled: bool, default: bool },
+    Popup { text: String, items: Vec<Item> },
+    Separator,
+}
+
+/// Меню трея: «Открыть» (по умолчанию, жирным), туннели (группы — подменю), «Выход». Возвращает строки и имена
+/// туннелей по номерам команд: пункт `CMD_TUNNEL + i` — туннель `names[i]`.
+fn layout(entries: &[Entry]) -> (Vec<Item>, Vec<String>) {
+    let mut names = Vec::new();
+    let mut items = vec![Item::Command { id: CMD_OPEN, text: tr("tray.open"), checked: false, enabled: true, default: true }];
+    let tunnels = tunnel_items(entries, &mut names);
+    if !tunnels.is_empty() {
+        items.push(Item::Separator);
+        items.extend(tunnels);
+    }
+    items.push(Item::Separator);
+    items.push(Item::Command { id: CMD_EXIT, text: tr("tray.exit"), checked: false, enabled: true, default: false });
+    (items, names)
+}
+
+fn tunnel_items(entries: &[Entry], names: &mut Vec<String>) -> Vec<Item> {
+    entries
+        .iter()
+        .filter_map(|e| match e {
+            Entry::Tunnel { name, connected, enabled } => {
+                names.push(name.clone());
+                let id = CMD_TUNNEL + names.len() - 1;
+                Some(Item::Command { id, text: menu_text(name), checked: *connected, enabled: *enabled, default: false })
+            }
+            // Пустое подменю — тупик, его не показываем.
+            Entry::Group { title, entries } => {
+                let items = tunnel_items(entries, names);
+                (!items.is_empty()).then(|| Item::Popup { text: menu_text(title), items })
+            }
+            Entry::Note(text) => Some(Item::Command { id: CMD_NOTE, text: menu_text(text), checked: false, enabled: false, default: false }),
+        })
+        .collect()
+}
+
+/// Текст пункта как есть: `&` в имени Win32 иначе принял бы за мнемонику и не показал.
+fn menu_text(s: &str) -> String {
+    s.replace('&', "&&")
+}
+
+/// Номер выбранной команды -> что сделать.
+#[derive(Debug, PartialEq)]
+enum Pick<'a> {
+    Open,
+    Exit,
+    Toggle(&'a str),
+    Nothing,
+}
+
+fn pick(cmd: usize, names: &[String]) -> Pick<'_> {
+    match cmd {
+        CMD_OPEN => Pick::Open,
+        CMD_EXIT => Pick::Exit,
+        _ => match cmd.checked_sub(CMD_TUNNEL).and_then(|i| names.get(i)) {
+            Some(name) => Pick::Toggle(name),
+            None => Pick::Nothing,
+        },
+    }
+}
+
+unsafe fn fill_menu(m: HMENU, items: &[Item]) {
+    for item in items {
+        match item {
+            Item::Command { id, text, checked, enabled, default } => {
+                let flags = MF_STRING | if *checked { MF_CHECKED } else { 0 } | if *enabled { 0 } else { MF_GRAYED };
+                AppendMenuW(m, flags, *id, wide(text).as_ptr());
+                if *default {
+                    SetMenuDefaultItem(m, *id as u32, 0);
+                }
+            }
+            Item::Popup { text, items } => {
+                // Подменю уничтожается вместе с родителем (`DestroyMenu` в `menu`).
+                let sub = CreatePopupMenu();
+                fill_menu(sub, items);
+                AppendMenuW(m, MF_POPUP, sub as usize, wide(text).as_ptr());
+            }
+            Item::Separator => {
+                AppendMenuW(m, MF_SEPARATOR, 0, null());
+            }
+        }
+    }
+}
+
 unsafe fn menu(t: &Tray, hwnd: HWND) {
+    let (items, names) = layout(&t.hooks.entries());
     let m = CreatePopupMenu();
-    AppendMenuW(m, MF_STRING, CMD_OPEN, wide(&tr("tray.open")).as_ptr());
-    AppendMenuW(m, MF_SEPARATOR, 0, null());
-    AppendMenuW(m, MF_STRING, CMD_EXIT, wide(&tr("tray.exit")).as_ptr());
+    fill_menu(m, &items);
     let mut pt = POINT { x: 0, y: 0 };
     GetCursorPos(&mut pt);
     SetForegroundWindow(hwnd);
     let cmd = TrackPopupMenu(m, TPM_RETURNCMD | TPM_NONOTIFY | TPM_RIGHTBUTTON, pt.x, pt.y, 0, hwnd, null()) as usize;
     PostMessageW(hwnd, WM_NULL, 0, 0);
     DestroyMenu(m);
-    match cmd {
-        CMD_OPEN => show_window(),
-        CMD_EXIT => (t.on_exit)(),
-        _ => {}
+    match pick(cmd, &names) {
+        Pick::Open => show_window(),
+        Pick::Exit => t.hooks.exit(),
+        Pick::Toggle(name) => t.hooks.toggle(name),
+        Pick::Nothing => {}
     }
 }
 
@@ -445,6 +628,71 @@ mod tests {
 
     fn state(wanted: bool, visible: bool) -> State {
         State { wanted, visible, level: Level::Off, tip: String::new(), overlay: None, engine: None }
+    }
+
+    #[test]
+    fn toast_click_opens_what_the_toast_was_about() {
+        let office = Balloon::Tunnel("office".into());
+        assert_eq!(balloon_click(NIN_BALLOONUSERCLICK, &Balloon::Update), Some(Clicked::Update));
+        assert_eq!(
+            balloon_click(NIN_BALLOONUSERCLICK, &office),
+            Some(Clicked::Tunnel("office".into())),
+            "щелчок по сообщению о туннеле выбирает туннель, обновления не открывает"
+        );
+        assert_eq!(balloon_click(NIN_BALLOONUSERCLICK, &Balloon::None), None);
+        assert_eq!(balloon_click(WM_LBUTTONUP, &Balloon::Update), None, "значок в трее — не уведомление");
+        assert_eq!(balloon_click(WM_RBUTTONUP, &office), None);
+    }
+
+    fn tunnel(name: &str, connected: bool, enabled: bool) -> Entry {
+        Entry::Tunnel { name: name.into(), connected, enabled }
+    }
+
+    #[test]
+    fn menu_lists_tunnels_between_open_and_exit() {
+        let work = Entry::Group {
+            title: "Work".into(),
+            entries: vec![tunnel("office", true, true), Entry::Group { title: "Empty".into(), entries: vec![] }],
+        };
+        let (items, names) = layout(&[work, tunnel("R&D", false, false)]);
+        assert_eq!(names, ["office", "R&D"]);
+        assert!(matches!(&items[0], Item::Command { id: CMD_OPEN, default: true, .. }), "«Открыть» первым и по умолчанию");
+        assert_eq!(items[1], Item::Separator);
+        let Item::Popup { text, items: inner } = &items[2] else { panic!("группа — подменю: {:?}", items[2]) };
+        assert_eq!(text, "Work");
+        let office = Item::Command { id: CMD_TUNNEL, text: "office".into(), checked: true, enabled: true, default: false };
+        assert_eq!(inner, &[office], "пустая подгруппа не показана");
+        let rnd = Item::Command { id: CMD_TUNNEL + 1, text: "R&&D".into(), checked: false, enabled: false, default: false };
+        assert_eq!(items[3], rnd, "& не становится мнемоникой; занятый туннель — серый");
+        assert_eq!(items[4], Item::Separator);
+        assert!(matches!(&items[5], Item::Command { id: CMD_EXIT, .. }));
+        assert_eq!(items.len(), 6);
+    }
+
+    #[test]
+    fn note_is_a_grey_line_that_picks_nothing() {
+        let (items, names) = layout(&[Entry::Note("No core & co".into()), tunnel("a", false, false)]);
+        let note = Item::Command { id: CMD_NOTE, text: "No core && co".into(), checked: false, enabled: false, default: false };
+        assert_eq!(items[2], note);
+        assert_eq!(names, ["a"], "пояснение не занимает номер туннеля");
+        assert_eq!(pick(CMD_NOTE, &names), Pick::Nothing);
+    }
+
+    #[test]
+    fn menu_without_tunnels_is_open_and_exit() {
+        let (items, names) = layout(&[]);
+        assert!(names.is_empty());
+        assert_eq!(items.len(), 3, "без лишнего разделителя: {items:?}");
+    }
+
+    #[test]
+    fn command_ids_map_back_to_tunnels() {
+        let names = vec!["a".to_string(), "b".to_string()];
+        assert_eq!(pick(CMD_OPEN, &names), Pick::Open);
+        assert_eq!(pick(CMD_EXIT, &names), Pick::Exit);
+        assert_eq!(pick(CMD_TUNNEL + 1, &names), Pick::Toggle("b"));
+        assert_eq!(pick(CMD_TUNNEL + 2, &names), Pick::Nothing, "номер вне списка — ничего");
+        assert_eq!(pick(0, &names), Pick::Nothing, "меню закрыто без выбора");
     }
 
     #[test]

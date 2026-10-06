@@ -118,6 +118,7 @@ mod tests {
                 running: Some(&running),
                 pending: &|_| false,
                 service_exists: &|t| host.service_exists(t),
+                config_exists: &|_| true,
                 stop_reason: &|_| None,
                 native_services: false,
                 network_changed: false,
@@ -319,7 +320,7 @@ mod tests {
         let mut retries = Retries::default();
         let now = Instant::now();
         let running = host.running().unwrap();
-        let seen = Seen { desired: &desired, running: Some(&running), pending: &|_| false, service_exists: &|t| host.service_exists(t), stop_reason: &|_| None, native_services: false, network_changed: false };
+        let seen = Seen { desired: &desired, running: Some(&running), pending: &|_| false, service_exists: &|t| host.service_exists(t), config_exists: &|_| true, stop_reason: &|_| None, native_services: false, network_changed: false };
         let mut log = Vec::new();
         for t in retries.tick(now, &seen).due {
             let result = run_switch(&host, &t, Plan::Connect, &[]).map(|()| true);

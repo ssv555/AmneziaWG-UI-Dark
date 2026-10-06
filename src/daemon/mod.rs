@@ -1,7 +1,10 @@
 //! Ядро — служба Windows «AmneziaWG UI Dark Core» (SYSTEM, запускается вместе с Windows): режим работы,
-//! туннели обоих режимов, опрос раз в секунду, статистика, журнал событий, пинг. Окно — только интерфейс:
-//! говорит с ядром по именованному каналу (`pipe`, протокол `proto`); закрыли окно — всё продолжает работать.
+//! туннели обоих режимов, опрос раз в секунду, статистика, журнал событий (пинг ведёт агент, `agent`). Окно — только
+//! интерфейс: говорит с ядром по именованному каналу (`pipe`, протокол `proto`); закрыли окно — всё продолжает работать.
 
+pub mod agent;
+pub(crate) mod agent_watch;
+pub(crate) mod budget;
 pub mod helper;
 pub mod install;
 pub mod pipe;
@@ -19,7 +22,7 @@ use std::path::PathBuf;
 
 use proto::{NativeOp, Request, Response};
 
-use crate::events::{Event, EventLog, Severity};
+use crate::events::{Event, Severity};
 use crate::ini::Ini;
 use crate::settings::Mode;
 
@@ -43,8 +46,6 @@ pub fn events_file() -> PathBuf {
 #[derive(Clone, Debug, PartialEq)]
 pub struct Config {
     pub mode: Mode,
-    pub ping: bool,
-    pub ping_host: String,
     /// Язык журнала событий — язык окна владельца (код ISO 639-2).
     pub language: String,
     /// SID учётной записи владельца: ей (кроме SYSTEM и администраторов) открыт канал ядра.
@@ -82,8 +83,6 @@ impl Config {
     fn from_ini(ini: &Ini) -> Config {
         Config {
             mode: if ini.get("core", "mode") == Some(Mode::Engine.as_str()) { Mode::Engine } else { Mode::Overlay },
-            ping: ini.get_bool("core", "ping", true),
-            ping_host: ini.get("core", "ping_host").filter(|h| !h.is_empty()).unwrap_or(crate::settings::DEFAULT_PING_HOST).to_string(),
             owner_sid: ini.get("core", "owner_sid").unwrap_or_default().to_string(),
             language: ini.get("core", "language").filter(|c| crate::i18n::is_code(c)).unwrap_or(crate::i18n::DEFAULT).to_string(),
             // Имя туннеля уходит в пути и командные строки — только допустимые (запятой в них нет).
@@ -97,10 +96,10 @@ impl Config {
     }
 
     fn save_to(&self, path: &std::path::Path) -> Result<(), String> {
-        let mut ini = Ini::default();
+        // Поверх файла, а не с чистого листа: чужие ключи остаются. Так `ping`/`ping_host` ядра прежней версии
+        // доживают до первого запуска агента, который переносит их в `agent.ini` (`agent::AgentConfig`).
+        let mut ini = Ini::load(path);
         ini.set("core", "mode", self.mode.as_str());
-        ini.set_bool("core", "ping", self.ping);
-        ini.set("core", "ping_host", &self.ping_host);
         ini.set("core", "owner_sid", &self.owner_sid);
         ini.set("core", "language", &self.language);
         if let Some(tunnels) = &self.tunnels {
@@ -116,10 +115,14 @@ pub fn log_unreadable(problem: &crate::ini::Unreadable) {
     log_notice(events_file(), Severity::Bad, &problem.text());
 }
 
-/// Запись в файл журнала ядра напрямую, а не через `Shared`: установка и ранний отказ запуска (нет владельца)
-/// заканчиваются раньше, чем он появится. Журнал, открытый позже, подхватывает запись из файла.
+/// Запись в файл журнала напрямую, а не через `Shared`: установка и ранний отказ запуска (нет владельца)
+/// заканчиваются раньше, чем он появится. Только дописать строку: файл ведёт и ротирует агент, он и покажет запись.
 fn log_notice(file: PathBuf, severity: Severity, text: &str) {
-    EventLog::open(Some(file)).push(Event::new(crate::monitor::unix_now(), "", severity, text, false));
+    let event = Event::new(crate::monitor::unix_now(), "", severity, text, false);
+    if let Err(e) = crate::events::append_event(&file, &event) {
+        // Служба без консоли: это всё, что остаётся, когда не пишется сам журнал.
+        eprintln!("core: cannot write {}: {e}", file.display());
+    }
 }
 
 /// Клиентская сторона ядра: всё, что окно и ключи командной строки просят у ядра. Реализации — канал
@@ -161,13 +164,6 @@ pub trait CoreApi: Send + Sync {
     fn report(&self, req: Request) -> Result<crate::store::ImportReport, String> {
         match self.call(req)? {
             Response::Report(r) => Ok(r),
-            other => Err(unexpected(other)),
-        }
-    }
-
-    fn updates(&self, op: crate::update::UpdateOp) -> Result<crate::update::UpdatesState, String> {
-        match self.call(Request::Updates(op))? {
-            Response::Updates(s) => Ok(*s),
             other => Err(unexpected(other)),
         }
     }
@@ -259,7 +255,22 @@ mod tests {
         std::fs::write(&path, "[core]\r\nmode=engine\r\nping=0\r\nowner_sid=S-1-5-21-1\r\n").unwrap();
         let (config, problem) = Config::load_guarded_from(&path);
         assert!(problem.is_none());
-        assert_eq!((config.mode, config.ping, config.owner_sid.as_str()), (Mode::Engine, false, "S-1-5-21-1"));
+        assert_eq!((config.mode, config.owner_sid.as_str()), (Mode::Engine, "S-1-5-21-1"));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Ядро пинга больше не знает, но его ключи в `core.ini` не стирает: их ещё не перенёс агент.
+    #[test]
+    fn save_keeps_keys_the_core_does_not_own() {
+        let dir = dir("foreign");
+        let path = dir.join("core.ini");
+        std::fs::write(&path, "[core]\r\nmode=overlay\r\nping=0\r\nping_host=9.9.9.9\r\nowner_sid=S-1-5-21-1\r\n").unwrap();
+        let (mut config, _) = Config::load_guarded_from(&path);
+        config.mode = Mode::Engine;
+        config.save_to(&path).unwrap();
+        let saved = Ini::load(&path);
+        assert_eq!(saved.get("core", "mode"), Some("engine"));
+        assert_eq!((saved.get("core", "ping"), saved.get("core", "ping_host")), (Some("0"), Some("9.9.9.9")));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -292,11 +303,70 @@ mod tests {
 
         let log = dir.join("events.log");
         log_notice(log.clone(), Severity::Bad, &problem.text());
-        let reopened = EventLog::open(Some(log));
+        let reopened = crate::events::EventLog::open(Some(log));
         let texts: Vec<_> = reopened.items.iter().map(|e| (e.severity, e.text.clone())).collect();
         assert_eq!(texts.len(), 1);
         assert_eq!(texts[0].0, Severity::Bad);
         assert!(texts[0].1.contains("core.ini"), "{}", texts[0].1);
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Ограда ядра (core-split): ядро ведёт только VPN. Обновления, пинг, статистика, помощник родного окна и запись
+    /// журнала на диск — у агента (`daemon::agent`); упоминание их в коде ядра — это работа, вернувшаяся в службу
+    /// SYSTEM, которую разделение из неё вынесло. Проверка по тексту, как `dialog::window_standard`: тесты и
+    /// комментарии не в счёт. `proto.rs` не здесь: его типы (`Request::Updates`, `CoreState.stats`/`ping`) общие
+    /// с окном прежней версии, ядро их только разбирает и отказывает.
+    #[test]
+    fn core_does_not_reach_into_agent_work() {
+        let deps = [
+            "crate::update", "update::", "crate::ping", "ping::", "crate::stats", "stats::", "TunnelStats",
+            "crate::native", "native::", "helper::", "run_elevated",
+        ];
+        // Прямая запись в файл журнала — только на выходе службы (`service.rs`, после `server::run`), не на живых путях.
+        let live_io = ["append_event", "EventLog::open", "events_file"];
+        let monitor = include_str!("../monitor.rs");
+        let core_path = [
+            ("server.rs", code_of(include_str!("server.rs")), true),
+            ("retry.rs", code_of(include_str!("retry.rs")), true),
+            ("restore.rs", code_of(include_str!("restore.rs")), true),
+            ("agent_watch.rs", code_of(include_str!("agent_watch.rs")), true),
+            ("netwatch.rs", code_of(include_str!("netwatch.rs")), true),
+            ("service.rs", code_of(include_str!("service.rs")), false),
+            ("monitor.rs::spawn", fn_text(monitor, "pub fn spawn("), true),
+            ("monitor.rs::poll", fn_text(monitor, "pub fn poll("), true),
+            ("monitor.rs::core_state", fn_text(monitor, "pub fn core_state("), true),
+        ];
+        let mut bad = Vec::new();
+        for (name, code, live) in &core_path {
+            assert!(!code.trim().is_empty(), "{name}: nothing to check");
+            let words = deps.iter().chain(if *live { live_io.iter() } else { [].iter() });
+            bad.extend(words.filter(|w| code.contains(**w)).map(|w| format!("{name} mentions {w}")));
+        }
+        assert!(bad.is_empty(), "core fence broken:\n{}", bad.join("\n"));
+    }
+
+    #[test]
+    fn core_fence_sees_code_not_comments_or_tests() {
+        let code = code_of("use crate::ping::PingState;\n// crate::stats in a comment\n#[cfg(test)]\nmod tests { crate::update }\n");
+        assert!(code.contains("crate::ping") && !code.contains("crate::stats") && !code.contains("crate::update"), "{code}");
+        let f = fn_text("fn a() {\n}\npub fn poll(x: u8) {\n    ping::measure();\n}\nfn b() { stats::x }\n", "pub fn poll(");
+        assert!(f.contains("ping::measure") && !f.contains("stats::"), "{f}");
+    }
+
+    /// Код без тестов и строк-комментариев.
+    fn code_of(source: &str) -> String {
+        let code = source.split("#[cfg(test)]").next().unwrap_or_default();
+        code.lines().filter(|l| !l.trim_start().starts_with("//")).collect::<Vec<_>>().join("\n")
+    }
+
+    /// Текст одной функции: от сигнатуры до закрывающей скобки на её отступе.
+    fn fn_text(source: &str, signature: &str) -> String {
+        // Рабочая копия может быть с CRLF (autocrlf): закрывающую скобку ищем по `\n`.
+        let source = &source.replace("\r\n", "\n");
+        let start = source.find(signature).unwrap_or_else(|| panic!("{signature} not found"));
+        let indent = &source[source[..start].rfind('\n').map_or(0, |i| i + 1)..start];
+        let close = format!("\n{indent}}}\n");
+        let end = source[start..].find(&close).map_or(source.len(), |i| start + i + close.len());
+        code_of(&source[start..end])
     }
 }

@@ -1,6 +1,7 @@
 //! Помощник в сеансе пользователя: действия в родном окне AmneziaWG (UI Automation), которых ядро из сеанса 0
-//! сделать не может. Ядро кладёт задание в свою папку `ops` (только SYSTEM и администраторы), запускает
-//! `awg-ui.exe --native-op <задание>` с повышенным токеном пользователя и забирает ответ из той же папки.
+//! сделать не может. Агент (`daemon::agent::tunnels`, SYSTEM) кладёт задание в папку `ops` (только SYSTEM и
+//! администраторы), запускает `awg-ui.exe --native-op <задание>` с повышенным токеном пользователя и забирает ответ
+//! из той же папки.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -34,7 +35,7 @@ pub enum Out {
     Err(String),
 }
 
-/// Сторона ядра: выполнить `op` в сеансе `session` и вернуть ответ помощника.
+/// Сторона агента: выполнить `op` в сеансе `session` и вернуть ответ помощника.
 pub fn run(session: u32, caller_sid: &str, op: &Op) -> Result<Out, String> {
     let dir = super::data_dir().join("ops");
     crate::win::protect_dir(&dir, super::DATA_SDDL)?;

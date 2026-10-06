@@ -178,13 +178,13 @@ impl App {
         if o.tray != new.tray {
             tray::set_visible(new.tray);
         }
-        // Пингует ядро: ему — включение и узел при каждом изменении (запрос дешёвый, ядро пишет core.ini; демо-ядро просто
-        // соглашается).
-        if o.ping != new.ping || o.ping_host != new.ping_host {
-            let (core, enabled, host, error) = (self.core.clone(), new.ping, new.ping_host.clone(), self.action_error.clone());
+        // Пингует агент: ему — включение и узел при каждом изменении (запрос дешёвый, агент пишет agent.ini). В демо
+        // агента нет: пинг в окне берёт настройки из `Options`, они уже подменены.
+        if let (Some(agent), true) = (&self.agent, o.ping != new.ping || o.ping_host != new.ping_host) {
+            let (agent, enabled, host, error) = (agent.clone(), new.ping, new.ping_host.clone(), self.action_error.clone());
             std::thread::spawn(move || {
-                if let Err(e) = core.ok(crate::daemon::proto::Request::SetPing { enabled, host }) {
-                    error.push(e);
+                if let Err(e) = agent.set_ping(enabled, &host) {
+                    error.push(crate::i18n::trf("agent.ping_not_set", &[&e]));
                 }
             });
         }

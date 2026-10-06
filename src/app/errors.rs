@@ -76,7 +76,7 @@ mod tests {
     use crate::monitor::Options;
 
     fn sink() -> ErrorSink {
-        let shared = Arc::new(Shared::new(None, Options { ping: false, ping_host: String::new(), notify: false, tray: false, taskbar: false }, None, None));
+        let shared = Arc::new(Shared::new(None, Options { ping: false, ping_host: String::new(), notify: false, tray: false, taskbar: false }, None));
         ErrorSink::new(shared, egui::Context::default())
     }
 

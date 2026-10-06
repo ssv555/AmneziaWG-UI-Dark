@@ -35,6 +35,8 @@ pub(super) enum Modal {
     UpdatesConfirm(UpdateConfirm),
     /// Редактор .conf закрывают с несохранёнными изменениями: сохранить, не сохранять или остаться.
     EditorUnsaved,
+    /// Конфиг в редакторе с ошибками сохраняют: записать всё равно (и что сделать затем) или вернуться к правке.
+    EditorInvalid(super::editor::AfterSave),
     About,
 }
 
@@ -151,7 +153,8 @@ mod tests {
     /// Контекст общий для кадров: признак автоповтора egui ставит сам по удержанным клавишам.
     fn frame(ctx: &egui::Context, modals: &mut Modals, events: Vec<egui::Event>, close: &[&str]) -> Vec<(&'static str, bool, bool)> {
         let mut seen = Vec::new();
-        let _ = ctx.run(egui::RawInput { events, ..Default::default() }, |ctx| {
+        let _ = ctx.run_ui(egui::RawInput { events, ..Default::default() }, |ui| {
+            let ctx = ui.ctx();
             modals.run(|m, turn| {
                 let (enter, escape) = turn.keys(ctx);
                 seen.push((kind(m), enter, escape));

@@ -78,9 +78,13 @@ pub fn install(owner_sid: &str) -> Result<bool, String> {
         let gui = crate::settings::Settings::from_ini(&crate::ini::Ini::load(&src.join("Settings.ini")));
         // Режим 2 — только если файлы движка на месте.
         config.mode = if crate::engine::installed_files_ok().is_ok() { gui.mode() } else { crate::settings::Mode::Overlay };
-        config.ping = gui.view.ping;
-        config.ping_host = gui.ping_host;
         config.language = gui.language;
+        // Пинг — настройка агента. Без `agent.ini` агент взял бы умолчания (в `core.ini` пинга нет) вместо выбора
+        // в окне; есть файл (переустановка) — он главнее.
+        let agent_ini = super::agent::AgentConfig::path();
+        if !agent_ini.exists() {
+            super::agent::AgentConfig { ping: gui.view.ping, ping_host: gui.ping_host }.save_to(&agent_ini)?;
+        }
         let events = data.join("logs").join("events.log");
         let carried = [
             copy_if_missing(&src.join("Stats.ini"), &data.join("Stats.ini")),

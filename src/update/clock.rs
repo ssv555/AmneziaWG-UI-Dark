@@ -64,11 +64,13 @@ pub(super) mod fake {
     pub(in super::super) struct FakeClock {
         pub at: Mutex<u64>,
         pub up: Mutex<Duration>,
+        /// Столько следующих вызовов `uptime` паникуют (как сбой часов) — проверка изоляции цикла планировщика.
+        pub panics: Mutex<u32>,
     }
 
     impl FakeClock {
         pub fn new(at: u64) -> FakeClock {
-            FakeClock { at: Mutex::new(at), up: Mutex::new(Duration::ZERO) }
+            FakeClock { at: Mutex::new(at), up: Mutex::new(Duration::ZERO), panics: Mutex::new(0) }
         }
     }
 
@@ -78,6 +80,14 @@ pub(super) mod fake {
         }
 
         fn uptime(&self) -> Duration {
+            let mut panics = self.panics.lock().unwrap();
+            if *panics > 0 {
+                *panics -= 1;
+                drop(panics);
+                assert!(crate::crash::isolated_now(), "паника планировщика не станет сбоем ядра");
+                panic!("clock edge");
+            }
+            drop(panics);
             *self.up.lock().unwrap()
         }
 

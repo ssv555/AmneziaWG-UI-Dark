@@ -4,8 +4,9 @@
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use windows::core::{BSTR, VARIANT};
+use windows::core::BSTR;
 use windows::Win32::Foundation::{HWND, LPARAM};
+use windows::Win32::System::Variant::VARIANT;
 use windows::Win32::System::Com::{CoCreateInstance, CoInitializeEx, CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED};
 use windows::Win32::UI::Accessibility::{
     CUIAutomation, IUIAutomation, IUIAutomationElement, IUIAutomationInvokePattern, IUIAutomationSelectionItemPattern,
@@ -176,7 +177,7 @@ fn blocking_dialog(main: HWND) -> Option<String> {
         main: HWND,
         title: Option<String>,
     }
-    unsafe extern "system" fn visit(h: HWND, data: LPARAM) -> windows::Win32::Foundation::BOOL {
+    unsafe extern "system" fn visit(h: HWND, data: LPARAM) -> windows::core::BOOL {
         let s = &mut *(data.0 as *mut Search);
         let mut pid = 0u32;
         GetWindowThreadProcessId(h, Some(&mut pid));
@@ -226,7 +227,7 @@ fn find_window() -> Option<HWND> {
         own_pid: u32,
         found: Option<HWND>,
     }
-    unsafe extern "system" fn visit(hwnd: HWND, data: LPARAM) -> windows::Win32::Foundation::BOOL {
+    unsafe extern "system" fn visit(hwnd: HWND, data: LPARAM) -> windows::core::BOOL {
         let search = &mut *(data.0 as *mut Search);
         let mut pid = 0u32;
         GetWindowThreadProcessId(hwnd, Some(&mut pid));
@@ -418,7 +419,7 @@ fn editor_window() -> Option<HWND> {
     struct Search {
         found: Option<HWND>,
     }
-    unsafe extern "system" fn visit(h: HWND, data: LPARAM) -> windows::Win32::Foundation::BOOL {
+    unsafe extern "system" fn visit(h: HWND, data: LPARAM) -> windows::core::BOOL {
         let search = &mut *(data.0 as *mut Search);
         if IsWindowVisible(h).as_bool() {
             let mut cls = [0u16; 64];
@@ -461,7 +462,7 @@ fn wait_dialog(owner: HWND) -> Option<HWND> {
         pid: u32,
         found: Option<HWND>,
     }
-    unsafe extern "system" fn visit(hwnd: HWND, data: LPARAM) -> windows::Win32::Foundation::BOOL {
+    unsafe extern "system" fn visit(hwnd: HWND, data: LPARAM) -> windows::core::BOOL {
         let search = &mut *(data.0 as *mut Search);
         let mut pid = 0u32;
         GetWindowThreadProcessId(hwnd, Some(&mut pid));

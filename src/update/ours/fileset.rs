@@ -4,6 +4,8 @@
 
 use std::path::{Path, PathBuf};
 
+use windows_sys::Win32::System::Threading::{CREATE_BREAKAWAY_FROM_JOB, CREATE_NEW_PROCESS_GROUP, DETACHED_PROCESS};
+
 use super::fs::{Fs, RealFs};
 use super::{InstallTarget, APP_EXE, RESTART_FLAG};
 use crate::i18n::trf;
@@ -41,14 +43,18 @@ impl InstallTarget {
     }
 }
 
+/// Как запускается помощник перезапуска: без консоли и группы запустившего и вне его Job object. Агент живёт в задании
+/// ядра с `KILL_ON_JOB_CLOSE`: без `CREATE_BREAKAWAY_FROM_JOB` помощник погиб бы вместе с ядром, которое он
+/// останавливает (задание выход разрешает — `agent_watch`). Процессу вне задания (ядру) флаг ничего не меняет.
+const RESTART_FLAGS: u32 = DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_BREAKAWAY_FROM_JOB;
+
 /// Запустить `exe --restart-core <заменённый набор>` отдельным процессом.
 fn spawn_restart(exe: &Path, set: &[String]) -> Result<(), String> {
     use std::os::windows::process::CommandExt;
-    use windows_sys::Win32::System::Threading::{CREATE_NEW_PROCESS_GROUP, DETACHED_PROCESS};
     std::process::Command::new(exe)
         .arg(RESTART_FLAG)
         .args(set)
-        .creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP)
+        .creation_flags(RESTART_FLAGS)
         .spawn()
         .map(drop)
         .map_err(|e| format!("{RESTART_FLAG}: {e}"))
@@ -178,6 +184,13 @@ mod tests {
     use crate::update::ours::fallback::restart_set;
     use crate::update::ours::testutil::*;
     use crate::update::ours::{MANIFEST, MANIFEST_SIG};
+
+    /// Помощник перезапуска, запущенный агентом, выходит из задания ядра: иначе остановка ядра убила бы и его.
+    #[test]
+    fn restart_helper_breaks_away_from_the_job() {
+        assert_eq!(RESTART_FLAGS & CREATE_BREAKAWAY_FROM_JOB, CREATE_BREAKAWAY_FROM_JOB);
+        assert_eq!(RESTART_FLAGS & DETACHED_PROCESS, DETACHED_PROCESS, "без консоли запустившего");
+    }
 
     #[test]
     fn install_set_replaces_and_rolls_back() {

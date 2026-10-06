@@ -5,6 +5,9 @@ use std::collections::BTreeSet;
 
 use crate::uapi;
 
+mod check;
+pub use check::{check, Issue};
+
 #[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct PeerInfo {
     pub public_key: String,
@@ -151,9 +154,25 @@ fn base64_decode(s: &str) -> Option<Vec<u8>> {
     Some(out)
 }
 
+/// В конфиге есть команды, которые служба туннеля выполнила бы (PreUp, PostUp, PreDown, PostDown): от SYSTEM.
+/// Из окна такие конфиги не принимают ни ядро, ни агент.
+pub fn has_scripts(text: &str) -> bool {
+    text.lines().any(|line| {
+        let key = line.split('=').next().unwrap_or("").trim().to_ascii_lowercase();
+        line.contains('=') && matches!(key.as_str(), "preup" | "postup" | "predown" | "postdown")
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scripts_are_found_in_any_case() {
+        assert!(has_scripts("[Interface]\npostup = cmd /c calc\n"));
+        assert!(has_scripts("[Interface]\n  PreDown=x\n"));
+        assert!(!has_scripts("[Interface]\nPrivateKey = a\n# PostUp is not set\n"));
+    }
 
     // Пример из man wg(8): открытый ключ вычисляется из приватного, сам приватный не сохраняется.
     const SAMPLE: &str = "[Interface]\r\n\

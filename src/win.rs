@@ -94,6 +94,8 @@ pub enum Files {
     Conf,
     ConfOrZip,
     Zip,
+    /// Журнал событий: `.log`, можно и `.txt`.
+    Log,
 }
 
 /// Стандартный диалог открытия/сохранения; `multi` — несколько файлов сразу. Отмена — пустой список.
@@ -111,6 +113,7 @@ pub fn pick_files(kind: Files, save: bool, multi: bool, initial: Option<&std::pa
         Files::Conf => ("AmneziaWG / WireGuard (*.conf)\0*.conf\0*.*\0*.*\0\0", "conf"),
         Files::ConfOrZip => ("*.conf, *.zip\0*.conf;*.zip\0*.*\0*.*\0\0", "conf"),
         Files::Zip => ("ZIP (*.zip)\0*.zip\0\0", "zip"),
+        Files::Log => ("Log (*.log)\0*.log\0Text (*.txt)\0*.txt\0*.*\0*.*\0\0", "log"),
     };
     let filter: Vec<u16> = filter.encode_utf16().collect();
     let ext = wide(ext);
@@ -507,8 +510,68 @@ pub fn border_color(hwnd: isize, rgb: Option<[u8; 3]>) {
     }
 }
 
+/// Секунды без клавиатуры и мыши в этом сеансе (признак «пользователь за компьютером» для `app::reminder`);
+/// `None` — Windows не ответила.
+pub fn idle_seconds() -> Option<u64> {
+    use windows_sys::Win32::System::SystemInformation::GetTickCount;
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetLastInputInfo, LASTINPUTINFO};
+    // dwTime — значение `GetTickCount` в момент последнего ввода.
+    let mut info = LASTINPUTINFO { cbSize: size_of::<LASTINPUTINFO>() as u32, dwTime: 0 };
+    if unsafe { GetLastInputInfo(&mut info) } == 0 {
+        return None;
+    }
+    Some(idle_ms(unsafe { GetTickCount() }, info.dwTime) / 1000)
+}
+
+/// Миллисекунды между двумя отсчётами `GetTickCount`: счётчик 32-битный и раз в 49 суток обнуляется.
+fn idle_ms(now_tick: u32, last_input_tick: u32) -> u64 {
+    now_tick.wrapping_sub(last_input_tick) as u64
+}
+
+/// `QUNS_ACCEPTS_NOTIFICATIONS` — единственное состояние, в котором всплывающее уведомление будет показано. В
+/// остальных (нет в сеансе или экран заблокирован, полноэкранная программа, игра, презентация, «не беспокоить»,
+/// полноэкранное приложение Store) Windows его прячет.
+const QUNS_ACCEPTS_NOTIFICATIONS: i32 = 5;
+
+fn accepts_notifications(state: i32) -> bool {
+    state == QUNS_ACCEPTS_NOTIFICATIONS
+}
+
+/// Покажет ли Windows уведомление сейчас; `Err` — текст ошибки вызова.
+pub fn notifications_accepted() -> Result<bool, String> {
+    let mut state = 0;
+    let hr = unsafe { windows_sys::Win32::UI::Shell::SHQueryUserNotificationState(&mut state) };
+    if hr < 0 {
+        return Err(format!("SHQueryUserNotificationState: 0x{hr:08X}"));
+    }
+    Ok(accepts_notifications(state))
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn idle_time_survives_the_tick_counter_wrapping() {
+        assert_eq!(super::idle_ms(10_000, 4_000), 6_000);
+        assert_eq!(super::idle_ms(5, u32::MAX - 994), 1_000, "счётчик обнулился между вводом и опросом");
+        assert_eq!(super::idle_ms(7, 7), 0);
+    }
+
+    #[test]
+    fn only_the_accepting_state_lets_a_toast_through() {
+        for (state, accepted) in [(1, false), (2, false), (3, false), (4, false), (5, true), (6, false), (7, false)] {
+            assert_eq!(super::accepts_notifications(state), accepted, "состояние {state}");
+        }
+    }
+
+    #[test]
+    fn probes_answer_without_panicking() {
+        // Сеанс сборки может быть без ввода (служба): важно, что вызовы не падают и число правдоподобно.
+        if let Some(secs) = super::idle_seconds() {
+            assert!(secs < 50 * 24 * 3600, "{secs}");
+        }
+        let _ = super::notifications_accepted();
+    }
+
     /// `quote_arg` -> CommandLineToArgvW возвращает исходные аргументы.
     #[test]
     fn quote_arg_round_trip() {

@@ -30,6 +30,13 @@ pub(super) const TICK: Duration = Duration::from_secs(1);
 /// адресов интерфейса, а она ещё может сорваться («Element not found», код 1168) — служба тогда встаёт через долю
 /// секунды: «подключён» по одному удачному запуску был бы неправдой.
 pub(super) const CONFIRM_FOR: Duration = Duration::from_secs(5);
+/// Дольше этого туннель не держится вне надзора одной арендой (`Retries::hold`), сколько бы ни попросили: ошибка
+/// в держателе не должна оставить желаемый туннель без переподключения на часы.
+pub(super) const MAX_LEASE: Duration = Duration::from_secs(60 * 60);
+/// Столько после истечения аренды пропажа службы туннеля режима 1 не считается отключением в окне AmneziaWG: держатель
+/// пропал или завис, и установщик мог убрать службу уже после конца аренды. Туннель, который так и не заработал,
+/// остаётся «вернуть» и дольше — пока не подключится (`Retries::after_lease`).
+pub(super) const AFTER_LEASE: Duration = Duration::from_secs(30 * 60);
 
 /// Один туннель под надзором.
 #[derive(Debug, Clone)]
@@ -96,6 +103,8 @@ pub(super) struct Seen<'a> {
     /// Туннель сейчас переключается по команде — не трогать.
     pub pending: &'a dyn Fn(&str) -> bool,
     pub service_exists: &'a dyn Fn(&str) -> bool,
+    /// У AmneziaWG (режим 1) ещё есть конфиг туннеля; не узнать — «есть»: из набора выводится только то, чего нет точно.
+    pub config_exists: &'a dyn Fn(&str) -> bool,
     /// Почему служба туннеля остановилась (коды завершения), для журнала; `None` — не узнать.
     pub stop_reason: &'a dyn Fn(&str) -> Option<String>,
     /// Службы туннелей принадлежат AmneziaWG (режим 1): их может удалить его родное окно.
@@ -113,6 +122,10 @@ pub(super) struct Tick {
     pub outside: Vec<String>,
     /// Итоги наблюдения: подключение подтверждено, поднятый попыткой туннель встал сразу после запуска.
     pub notes: Vec<(String, Note)>,
+    /// Аренда истекла сама (держатель не вернул туннели): надзор над ними снова идёт.
+    pub expired: Vec<String>,
+    /// Аренда истекла, а у AmneziaWG туннеля больше нет (конфиг удалён): вернуть нечего, выходят из желаемого набора.
+    pub gone: Vec<String>,
 }
 
 /// Что записать в журнал после попытки.
@@ -130,6 +143,11 @@ pub(super) enum Note {
 #[derive(Default)]
 pub(super) struct Retries {
     tracks: BTreeMap<String, Track>,
+    /// Туннели, снятые с надзора на время чужой работы над ними (установщик AmneziaWG), и когда аренда истекает.
+    holds: BTreeMap<String, Instant>,
+    /// Желаемые туннели, чья аренда истекла сама, и когда: их надо вернуть, а не считать отключёнными в окне AmneziaWG.
+    /// Пометка снимается, когда туннель работает спустя `AFTER_LEASE`, выходит из набора или его берёт пользователь.
+    after_lease: BTreeMap<String, Instant>,
     /// Первый такт после запуска ядра уже был.
     started: bool,
 }
@@ -137,15 +155,27 @@ pub(super) struct Retries {
 impl Retries {
     /// Очередной такт: кого взять под надзор, кого отпустить и кого подключать сейчас.
     pub(super) fn tick(&mut self, now: Instant, seen: &Seen) -> Tick {
-        let mut tick = Tick::default();
+        let mut tick = Tick { expired: self.expire(now, seen), ..Tick::default() };
         if let Some(running) = seen.running {
             // Вышел из набора (отключён пользователем, удалён) — надзор не нужен; заработавший снимается с надзора,
             // только проработав `CONFIRM_FOR` (`watch`).
             self.tracks.retain(|t, _| seen.desired.contains(t));
+            self.after_lease.retain(|t, at| seen.desired.contains(t) && (now < *at + AFTER_LEASE || !running.contains(t)));
+            tick.gone = self.gone_after_lease(running, seen);
             tick.notes = self.watch(now, running, seen.stop_reason);
-            let fresh: Vec<String> =
-                seen.desired.iter().filter(|t| !running.contains(*t) && !self.tracks.contains_key(*t) && !(seen.pending)(t)).cloned().collect();
+            let fresh: Vec<String> = seen
+                .desired
+                .iter()
+                .filter(|t| !running.contains(*t) && !self.tracks.contains_key(*t) && !self.is_held(t) && !(seen.pending)(t) && !tick.gone.contains(*t))
+                .cloned()
+                .collect();
             for t in fresh {
+                if self.after_lease.contains_key(&t) {
+                    // Аренда кончилась, а установщик убрал службу уже после неё (держатель завис или пропал): это не
+                    // воля пользователя, туннель подключается заново — `connect` ставит службу из конфига сам.
+                    self.tracks.insert(t, Track::new(now, Duration::ZERO));
+                    continue;
+                }
                 let exists = (seen.service_exists)(&t);
                 if self.started && seen.native_services && !exists {
                     // Работал и пропал вместе со службой — его отключили в окне AmneziaWG: поднимать обратно значило
@@ -169,10 +199,64 @@ impl Retries {
         tick.due = self
             .tracks
             .iter()
-            .filter(|(t, tr)| tr.next_at <= now && tr.up_since.is_none() && !(seen.pending)(t))
+            .filter(|(t, tr)| tr.next_at <= now && tr.up_since.is_none() && !self.is_held(t) && !(seen.pending)(t))
             .map(|(t, _)| t.clone())
             .collect();
         tick
+    }
+
+    /// Истёкшие аренды снимаются. Желаемый неработающий туннель сразу получает попытку, а все желаемые из истёкших
+    /// помечаются «вернуть» (`after_lease`): иначе в режиме 1 туннель, чью службу убрал установщик (до конца аренды
+    /// или, зависнув, после), такт счёл бы отключённым в окне AmneziaWG и вывел бы из набора — VPN не вернулся бы.
+    fn expire(&mut self, now: Instant, seen: &Seen) -> Vec<String> {
+        let expired: Vec<String> = self.holds.iter().filter(|(_, until)| **until <= now).map(|(t, _)| t.clone()).collect();
+        for t in &expired {
+            self.holds.remove(t);
+            if !seen.desired.contains(t) {
+                continue;
+            }
+            self.after_lease.insert(t.clone(), now);
+            if !seen.running.is_some_and(|r| r.contains(t)) {
+                self.restart(t, now);
+            }
+        }
+        expired
+    }
+
+    /// Помеченные «вернуть», которых у AmneziaWG больше нет (режим 1, туннель не работает, конфига нет): подключать
+    /// нечего, надзор и пометка с них снимаются, ядро выводит их из набора с записью в журнал.
+    fn gone_after_lease(&mut self, running: &[String], seen: &Seen) -> Vec<String> {
+        if !seen.native_services {
+            return Vec::new();
+        }
+        let gone: Vec<String> =
+            self.after_lease.keys().filter(|t| !running.contains(*t) && !(seen.pending)(t) && !(seen.config_exists)(t)).cloned().collect();
+        for t in &gone {
+            self.after_lease.remove(t);
+            self.tracks.remove(t);
+        }
+        gone
+    }
+
+    /// Снять туннели с надзора на `lease` (не дольше `MAX_LEASE`): их не подключают и не выводят из набора, пока
+    /// аренду не вернут (`release`) или она не истечёт сама — тогда надзор идёт снова, даже если держатель пропал.
+    /// Повторная аренда продлевает срок.
+    pub(super) fn hold(&mut self, tunnels: &[String], now: Instant, lease: Duration) {
+        let until = now + lease.min(MAX_LEASE);
+        for t in tunnels {
+            self.tracks.remove(t);
+            self.after_lease.remove(t);
+            self.holds.insert(t.clone(), until);
+        }
+    }
+
+    /// Вернуть аренду; возвращает туннели, которые действительно были сняты с надзора.
+    pub(super) fn release(&mut self, tunnels: &[String]) -> Vec<String> {
+        tunnels.iter().filter(|t| self.holds.remove(*t).is_some()).cloned().collect()
+    }
+
+    pub(super) fn is_held(&self, name: &str) -> bool {
+        self.holds.contains_key(name)
     }
 
     /// Работающие под надзором: проработал `CONFIRM_FOR` — подключён, надзор снят; поднятый нашей попыткой встал до
@@ -223,11 +307,13 @@ impl Retries {
     /// Команда пользователя над туннелем: надзор с него снимается (подключение он сделал сам, отключение — его воля).
     pub(super) fn forget(&mut self, name: &str) {
         self.tracks.remove(name);
+        self.after_lease.remove(name);
     }
 
     /// Смена режима или отключение всего: надзор снимается целиком.
     pub(super) fn clear(&mut self) {
         self.tracks.clear();
+        self.after_lease.clear();
     }
 
     /// «Повторить»: расписание с начала, попытка сразу.
@@ -269,6 +355,8 @@ mod tests {
         desired: Vec<String>,
         running: Vec<String>,
         services: Vec<String>,
+        /// Конфиги туннелей у AmneziaWG (режим 1); без конфига подключить нечем.
+        configs: Vec<String>,
         native: bool,
         /// Подключение не проходит, пока не наступит этот момент.
         fails_until: Option<Instant>,
@@ -277,6 +365,7 @@ mod tests {
         attempts: Vec<(String, Duration)>,
         notes: Vec<(String, Note)>,
         outside: Vec<String>,
+        gone: Vec<String>,
     }
 
     impl World {
@@ -285,29 +374,37 @@ mod tests {
                 desired: desired.iter().map(|s| s.to_string()).collect(),
                 running: vec![],
                 services: vec![],
+                configs: desired.iter().map(|s| s.to_string()).collect(),
                 native: false,
                 fails_until: None,
                 dies_after_start: 0,
                 attempts: vec![],
                 notes: vec![],
                 outside: vec![],
+                gone: vec![],
             }
         }
 
         /// Один такт ядра: решения надзора и попытки подключения, как в `Core::supervise_tick`.
         fn step(&mut self, r: &mut Retries, t0: Instant, now: Instant, network_changed: bool) {
             let services = self.services.clone();
+            let configs = self.configs.clone();
             let seen = Seen {
                 desired: &self.desired,
                 running: Some(&self.running),
                 pending: &|_| false,
                 service_exists: &|t| services.iter().any(|s| s.as_str() == t),
+                config_exists: &|t| configs.iter().any(|s| s.as_str() == t),
                 stop_reason: &|_| Some("код 1168".to_string()),
                 native_services: self.native,
                 network_changed,
             };
             let tick = r.tick(now, &seen);
             self.notes.extend(tick.notes);
+            for t in tick.gone {
+                self.desired.retain(|d| *d != t);
+                self.gone.push(t);
+            }
             for t in tick.outside {
                 self.desired.retain(|d| *d != t);
                 self.outside.push(t);
@@ -316,6 +413,8 @@ mod tests {
                 self.attempts.push((t.clone(), now - t0));
                 let result = if self.running.contains(&t) || !self.desired.contains(&t) {
                     Ok(false)
+                } else if !self.configs.contains(&t) {
+                    Err("no config".to_string())
                 } else if self.fails_until.is_some_and(|u| now < u) {
                     Err("Element not found".to_string())
                 } else if self.dies_after_start > 0 {
@@ -324,6 +423,10 @@ mod tests {
                     Ok(true)
                 } else {
                     self.running.push(t.clone());
+                    // `connect` режима 1 ставит службу из конфига.
+                    if !self.services.contains(&t) {
+                        self.services.push(t.clone());
+                    }
                     Ok(true)
                 };
                 if let Some(note) = r.outcome(&t, now, result) {
@@ -537,6 +640,7 @@ mod tests {
             running: None,
             pending: &|_| false,
             service_exists: &|_| panic!("вслепую не решаем"),
+            config_exists: &|_| panic!("вслепую не решаем"),
             stop_reason: &|_| panic!("вслепую не решаем"),
             native_services: true,
             network_changed: false,
@@ -550,12 +654,181 @@ mod tests {
         let t0 = Instant::now();
         let mut r = Retries::default();
         let desired = vec!["a".to_string()];
-        let seen = Seen { desired: &desired, running: Some(&[]), pending: &|_| true, service_exists: &|_| false, stop_reason: &|_| None, native_services: false, network_changed: false };
+        let seen = Seen { desired: &desired, running: Some(&[]), pending: &|_| true, service_exists: &|_| false, config_exists: &|_| true, stop_reason: &|_| None, native_services: false, network_changed: false };
         assert!(r.tick(t0, &seen).due.is_empty());
         assert!(r.view(t0).is_empty());
         // Снятый пользователем надзор: исход попытки, начатой до его команды, ничего не записывает.
         r.restart("a", t0);
         r.forget("a");
         assert_eq!(r.outcome("a", t0, Err("x".into())), None);
+    }
+
+    /// Установщик AmneziaWG держит туннель (режим 1) и убирает его службу. Пока аренда идёт, надзор туннель не
+    /// подключает и из набора не выводит; держатель пропал — аренда истекает сама, и попытка идёт сразу.
+    #[test]
+    fn lease_expiry_resumes_supervision_even_if_the_holder_is_gone() {
+        let t0 = Instant::now();
+        let mut r = Retries::default();
+        let mut w = World::new(&["office"]);
+        w.native = true;
+        w.running = vec!["office".into()];
+        w.services = vec!["office".into()];
+        w.run(&mut r, t0, 0, 10);
+        r.hold(&["office".to_string()], t0 + Duration::from_secs(10), Duration::from_secs(900));
+        assert!(r.is_held("office"));
+        // MSI удалил службу и остановил туннель.
+        w.running.clear();
+        w.services.clear();
+        w.run(&mut r, t0, 10, 910);
+        assert!(w.attempts.is_empty(), "под арендой попыток нет: {:?}", w.attempts);
+        assert!(w.outside.is_empty(), "под арендой туннель не выводится из набора");
+        assert!(r.view(t0 + Duration::from_secs(909)).is_empty());
+
+        let seen = Seen {
+            desired: &w.desired,
+            running: Some(&[]),
+            pending: &|_| false,
+            service_exists: &|_| false,
+            config_exists: &|_| true,
+            stop_reason: &|_| None,
+            native_services: true,
+            network_changed: false,
+        };
+        let tick = r.tick(t0 + Duration::from_secs(910), &seen);
+        assert_eq!(tick.expired, ["office"]);
+        assert_eq!(tick.due, ["office"], "аренда истекла — попытка сразу, а не вывод из набора");
+        assert!(tick.outside.is_empty());
+        assert!(!r.is_held("office"));
+    }
+
+    #[test]
+    fn released_tunnels_are_reported_once_and_lease_is_capped() {
+        let t0 = Instant::now();
+        let mut r = Retries::default();
+        let names = ["a".to_string(), "b".to_string()];
+        r.hold(&names, t0, Duration::from_secs(u32::MAX.into()));
+        assert_eq!(r.release(&["a".to_string(), "c".to_string()]), ["a"], "не взятый в аренду не возвращается");
+        assert!(r.release(&["a".to_string()]).is_empty(), "вторая отдача той же аренды — пусто");
+        let desired = vec!["b".to_string()];
+        let seen = Seen { desired: &desired, running: Some(&[]), pending: &|_| false, service_exists: &|_| true, config_exists: &|_| true, stop_reason: &|_| None, native_services: false, network_changed: false };
+        assert!(r.tick(t0 + MAX_LEASE - TICK, &seen).due.is_empty(), "аренда ещё идёт");
+        let tick = r.tick(t0 + MAX_LEASE, &seen);
+        assert_eq!((tick.expired, tick.due), (vec!["b".to_string()], vec!["b".to_string()]), "аренда не длиннее MAX_LEASE");
+    }
+
+    /// «Повторить» по туннелю под арендой не прорывает её: попытка ждёт возврата.
+    #[test]
+    fn held_tunnel_is_not_due_even_after_restart() {
+        let t0 = Instant::now();
+        let mut r = Retries::default();
+        r.hold(&["a".to_string()], t0, Duration::from_secs(60));
+        r.restart("a", t0);
+        let desired = vec!["a".to_string()];
+        let seen = Seen { desired: &desired, running: Some(&[]), pending: &|_| false, service_exists: &|_| true, config_exists: &|_| true, stop_reason: &|_| None, native_services: false, network_changed: false };
+        assert!(r.tick(t0, &seen).due.is_empty());
+    }
+
+    /// Держатель аренды пропал посреди MSI (режим 1): аренда истекла, службы туннеля нет, AmneziaWG ещё ставится.
+    /// Туннель остаётся желаемым и переподключается по обычному расписанию, а не выводится из набора как отключённый
+    /// в окне AmneziaWG; когда установка закончилась — подключён.
+    #[test]
+    fn expired_lease_with_the_service_gone_keeps_the_tunnel_desired_and_reconnects_it() {
+        let t0 = Instant::now();
+        let mut r = Retries::default();
+        let mut w = World::new(&["office"]);
+        w.native = true;
+        w.running = vec!["office".into()];
+        w.services = vec!["office".into()];
+        w.run(&mut r, t0, 0, 10);
+        r.hold(&["office".to_string()], t0 + Duration::from_secs(10), Duration::from_secs(60));
+        w.running.clear();
+        w.services.clear();
+        // AmneziaWG ещё не встал: подключение не проходит до 100 с.
+        w.fails_until = Some(t0 + Duration::from_secs(100));
+        w.run(&mut r, t0, 10, 95);
+        assert!(w.outside.is_empty() && w.gone.is_empty(), "истёкшая аренда — не отключение в окне AmneziaWG");
+        assert_eq!(w.desired, ["office"]);
+        assert_eq!(w.attempt_secs(), [70, 80, 90], "попытка сразу по истечении, дальше каждые 10 с");
+        w.run(&mut r, t0, 95, 120);
+        assert_eq!(w.attempt_secs(), [70, 80, 90, 100]);
+        assert_eq!(w.running, ["office"]);
+        assert!(matches!(w.notes.last(), Some((t, Note::Connected { attempts: 4 })) if t == "office"), "{:?}", w.notes);
+        assert!(r.view(t0).is_empty());
+    }
+
+    /// MSI завис дольше аренды: туннель ещё работал, когда она истекла, а службу установщик убрал позже. Это тоже не
+    /// воля пользователя — попытка сразу. Спустя `AFTER_LEASE` работы пропажа службы снова значит «отключён в окне».
+    #[test]
+    fn service_removed_after_the_lease_expired_is_reconnected_not_dropped() {
+        let t0 = Instant::now();
+        let mut r = Retries::default();
+        let mut w = World::new(&["office"]);
+        w.native = true;
+        w.running = vec!["office".into()];
+        w.services = vec!["office".into()];
+        w.run(&mut r, t0, 0, 10);
+        r.hold(&["office".to_string()], t0 + Duration::from_secs(10), Duration::from_secs(60));
+        w.run(&mut r, t0, 10, 200);
+        assert!(w.attempts.is_empty(), "работающий не трогается");
+        w.running.clear();
+        w.services.clear();
+        w.run(&mut r, t0, 200, 210);
+        assert!(w.outside.is_empty());
+        assert_eq!(w.attempt_secs(), [200]);
+        assert_eq!(w.running, ["office"]);
+
+        // Проработал `AFTER_LEASE` после истечения — пометка снята, обычное правило режима 1 снова в силе.
+        let later = 70 + AFTER_LEASE.as_secs();
+        w.run(&mut r, t0, 210, later + 1);
+        w.running.clear();
+        w.services.clear();
+        w.run(&mut r, t0, later + 1, later + 3);
+        assert_eq!(w.outside, ["office"]);
+        assert_eq!(w.attempt_secs(), [200]);
+    }
+
+    /// Аренда истекла, а у AmneziaWG туннеля больше нет (конфиг удалён): подключать нечего — туннель выходит из набора
+    /// (ядро пишет это в журнал), попыток больше нет.
+    #[test]
+    fn expired_lease_of_a_tunnel_amneziawg_no_longer_has_drops_it() {
+        let t0 = Instant::now();
+        let mut r = Retries::default();
+        let mut w = World::new(&["office", "home"]);
+        w.native = true;
+        w.running = vec!["office".into(), "home".into()];
+        w.services = w.running.clone();
+        w.run(&mut r, t0, 0, 10);
+        r.hold(&w.desired.clone(), t0 + Duration::from_secs(10), Duration::from_secs(60));
+        w.running.clear();
+        w.services.clear();
+        w.configs.retain(|c| c != "home");
+        w.run(&mut r, t0, 10, 200);
+        assert_eq!(w.gone, ["home"]);
+        assert!(w.outside.is_empty());
+        assert_eq!(w.desired, ["office"]);
+        assert!(!w.attempts.iter().any(|(t, _)| t == "home"), "{:?}", w.attempts);
+        assert_eq!(w.running, ["office"]);
+        assert!(r.view(t0).is_empty());
+    }
+
+    /// Пометка «вернуть» не переживает команду пользователя и новую аренду: отключение в окне AmneziaWG после них —
+    /// снова отключение.
+    #[test]
+    fn user_command_ends_the_after_lease_mark() {
+        let t0 = Instant::now();
+        let mut r = Retries::default();
+        let mut w = World::new(&["office"]);
+        w.native = true;
+        w.running = vec!["office".into()];
+        w.services = vec!["office".into()];
+        w.run(&mut r, t0, 0, 10);
+        r.hold(&["office".to_string()], t0 + Duration::from_secs(10), Duration::from_secs(60));
+        w.run(&mut r, t0, 10, 80);
+        r.forget("office");
+        w.running.clear();
+        w.services.clear();
+        w.run(&mut r, t0, 80, 82);
+        assert_eq!(w.outside, ["office"]);
+        assert!(w.attempts.is_empty());
     }
 }
