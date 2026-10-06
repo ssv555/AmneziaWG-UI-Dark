@@ -13,7 +13,8 @@ use super::dialog::{dialog_window, window_escape, window_keys};
 use super::markdown;
 use super::modals::{Modal, Outcome as ModalOutcome, Turn};
 use super::reminder::{self, Due, Presence};
-use super::{dialog_buttons, mono, ErrorSink, GRAY, GREEN, RED, YELLOW};
+use super::theme::{palette, Palette};
+use super::{dialog_buttons, mono, ErrorSink};
 use crate::daemon::agent::client::{AgentApi, UpdatesError};
 use crate::fmt;
 use crate::i18n::{tr, trf};
@@ -351,7 +352,7 @@ impl UpdatesWindow {
                 if !notes.is_empty() {
                     ui.add_space(8.0);
                     for note in &notes {
-                        ui.add(egui::Label::new(RichText::new(note).color(YELLOW)).wrap());
+                        ui.add(egui::Label::new(RichText::new(note).color(palette().warning)).wrap());
                     }
                 }
                 ui.add_space(10.0);
@@ -559,7 +560,7 @@ pub(super) fn menu_title(mut job: egui::text::LayoutJob, badge: bool) -> egui::W
     }
     let size = job.sections.first().map_or(14.0, |s| s.format.font_id.size);
     let dot = egui::FontId::proportional(size * 0.55);
-    job.append("●", 4.0, egui::TextFormat { font_id: dot, color: YELLOW, valign: Align::Center, ..Default::default() });
+    job.append("●", 4.0, egui::TextFormat { font_id: dot, color: palette().warning, valign: Align::Center, ..Default::default() });
     job.into()
 }
 
@@ -601,7 +602,7 @@ fn cell(ui: &mut Ui, width: f32, right: bool, add: impl FnOnce(&mut Ui)) {
 
 fn head(ui: &mut Ui, width: f32, right: bool, key: &str) {
     cell(ui, width, right, |ui| {
-        ui.add(egui::Label::new(RichText::new(tr(key)).color(GRAY)).truncate());
+        ui.add(egui::Label::new(RichText::new(tr(key)).color(palette().idle)).truncate());
     });
 }
 
@@ -625,9 +626,9 @@ fn flex(total: f32, fixed: &[f32], spacing: f32, min: f32) -> f32 {
 fn version_cell(ui: &mut Ui, version: Option<&str>, released: Option<u64>, tip: Option<String>, missing: &str) {
     match version {
         Some(v) => {
-            let mut shown = vec![ui.label(mono(v, Color32::WHITE))];
+            let mut shown = vec![ui.label(mono(v, palette().text_strong))];
             if let Some(at) = released.filter(|t| *t > 0) {
-                shown.push(ui.label(mono(fmt::date(at), GRAY)));
+                shown.push(ui.label(mono(fmt::date(at), palette().idle)));
             }
             if let Some(tip) = tip {
                 for r in shown {
@@ -636,7 +637,7 @@ fn version_cell(ui: &mut Ui, version: Option<&str>, released: Option<u64>, tip: 
             }
         }
         None => {
-            ui.label(RichText::new(missing).color(GRAY));
+            ui.label(RichText::new(missing).color(palette().idle));
         }
     }
 }
@@ -675,7 +676,7 @@ fn components_table(ui: &mut Ui, v: &View, clicks: &mut Vec<Click>) {
             cell(ui, W_VERSION, false, |ui| version_cell(ui, avail.map(Available::shown).as_deref(), avail.map(|a| a.published), None, "—"));
             cell(ui, W_STATUS, false, |ui| {
                 let s = status(c);
-                clipped_tip(ui, RichText::new(status_text(&s)).color(status_color(&s)), status_tip(&s));
+                clipped_tip(ui, RichText::new(status_text(&s)).color(status_color(palette(), &s)), status_tip(&s));
             });
             // Текст релиза — в отдельном окне: высота строки от его длины не зависит.
             cell(ui, W_NEWS, false, |ui| {
@@ -693,17 +694,17 @@ fn status_line(ui: &mut Ui, v: &View) {
         if v.busy {
             ui.spinner();
             let text = v.state.busy.clone().unwrap_or_else(|| tr("upd.waiting"));
-            clipped(ui, RichText::new(text).color(YELLOW));
+            clipped(ui, RichText::new(text).color(palette().warning));
         } else {
             let text = match v.state.checked_at {
                 Some(t) => trf("upd.checked_at", &[&fmt::date_time(t)]),
                 None => tr("upd.never_checked"),
             };
-            ui.label(RichText::new(text).color(GRAY));
+            ui.label(RichText::new(text).color(palette().idle));
         }
     });
     if let Some(e) = v.error {
-        cell(ui, ui.available_width(), false, |ui| clipped(ui, RichText::new(e).color(RED)));
+        cell(ui, ui.available_width(), false, |ui| clipped(ui, RichText::new(e).color(palette().error)));
     }
 }
 
@@ -728,20 +729,20 @@ fn history_table(ui: &mut Ui, v: &View, clicks: &mut Vec<Click>) {
     for e in &v.state.history {
         ui.horizontal(|ui| {
             cell(ui, W_DATE, false, |ui| {
-                ui.label(mono(fmt::date_time(e.at), GRAY));
+                ui.label(mono(fmt::date_time(e.at), palette().idle));
             });
             cell(ui, w_name, false, |ui| clipped(ui, RichText::new(short(e.component))));
             cell(ui, W_ACTION, false, |ui| clipped(ui, RichText::new(action_name(e.action))));
-            cell(ui, W_FROM_TO, false, |ui| clipped(ui, mono(versions(e), Color32::WHITE)));
+            cell(ui, W_FROM_TO, false, |ui| clipped(ui, mono(versions(e), palette().text_strong)));
             cell(ui, W_SIZE, true, |ui| {
                 let size = if e.backup.is_some() { fmt::bytes(e.backup_size as f64) } else { "—".to_string() };
-                ui.label(mono(size, GRAY));
+                ui.label(mono(size, palette().idle));
             });
             cell(ui, W_RESULT, false, |ui| {
                 if e.ok {
-                    ui.label(RichText::new(tr("upd.result_ok")).color(GREEN));
+                    ui.label(RichText::new(tr("upd.result_ok")).color(palette().connected));
                 } else {
-                    let r = ui.label(RichText::new(tr("upd.result_err")).color(RED));
+                    let r = ui.label(RichText::new(tr("upd.result_err")).color(palette().error));
                     if let Some(err) = &e.error {
                         r.on_hover_text(err);
                     }
@@ -867,12 +868,12 @@ fn status_tip(s: &Status) -> String {
     }
 }
 
-fn status_color(s: &Status) -> Color32 {
+fn status_color(p: &Palette, s: &Status) -> Color32 {
     match s {
-        Status::Ok | Status::OkEngine(_) => GREEN,
-        Status::Update | Status::UpstreamNewer(_) => YELLOW,
-        Status::Missing | Status::Unknown | Status::Manual(_) | Status::UpstreamUnchecked => GRAY,
-        Status::Error(_) => RED,
+        Status::Ok | Status::OkEngine(_) => p.connected,
+        Status::Update | Status::UpstreamNewer(_) => p.warning,
+        Status::Missing | Status::Unknown | Status::Manual(_) | Status::UpstreamUnchecked => p.idle,
+        Status::Error(_) => p.error,
     }
 }
 
@@ -1060,6 +1061,7 @@ fn versions(e: &HistoryEntry) -> String {
 
 #[cfg(test)]
 mod tests {
+    use super::super::theme::{DAYLIGHT, GRAPHITE};
     use super::*;
 
     pub(super) fn row(id: Component, installed: Option<&str>, available: Option<&str>, update: bool) -> ComponentState {
@@ -1202,7 +1204,9 @@ mod tests {
         broken.error = Some("timeout".into());
         assert_eq!(status(&broken), Status::Error("timeout".into()));
         assert_eq!(status_text(&Status::Error("timeout".into())), "timeout");
-        assert_eq!(status_color(&Status::Update), YELLOW);
+        assert_eq!(status_color(&GRAPHITE, &Status::Update), GRAPHITE.warning);
+        // Цвет берётся из переданной палитры, а не из констант Графита.
+        assert_eq!(status_color(&DAYLIGHT, &Status::Update), DAYLIGHT.warning);
     }
 
     fn engine(up: Option<crate::update::EngineUpstream>) -> ComponentState {
@@ -1220,12 +1224,12 @@ mod tests {
         assert_eq!(s, Status::Manual(full.into()));
         assert_eq!(status_text(&s), tr("upd.st_manual"));
         assert_eq!(status_tip(&s), full);
-        assert_eq!(status_color(&s), GRAY);
+        assert_eq!(status_color(&GRAPHITE, &s), GRAPHITE.idle);
         assert!(status_text(&s).chars().count() < 40, "короткий текст помещается в колонку");
         // Тот же текст без признака — настоящий сбой, красный.
         app.manual_only = false;
         assert_eq!(status(&app), Status::Error(full.into()));
-        assert_eq!(status_color(&status(&app)), RED);
+        assert_eq!(status_color(&GRAPHITE, &status(&app)), GRAPHITE.error);
     }
 
     #[test]
@@ -1233,15 +1237,15 @@ mod tests {
         use crate::update::EngineUpstream as Up;
         let tag = "v3.1.20260814".to_string();
         let ok = status(&engine(Some(Up::Current(tag.clone()))));
-        assert_eq!((&ok, status_color(&ok)), (&Status::OkEngine(tag.clone()), GREEN));
+        assert_eq!((&ok, status_color(&GRAPHITE, &ok)), (&Status::OkEngine(tag.clone()), GRAPHITE.connected));
         assert_eq!(status_text(&ok), "Up to date");
         assert_eq!(status_tip(&ok), "Built from amneziawg-windows v3.1.20260814 — the newest Amnezia release");
 
         let newer = status(&engine(Some(Up::Newer("v3.2.0".into()))));
-        assert_eq!((status_text(&newer), status_color(&newer)), ("Amnezia released v3.2.0 — comes with an app update".to_string(), YELLOW));
+        assert_eq!((status_text(&newer), status_color(&GRAPHITE, &newer)), ("Amnezia released v3.2.0 — comes with an app update".to_string(), GRAPHITE.warning));
 
         let failed = status(&engine(Some(Up::Unchecked)));
-        assert_eq!((status_text(&failed), status_color(&failed)), ("Could not check".to_string(), GRAY));
+        assert_eq!((status_text(&failed), status_color(&GRAPHITE, &failed)), ("Could not check".to_string(), GRAPHITE.idle));
         assert!(status_tip(&failed).contains("event log"));
 
         // Проверки не было (state.json прежней версии): прежнее поведение.

@@ -5,7 +5,7 @@ use std::sync::Arc;
 use eframe::egui::{self, Align2, Color32, FontId, Pos2, Rect, RichText, Sense, Stroke, Ui, Vec2};
 
 use crate::app::a11y::{self, Painted};
-use crate::app::theme::{level_color, BLUE, NUM_FONT, RED};
+use crate::app::theme::{level_color, palette, NUM_FONT};
 use crate::app::{menu, Action, Confirm, Dialog};
 use crate::daemon::proto::Plan;
 use crate::groups::{self, Agg, Verdict, UNGROUPED};
@@ -34,12 +34,12 @@ pub(super) fn drop_target(ui: &Ui, resp: &egui::Response, rect: Rect, target: Op
     match verdict {
         Verdict::Noop => {}
         Verdict::Invalid => {
-            ui.painter().rect_stroke(area, 3.0, Stroke::new(1.5_f32, RED), egui::StrokeKind::Inside);
+            ui.painter().rect_stroke(area, 3.0, Stroke::new(1.5_f32, palette().error), egui::StrokeKind::Inside);
             ui.ctx().set_cursor_icon(egui::CursorIcon::NotAllowed);
         }
         Verdict::Valid => {
-            ui.painter().rect_filled(area, 3.0, BLUE.gamma_multiply(0.15));
-            ui.painter().rect_stroke(area, 3.0, Stroke::new(1.5_f32, BLUE), egui::StrokeKind::Inside);
+            ui.painter().rect_filled(area, 3.0, palette().accent.gamma_multiply(0.15));
+            ui.painter().rect_stroke(area, 3.0, Stroke::new(1.5_f32, palette().accent), egui::StrokeKind::Inside);
             if resp.dnd_release_payload::<Drag>().is_some() {
                 let to = target.map(str::to_string);
                 actions.push(match &*drag {
@@ -88,6 +88,14 @@ fn triangle_right(painter: &egui::Painter, c: Pos2, r: f32, color: Color32) {
     painter.add(egui::Shape::convex_polygon(pts, color, Stroke::NONE));
 }
 
+/// Фон выделенной строки. В светлой теме бледная заливка почти сливается с фоном, поэтому слева ещё полоса акцента.
+fn paint_selected(ui: &Ui, painter: &egui::Painter, row: Rect) {
+    painter.rect_filled(row, 2.0, ui.visuals().selection.bg_fill);
+    if palette().selection_bar {
+        painter.rect_filled(Rect::from_min_size(row.min, Vec2::new(3.0, row.height())), 1.0, palette().accent);
+    }
+}
+
 fn truncated(ui: &Ui, text: &str, font: FontId, color: Color32, width: f32) -> Arc<egui::Galley> {
     let mut job = egui::text::LayoutJob::single_section(text.to_string(), egui::TextFormat::simple(font, color));
     job.wrap = egui::text::TextWrapping::truncate_at_width(width.max(10.0));
@@ -129,7 +137,7 @@ pub(super) fn group_row(ui: &mut Ui, g: &GroupLine, cols: &[(SortKey, &str, f32)
     }
     let painter = ui.painter_at(row);
     if g.selected {
-        painter.rect_filled(row, 2.0, ui.visuals().selection.bg_fill);
+        paint_selected(ui, &painter, row);
     } else if resp.hovered() {
         painter.rect_filled(row, 2.0, ui.visuals().widgets.hovered.weak_bg_fill);
     }
@@ -263,7 +271,7 @@ pub(super) fn tunnel_row(
     }
     let painter = ui.painter_at(row);
     if selected {
-        painter.rect_filled(row, 2.0, ui.visuals().selection.bg_fill);
+        paint_selected(ui, &painter, row);
     } else if resp.hovered() {
         painter.rect_filled(row, 2.0, ui.visuals().widgets.hovered.weak_bg_fill);
     }
@@ -353,7 +361,7 @@ pub(super) fn tunnel_row(
                 ui.close();
             }
             ui.separator();
-            let delete = egui::Button::new(RichText::new(tr("del.tunnel_menu")).color(RED)).shortcut_text("Del");
+            let delete = egui::Button::new(RichText::new(tr("del.tunnel_menu")).color(palette().error)).shortcut_text("Del");
             if ui.add(delete).clicked() {
                 actions.push(Action::Confirm(Confirm::DeleteTunnel(name.clone())));
                 ui.close();
@@ -404,7 +412,7 @@ pub(super) fn tunnel_row(
             });
         }
         ui.separator();
-        let delete = egui::Button::new(RichText::new(tr("del.tunnel_menu")).color(RED)).shortcut_text("Del");
+        let delete = egui::Button::new(RichText::new(tr("del.tunnel_menu")).color(palette().error)).shortcut_text("Del");
         if ui.add(delete).clicked() {
             actions.push(Action::Confirm(Confirm::DeleteTunnel(name.clone())));
             ui.close();

@@ -189,3 +189,5 @@ flowchart LR
 Третья ограда к разделению процессов не относится: `windows_follow_the_standard` в `src/app/dialog.rs` запрещает создавать `egui::Window` где-либо, кроме общего конструктора диалогов.
 
 Четвёртая: `context_menus_go_through_the_helper` в `src/app/menu.rs` запрещает в `src/app` контекстное меню по правому щелчку напрямую (`Popup::context_menu`, `Response::context_menu`, `secondary_clicked`); любое контекстное меню строится через `menu::context_menu`, которое открывает его ещё и по Shift+F10 и клавише меню.
+
+Пятая: `colours_come_only_from_the_palette` в `src/app/theme.rs` запрещает в `src/app.rs` и `src/app/` вне `theme.rs` цвета-литералы (константы и конструкторы `Color32::`, кроме `TRANSPARENT` и `PLACEHOLDER`) и базовые `Visuals::dark()` / `Visuals::light()` egui; любой цвет берётся из `Palette` активной темы.

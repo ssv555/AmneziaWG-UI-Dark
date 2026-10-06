@@ -48,7 +48,7 @@ mod tray_menu;
 mod updates;
 mod watcher;
 mod window;
-use core_ui::{send_language, CoreLink, Probe};
+use core_ui::{send_language, CoreLink, Look, Probe};
 use details::{details, Detail};
 use dialog::dialog_buttons;
 use editor::Editor;
@@ -165,8 +165,8 @@ pub struct App {
     /// Связь с ядром: полоса «установить / обновить», сверка в фоне.
     core_link: CoreLink,
     hwnd: isize,
-    /// Режим, чей вид (иконки, разделители, рамка окна) уже выставлен.
-    look: Option<Mode>,
+    /// Выставленный вид: режим (иконки, разделители, рамка окна) и тема (палитра, заголовок окна).
+    look: Option<Look>,
     /// Ошибка ушла в журнал, пока панель журнала скрыта.
     unseen_error: bool,
     /// «Выход» из меню трея ждёт разбора в кадре.
@@ -188,7 +188,7 @@ pub struct App {
 impl App {
     pub fn new(cc: &eframe::CreationContext, shared: Arc<Shared>, start: Start) -> Self {
         let ctx = cc.egui_ctx.clone();
-        ctx.set_theme(egui::Theme::Dark);
+        // Тему (стиль egui, заголовок и рамку окна Windows) ставит `apply_look` в каждом кадре до рисования.
         add_fallback_fonts(&ctx);
         ctx.all_styles_mut(|s| {
             for (style, font) in s.text_styles.iter_mut() {
@@ -215,9 +215,6 @@ impl App {
             Ok(RawWindowHandle::Win32(w)) => w.hwnd.get(),
             _ => 0,
         };
-        if hwnd != 0 {
-            win::dark_title_bar(hwnd);
-        }
         // Служба менеджера AmneziaWG — забота ядра, пинг — агента; в демо пинг выдуманный, прямо в окне.
         let action_error = ErrorSink::new(shared.clone(), ctx.clone());
         let core: Core = match &start.demo {
@@ -572,7 +569,7 @@ impl eframe::App for App {
         self.track_window(ctx);
         self.sync_zoom(ctx);
         self.sync_mode();
-        self.apply_mode_look();
+        self.apply_look();
         self.watch_core();
         self.drain_errors();
         self.check_exit_request();

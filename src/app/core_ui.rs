@@ -1,4 +1,4 @@
-//! Окно и ядро: полоса «установить / обновить ядро», установка через один запрос UAC, режим от ядра.
+//! Окно и ядро: полоса «установить / обновить ядро», установка через один запрос UAC, режим от ядра, вид окна по режиму и теме.
 
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
@@ -6,8 +6,10 @@ use std::time::{Duration, Instant};
 
 use eframe::egui::{self, RichText};
 
-use super::{Action, App, Core, ErrorSink, NEON, YELLOW};
-use crate::settings::Mode;
+use super::theme::{self, ThemeId};
+use super::{Action, App, Core, ErrorSink};
+use crate::events::Severity;
+use crate::settings::{Mode, Theme};
 use crate::elevated::Outcome;
 use crate::i18n::{self, tr, trf};
 
@@ -253,7 +255,7 @@ impl App {
                 if matches!(link, LinkState::Installing) {
                     ui.spinner();
                 }
-                ui.label(RichText::new(text).color(YELLOW));
+                ui.label(RichText::new(text).color(theme::palette().warning));
                 if let Some(b) = button {
                     if ui.button(b).on_hover_text(tr("core.uac_hint")).clicked() {
                         actions.push(Action::InstallCore);
@@ -293,24 +295,58 @@ impl App {
         }
     }
 
-    /// Режим виден сразу: в режиме 2 иконки (трей, панель задач, заголовок) жёлтые, разделители и рамки —
-    /// неоново-жёлтые, рамка окна Windows 11 — тоже; в режиме 1 всё обычное.
-    pub(super) fn apply_mode_look(&mut self) {
+    /// Вид окна по режиму и теме. Режим виден сразу: в режиме 2 иконки (трей, панель задач, заголовок) жёлтые,
+    /// разделители и рамки — цвета `mode2_frame` темы, рамка окна Windows 11 — тоже. Тема — палитра egui и
+    /// заголовок окна Windows (тёмный или светлый). Зовётся каждый кадр до рисования; работа — только при смене.
+    pub(super) fn apply_look(&mut self) {
         let engine = self.s.mode() == Mode::Engine;
         // Трей ставится после первого кадра — звать каждый кадр, повтор ничего не делает.
         crate::tray::set_engine(engine);
-        if self.look == Some(self.s.mode()) {
+        let (look, registry_error) =
+            Look::wanted(self.s.mode(), self.s.theme, self.ctx.system_theme(), crate::win::apps_use_light_theme);
+        let focus_changed =
+            self.ctx.input(|i| i.events.iter().any(|e| matches!(e, egui::Event::WindowFocused(_))));
+        match look.step(self.look, focus_changed) {
+            LookStep::Keep => return,
+            LookStep::MarkTitleBar => {
+                self.mark_title_bar(look.theme.palette().dark);
+                return;
+            }
+            LookStep::Apply => {}
+        }
+        self.look = Some(look);
+        self.about_icon = None;
+        // Ошибка реестра пишется только при смене вида: читается он каждый кадр, а ключ вида от неё не меняется.
+        if let Some(e) = registry_error {
+            self.shared.log("", Severity::Warn, &e);
+        }
+        theme::set_active(look.theme);
+        let palette = look.theme.palette();
+        // Тема egui задана явно: при «как в системе» egui сам менял бы стиль вслед за Windows мимо палитры.
+        let egui_theme = if palette.dark { egui::Theme::Dark } else { egui::Theme::Light };
+        self.ctx.set_theme(egui_theme);
+        self.ctx.set_visuals_of(egui_theme, palette.visuals(engine));
+        if self.hwnd == 0 {
             return;
         }
-        self.look = Some(self.s.mode());
-        self.about_icon = None;
-        let stroke = if engine { NEON } else { egui::Visuals::dark().widgets.noninteractive.bg_stroke.color };
-        self.ctx.all_styles_mut(|s| {
-            s.visuals.widgets.noninteractive.bg_stroke.color = stroke;
-            s.visuals.window_stroke.color = stroke;
-        });
-        if self.hwnd != 0 {
-            crate::win::border_color(self.hwnd, engine.then_some([NEON.r(), NEON.g(), NEON.b()]));
+        let frame = palette.mode2_frame;
+        // В режиме 1 рамка системная (`None`): Windows подбирает её под тёмный или светлый заголовок, и Графит
+        // остаётся ровно прежним.
+        let border = engine.then_some([frame.r(), frame.g(), frame.b()]);
+        for result in [crate::win::title_bar_dark(self.hwnd, palette.dark), crate::win::border_color(self.hwnd, border)] {
+            if let Err(e) = result {
+                self.shared.log("", Severity::Warn, &e);
+            }
+        }
+    }
+
+    /// Заголовок снова в цвет темы, без перерисовки рамки (см. `LookStep::MarkTitleBar`).
+    fn mark_title_bar(&self, dark: bool) {
+        if self.hwnd == 0 {
+            return;
+        }
+        if let Err(e) = crate::win::title_bar_dark_mark(self.hwnd, dark) {
+            self.shared.log("", Severity::Warn, &e);
         }
     }
 
@@ -322,6 +358,68 @@ impl App {
             self.sources.clear_infos();
         }
     }
+}
+
+/// Выставленный вид окна: режим, тема и тема Windows, как её сообщил egui (от winit). Тема Windows — в ключе
+/// и при явной теме окна: при смене темы Windows winit сам перекрашивает заголовок под систему, и его нужно
+/// вернуть к теме окна.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(super) struct Look {
+    mode: Mode,
+    theme: ThemeId,
+    system: Option<egui::Theme>,
+}
+
+impl Look {
+    /// Вид по настройкам. «Как в Windows» берёт тему, о которой сообщил egui; не сообщил — `registry`
+    /// (`AppsUseLightTheme`); не прочлось и там — тёмная, с текстом ошибки для журнала.
+    fn wanted(
+        mode: Mode,
+        theme: Theme,
+        system: Option<egui::Theme>,
+        registry: impl FnOnce() -> Result<bool, String>,
+    ) -> (Look, Option<String>) {
+        let (system_is_light, error) = match (theme, system) {
+            (_, Some(reported)) => (reported == egui::Theme::Light, None),
+            // Явная тема от Windows не зависит — реестр не читаем.
+            (Theme::Graphite | Theme::Slate | Theme::Daylight, None) => (false, None),
+            (Theme::System, None) => match registry() {
+                Ok(light) => (light, None),
+                Err(e) => (false, Some(format!("Windows theme: {e}; using the dark theme"))),
+            },
+        };
+        (Look { mode, theme: theme::resolve(theme, system_is_light), system }, error)
+    }
+
+    /// Выставлять ли вид заново: впервые или что-то в ключе поменялось.
+    fn differs_from(self, applied: Option<Look>) -> bool {
+        applied != Some(self)
+    }
+
+    /// Что сделать с видом в этом кадре. `focus_changed` — окно получило или потеряло фокус.
+    fn step(self, applied: Option<Look>, focus_changed: bool) -> LookStep {
+        if self.differs_from(applied) {
+            LookStep::Apply
+        } else if focus_changed {
+            LookStep::MarkTitleBar
+        } else {
+            LookStep::Keep
+        }
+    }
+}
+
+/// Шаг вида окна в кадре.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum LookStep {
+    /// Вид уже выставлен.
+    Keep,
+    /// Вид тот же, но заголовок мог перекраситься мимо нас: winit на любое `WM_SETTINGCHANGE` (обои, переменные
+    /// среды, не только тема) ставит заголовку тему Windows, и событие приходит, только если сменилась сама тема
+    /// Windows. Само сообщение окну не видно, поэтому повод — смена фокуса: настройки меняют в другой программе,
+    /// и к окну возвращаются щелчком. Отметка у DWM дешёвая, кадров с фокусом мало.
+    MarkTitleBar,
+    /// Выставить вид целиком: палитра, заголовок с перерисовкой, рамка.
+    Apply,
 }
 
 #[cfg(test)]
@@ -401,5 +499,66 @@ mod tests {
         link.set_installing();
         assert_eq!(link.due(false, t0 + s(9999)), None);
         assert_eq!(link.state(), LinkState::Installing);
+    }
+
+    fn no_registry() -> Result<bool, String> {
+        panic!("реестр читается только для «Как в Windows», когда egui не сообщил тему")
+    }
+
+    fn theme_of(theme: Theme, system: Option<egui::Theme>, registry: impl FnOnce() -> Result<bool, String>) -> ThemeId {
+        let (look, error) = Look::wanted(Mode::Overlay, theme, system, registry);
+        assert_eq!(error, None);
+        look.theme
+    }
+
+    #[test]
+    fn follow_windows_takes_the_reported_theme_first_then_the_registry() {
+        assert_eq!(theme_of(Theme::System, Some(egui::Theme::Light), no_registry), ThemeId::Daylight);
+        assert_eq!(theme_of(Theme::System, Some(egui::Theme::Dark), no_registry), ThemeId::Graphite);
+        assert_eq!(theme_of(Theme::System, None, || Ok(true)), ThemeId::Daylight);
+        assert_eq!(theme_of(Theme::System, None, || Ok(false)), ThemeId::Graphite);
+        // Реестр не прочелся — тёмная тема и ошибка для журнала, а не тишина.
+        let (look, error) = Look::wanted(Mode::Overlay, Theme::System, None, || Err("RegGetValueW: 2".into()));
+        assert_eq!(look.theme, ThemeId::Graphite);
+        assert!(error.is_some_and(|e| e.contains("RegGetValueW: 2")));
+    }
+
+    #[test]
+    fn explicit_theme_ignores_windows() {
+        for system in [Some(egui::Theme::Light), Some(egui::Theme::Dark), None] {
+            assert_eq!(theme_of(Theme::Graphite, system, no_registry), ThemeId::Graphite);
+            assert_eq!(theme_of(Theme::Slate, system, no_registry), ThemeId::Slate);
+            assert_eq!(theme_of(Theme::Daylight, system, no_registry), ThemeId::Daylight);
+        }
+    }
+
+    #[test]
+    fn look_is_reapplied_only_when_its_key_changes() {
+        let wanted = |mode, theme, system| Look::wanted(mode, theme, system, || Ok(false)).0;
+        let dark = Some(egui::Theme::Dark);
+        let applied = wanted(Mode::Overlay, Theme::Graphite, dark);
+        assert!(applied.differs_from(None), "первый кадр");
+        assert!(!wanted(Mode::Overlay, Theme::Graphite, dark).differs_from(Some(applied)));
+        assert!(wanted(Mode::Engine, Theme::Graphite, dark).differs_from(Some(applied)), "режим");
+        assert!(wanted(Mode::Overlay, Theme::Slate, dark).differs_from(Some(applied)), "тема");
+        assert!(wanted(Mode::Overlay, Theme::System, Some(egui::Theme::Light)).differs_from(Some(applied)), "Windows посветлела");
+        // При явной теме смена темы Windows тоже повод: winit перекрасил заголовок под систему, его надо вернуть.
+        assert!(wanted(Mode::Overlay, Theme::Graphite, Some(egui::Theme::Light)).differs_from(Some(applied)));
+        // «Как в Windows» при тёмной Windows — та же палитра, но настройка другая: вид тот же, перевыставлять нечего.
+        assert!(!wanted(Mode::Overlay, Theme::System, dark).differs_from(Some(applied)));
+    }
+
+    /// Явная тёмная тема при светлой Windows: winit мог перекрасить заголовок без события (любое
+    /// `WM_SETTINGCHANGE`), поэтому при смене фокуса отметка заголовка ставится снова — без смены вида целиком.
+    #[test]
+    fn title_bar_is_marked_again_when_focus_changes() {
+        let (applied, _) = Look::wanted(Mode::Overlay, Theme::Graphite, Some(egui::Theme::Light), no_registry);
+        assert_eq!(applied.step(Some(applied), false), LookStep::Keep);
+        assert_eq!(applied.step(Some(applied), true), LookStep::MarkTitleBar);
+        // Первый кадр и смена вида выставляют всё, заголовок тоже: отдельная отметка не нужна.
+        assert_eq!(applied.step(None, false), LookStep::Apply);
+        assert_eq!(applied.step(None, true), LookStep::Apply);
+        let (engine, _) = Look::wanted(Mode::Engine, Theme::Graphite, Some(egui::Theme::Light), no_registry);
+        assert_eq!(engine.step(Some(applied), true), LookStep::Apply);
     }
 }

@@ -1,4 +1,4 @@
-//! Windows-специфика: права администратора, тёмный заголовок, служба менеджера, автозапуск, один экземпляр.
+//! Windows-специфика: права администратора, заголовок и рамка окна под тему, служба менеджера, автозапуск, один экземпляр.
 
 use std::ffi::c_void;
 use std::ptr::{null, null_mut};
@@ -488,25 +488,77 @@ pub fn on_screen(x: f32, y: f32) -> bool {
     x >= left - 8.0 && y >= top - 8.0 && x < right - 100.0 && y < bottom - 50.0
 }
 
-pub fn dark_title_bar(hwnd: isize) {
-    let on: i32 = 1;
-    unsafe {
+/// Тёмный или светлый заголовок окна, перерисованный сразу.
+pub fn title_bar_dark(hwnd: isize, dark: bool) -> Result<(), String> {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        SetWindowPos, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER,
+    };
+    title_bar_dark_mark(hwnd, dark)?;
+    // Windows 10 перерисовывает заголовок только при следующей активации окна; смена рамки — сразу.
+    let flags = SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE;
+    if unsafe { SetWindowPos(hwnd as _, null_mut(), 0, 0, 0, 0, flags) } == 0 {
+        return Err(format!("title bar redraw: SetWindowPos: {}", std::io::Error::last_os_error()));
+    }
+    Ok(())
+}
+
+/// Только отметка тёмного или светлого заголовка у DWM, без перерисовки рамки: дёшево, можно звать на каждую
+/// активацию окна. Windows 11 перерисовывает заголовок сам, Windows 10 — при следующей активации.
+pub fn title_bar_dark_mark(hwnd: isize, dark: bool) -> Result<(), String> {
+    let on = i32::from(dark);
+    let hr = unsafe {
         DwmSetWindowAttribute(
             hwnd as *mut c_void,
             DWMWA_USE_IMMERSIVE_DARK_MODE as _,
             &on as *const i32 as *const c_void,
             size_of::<i32>() as u32,
-        );
+        )
+    };
+    if hr < 0 {
+        return Err(format!("title bar dark={dark}: DwmSetWindowAttribute HRESULT 0x{hr:08X}"));
     }
+    Ok(())
 }
 
-/// Цвет рамки окна (Windows 11; в Windows 10 вызов ничего не делает); `None` — системный.
-pub fn border_color(hwnd: isize, rgb: Option<[u8; 3]>) {
+/// Цвет рамки окна (Windows 11; Windows 10 такой настройки не знает — не ошибка); `None` — системный.
+pub fn border_color(hwnd: isize, rgb: Option<[u8; 3]>) -> Result<(), String> {
     // DWMWA_BORDER_COLOR и DWMWA_COLOR_DEFAULT из dwmapi.h; цвет — COLORREF 0x00BBGGRR.
     const DWMWA_BORDER_COLOR: u32 = 34;
+    // Ответ Windows 10 на незнакомый атрибут.
+    const E_INVALIDARG: i32 = 0x8007_0057_u32 as i32;
     let color: u32 = rgb.map_or(0xFFFF_FFFF, |[r, g, b]| u32::from(r) | u32::from(g) << 8 | u32::from(b) << 16);
-    unsafe {
-        DwmSetWindowAttribute(hwnd as *mut c_void, DWMWA_BORDER_COLOR as _, &color as *const u32 as *const c_void, size_of::<u32>() as u32);
+    let hr = unsafe {
+        DwmSetWindowAttribute(hwnd as *mut c_void, DWMWA_BORDER_COLOR as _, &color as *const u32 as *const c_void, size_of::<u32>() as u32)
+    };
+    if hr >= 0 || hr == E_INVALIDARG {
+        return Ok(());
+    }
+    Err(format!("window border colour {color:08X}: DwmSetWindowAttribute HRESULT 0x{hr:08X}"))
+}
+
+/// Светлая ли тема приложений в Windows (`AppsUseLightTheme`) — запасной путь, когда egui не сообщил тему.
+/// Значения нет (Windows до 1809, тема не менялась) — светлая, как и считает Windows.
+pub fn apps_use_light_theme() -> Result<bool, String> {
+    use windows_sys::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_SUCCESS};
+    use windows_sys::Win32::System::Registry::{RegGetValueW, HKEY_CURRENT_USER, RRF_RT_REG_DWORD};
+    const KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize";
+    let mut value: u32 = 0;
+    let mut size = size_of::<u32>() as u32;
+    let status = unsafe {
+        RegGetValueW(
+            HKEY_CURRENT_USER,
+            wide(KEY).as_ptr(),
+            wide("AppsUseLightTheme").as_ptr(),
+            RRF_RT_REG_DWORD,
+            null_mut(),
+            &mut value as *mut u32 as *mut c_void,
+            &mut size,
+        )
+    };
+    match status {
+        ERROR_SUCCESS => Ok(value != 0),
+        ERROR_FILE_NOT_FOUND => Ok(true),
+        e => Err(format!(r"HKCU\{KEY}\AppsUseLightTheme: {}", std::io::Error::from_raw_os_error(e as i32))),
     }
 }
 

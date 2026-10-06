@@ -5,7 +5,7 @@ use eframe::egui::{self, RichText, Ui};
 use crate::i18n::{tr, trf};
 use crate::settings::Mode;
 
-use super::theme::{GREEN, NEON, RED};
+use super::theme::palette;
 use super::Action;
 
 pub(super) struct StatusBar<'a> {
@@ -21,7 +21,7 @@ pub(super) struct StatusBar<'a> {
 pub(super) fn status_bar(ui: &mut Ui, bar: &StatusBar, actions: &mut Vec<Action>) {
     ui.horizontal(|ui| {
         match bar.mode {
-            Mode::Engine => ui.label(RichText::new(tr("status.mode_engine")).color(NEON).strong()),
+            Mode::Engine => ui.label(RichText::new(tr("status.mode_engine")).color(palette().mode2_text).strong()),
             Mode::Overlay => ui.weak(tr("status.mode_overlay")),
         };
         if !bar.service.is_empty() {
@@ -29,15 +29,15 @@ pub(super) fn status_bar(ui: &mut Ui, bar: &StatusBar, actions: &mut Vec<Action>
             ui.weak(bar.service);
         }
         if let Some(e) = bar.poll_error {
-            ui.colored_label(RED, trf("status.poll_error", &[e]));
+            ui.colored_label(palette().error, trf("status.poll_error", &[e]));
         }
         if let Some(n) = bar.notice {
             if ui.small_button("×").on_hover_text(tr("btn.dismiss")).clicked() {
                 actions.push(Action::ClearNotice);
             }
-            ui.colored_label(GREEN, n);
+            ui.colored_label(palette().connected, n);
         }
-        if bar.unseen_error && ui.add(egui::Button::new(RichText::new(tr("status.error_in_log")).color(RED)).small()).clicked() {
+        if bar.unseen_error && ui.add(egui::Button::new(RichText::new(tr("status.error_in_log")).color(palette().error)).small()).clicked() {
             actions.push(Action::ShowLog);
         }
     });

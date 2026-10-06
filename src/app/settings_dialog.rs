@@ -8,11 +8,11 @@
 use eframe::egui::{self, RichText};
 
 use crate::i18n::tr;
-use crate::settings::{Mode, Settings};
+use crate::settings::{Mode, Settings, Theme};
 
 use super::dialog::{dialog_buttons, dialog_ok_cancel_apply, dialog_window};
 use super::modals::{Outcome, Turn};
-use super::theme::{RED, YELLOW};
+use super::theme::palette;
 use super::{Action, App, Modal};
 
 /// Значения параметров в окне — черновик до «ОК» или «Применить».
@@ -29,6 +29,8 @@ pub(super) struct Choices {
     /// Вернуть диалоги, отмеченные «Больше не показывать».
     restore_dialogs: bool,
     mode: Mode,
+    /// Окно только сохраняет выбор: тему из `Settings` каждый кадр берёт цикл окна.
+    theme: Theme,
 }
 
 impl Choices {
@@ -43,6 +45,7 @@ impl Choices {
             ping_host: s.ping_host.clone(),
             restore_dialogs: false,
             mode: s.mode(),
+            theme: s.theme,
         }
     }
 
@@ -69,6 +72,7 @@ impl Choices {
         s.close_to_tray = self.close_to_tray;
         s.taskbar = self.taskbar;
         s.ping_host = self.ping_host.trim().to_string();
+        s.theme = self.theme;
         if self.restore_dialogs {
             s.hidden_dialogs.clear();
         }
@@ -189,9 +193,31 @@ impl App {
     }
 }
 
+/// Ключ перевода подписи темы в списке.
+fn theme_key(theme: Theme) -> &'static str {
+    match theme {
+        Theme::Graphite => "theme.graphite",
+        Theme::Slate => "theme.slate",
+        Theme::Daylight => "theme.daylight",
+        Theme::System => "theme.system",
+    }
+}
+
 /// Разделы окна: Общие, Уведомления и трей, Сеть, Режим работы.
 fn sections(ui: &mut egui::Ui, c: &mut Choices, hidden: usize) {
     section(ui, "set.sec_general");
+    ui.horizontal(|ui| {
+        let label = ui.label(tr("set.theme"));
+        egui::ComboBox::from_id_salt("settings-theme")
+            .selected_text(tr(theme_key(c.theme)))
+            .show_ui(ui, |ui| {
+                for theme in Theme::ALL {
+                    ui.selectable_value(&mut c.theme, theme, tr(theme_key(theme)));
+                }
+            })
+            .response
+            .labelled_by(label.id);
+    });
     ui.checkbox(&mut c.multiple, tr("set.multiple"));
     ui.checkbox(&mut c.taskbar, tr("set.taskbar"));
     if let Some(on) = &mut c.autostart {
@@ -212,14 +238,14 @@ fn sections(ui: &mut egui::Ui, c: &mut Choices, hidden: usize) {
         ui.add(egui::TextEdit::singleline(&mut c.ping_host).desired_width(220.0));
     });
     if !c.ping_host_ok() {
-        ui.add(egui::Label::new(RichText::new(tr("set.ping_bad")).color(RED)).wrap());
+        ui.add(egui::Label::new(RichText::new(tr("set.ping_bad")).color(palette().error)).wrap());
     }
 
     section(ui, "set.mode");
     for (mode, key) in [(Mode::Overlay, "mode.overlay"), (Mode::Engine, "mode.engine")] {
         ui.radio_value(&mut c.mode, mode, tr(key));
     }
-    ui.add(egui::Label::new(RichText::new(tr("set.mode_note")).color(YELLOW).small()).wrap());
+    ui.add(egui::Label::new(RichText::new(tr("set.mode_note")).color(palette().warning).small()).wrap());
 }
 
 fn section(ui: &mut egui::Ui, key: &str) {
@@ -245,6 +271,7 @@ mod tests {
         c.ping_host = " 9.9.9.9 ".into();
         c.restore_dialogs = true;
         c.mode = Mode::Engine;
+        c.theme = Theme::Daylight;
         d
     }
 
@@ -266,6 +293,7 @@ mod tests {
             (!before.multiple, !before.tray, !before.notify, !before.close_to_tray, !before.taskbar)
         );
         assert_eq!(s.ping_host, "9.9.9.9");
+        assert_eq!(s.theme, Theme::Daylight);
         assert!(s.hidden_dialogs.is_empty());
         // Автозапуск и режим — прежними путями: действие автозапуска и окно подтверждения смены режима.
         assert_eq!(actions.len(), 2);
@@ -282,6 +310,7 @@ mod tests {
         let mut actions = Vec::new();
         assert_eq!(d.press(Press::Cancel, &mut s, Some(false), &mut actions), Outcome::Close);
         assert_eq!(s.to_ini().to_text(), before);
+        assert_eq!(s.theme, Theme::Graphite, "the theme picked in the window is discarded");
         assert!(actions.is_empty());
     }
 
@@ -318,10 +347,40 @@ mod tests {
         let mut s = with_hidden();
         s.multiple = true;
         s.ping_host = "9.9.9.9".into();
+        s.theme = Theme::Slate;
         let mut d = SettingsDialog::new(&s, Some(true));
+        assert_eq!(d.choices.theme, Theme::Slate, "the window starts from the saved theme");
         d.choices.mode = Mode::Engine;
         let reset = d.choices.defaults();
+        assert_eq!(reset.theme, Theme::Graphite);
         let def = Choices::read(&Settings::default(), Some(true));
         assert_eq!(reset, Choices { restore_dialogs: true, mode: Mode::Engine, ..def });
+    }
+
+    #[test]
+    fn apply_saves_the_theme_and_cancel_after_it_keeps_it() {
+        let mut s = Settings::default();
+        let mut d = SettingsDialog::new(&s, None);
+        d.choices.theme = Theme::System;
+        assert!(d.changed(&s, None), "a new theme enables Apply");
+        let mut actions = Vec::new();
+        assert_eq!(d.press(Press::Apply, &mut s, None, &mut actions), Outcome::Keep);
+        assert_eq!(s.theme, Theme::System);
+        d.choices.theme = Theme::Slate;
+        assert_eq!(d.press(Press::Cancel, &mut s, None, &mut actions), Outcome::Close);
+        assert_eq!(s.theme, Theme::System);
+        assert!(actions.is_empty(), "a theme change needs no action: the window reads the setting");
+    }
+
+    #[test]
+    fn every_theme_has_its_own_label_in_both_languages() {
+        use std::collections::HashSet;
+        let (mut en, mut ru) = (HashSet::new(), HashSet::new());
+        for theme in Theme::ALL {
+            let (e, r) = crate::i18n::builtin_pair(theme_key(theme)).unwrap_or_else(|| panic!("{theme:?}: no i18n key"));
+            en.insert(e);
+            ru.insert(r);
+        }
+        assert_eq!((en.len(), ru.len()), (Theme::ALL.len(), Theme::ALL.len()), "theme labels must differ");
     }
 }

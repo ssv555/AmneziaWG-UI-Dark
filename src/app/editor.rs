@@ -11,7 +11,7 @@ use crate::win;
 
 use super::dialog::{dialog_buttons, dialog_choice, dialog_window, window_escape};
 use super::modals::{Modal, Modals, Outcome, Turn};
-use super::theme::{GREEN, RED};
+use super::theme::palette;
 use super::watcher::Infos;
 use super::App;
 use crate::daemon::CoreApi;
@@ -136,7 +136,7 @@ impl App {
                     });
                 });
                 if let Some((note, is_error)) = &ed.note {
-                    ui.colored_label(if *is_error { RED } else { GREEN }, note);
+                    ui.colored_label(if *is_error { palette().error } else { palette().connected }, note);
                 }
                 ui.separator();
                 // Место под замечаниями оставляется заранее: поле редактора иначе заняло бы всю высоту.
@@ -153,7 +153,7 @@ impl App {
                     ui.separator();
                     egui::ScrollArea::vertical().id_salt("conf-issues").max_height(row * ISSUES_VISIBLE as f32).show(ui, |ui| {
                         for issue in &ed.issues {
-                            ui.colored_label(RED, issue_text(issue));
+                            ui.colored_label(palette().error, issue_text(issue));
                         }
                     });
                 }

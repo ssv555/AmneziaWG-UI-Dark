@@ -19,7 +19,7 @@ use crate::{tray, win};
 
 use super::dialog::{dialog_buttons, dialog_window};
 use super::modals::{Modal, Outcome, Turn};
-use super::theme::YELLOW;
+use super::theme::palette;
 use super::{Action, App, ErrorSink};
 
 /// Действия, которые перезаписывают или удаляют данные или рвут VPN, — только после подтверждения.
@@ -82,7 +82,7 @@ impl App {
                 ui.add(egui::Label::new(text).wrap());
                 if let Some(w) = &warning {
                     ui.add_space(6.0);
-                    ui.add(egui::Label::new(RichText::new(w).color(YELLOW)).wrap());
+                    ui.add(egui::Label::new(RichText::new(w).color(palette().warning)).wrap());
                 }
                 ui.add_space(10.0);
                 if offer_copy {

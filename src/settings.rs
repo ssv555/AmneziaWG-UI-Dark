@@ -41,6 +41,37 @@ impl Mode {
     }
 }
 
+/// Тема окна. `System` — светлая или тёмная вслед за Windows; какая именно, решает окно (`app::theme::resolve`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Theme {
+    /// Тёмная, прежний вид (по умолчанию).
+    Graphite,
+    /// Мягкая тёмная сине-серая.
+    Slate,
+    /// Светлая.
+    Daylight,
+    /// Как в Windows.
+    System,
+}
+
+impl Theme {
+    pub const ALL: [Theme; 4] = [Theme::Graphite, Theme::Slate, Theme::Daylight, Theme::System];
+
+    /// Имя в INI. Не менять: оно записано в файлах пользователей.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Theme::Graphite => "graphite",
+            Theme::Slate => "slate",
+            Theme::Daylight => "daylight",
+            Theme::System => "system",
+        }
+    }
+
+    fn parse(s: &str) -> Option<Theme> {
+        Theme::ALL.into_iter().find(|t| t.as_str() == s)
+    }
+}
+
 /// Диалог с «Больше не показывать». Имя в `[hidden_dialogs]` — `ini_name`, оно записано в файлах пользователей и
 /// от переводов не зависит: переименование ключа в `i18n` не должно сбрасывать запомненный выбор.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
@@ -203,6 +234,8 @@ pub struct Settings {
     pub close_to_tray: bool,
     /// Режим работы; меняется только с перезапуском программы, и только через `switch_mode`.
     mode: Mode,
+    /// Тема окна; неизвестное имя в файле — Графит.
+    pub theme: Theme,
     pub ping_host: String,
     /// Код языка ISO 639-2 (eng, rus, …).
     pub language: String,
@@ -239,6 +272,7 @@ impl Default for Settings {
             taskbar: true,
             close_to_tray: true,
             mode: Mode::Overlay,
+            theme: Theme::Graphite,
             ping_host: DEFAULT_PING_HOST.to_string(),
             language: crate::i18n::DEFAULT.to_string(),
             log_dir: DEFAULT_LOG_DIR.to_string(),
@@ -301,6 +335,8 @@ impl Settings {
             taskbar: ini.get_bool("options", "taskbar_state", d.taskbar),
             close_to_tray: ini.get_bool("options", "close_to_tray", d.close_to_tray),
             mode,
+            // Неизвестное имя (опечатка, другой регистр, файл новой версии) — тема по умолчанию: это вид, не данные.
+            theme: ini.get("options", "theme").and_then(Theme::parse).unwrap_or(d.theme),
             ping_host: ini.get("options", "ping_host").filter(|h| !h.is_empty()).unwrap_or(DEFAULT_PING_HOST).to_string(),
             language: ini.get("options", "language").filter(|c| crate::i18n::is_code(c)).unwrap_or(crate::i18n::DEFAULT).to_string(),
             log_dir: ini.get("options", "log_dir").filter(|d| !d.is_empty()).unwrap_or(DEFAULT_LOG_DIR).to_string(),
@@ -364,6 +400,7 @@ impl Settings {
         ini.set_bool("options", "taskbar_state", self.taskbar);
         ini.set_bool("options", "close_to_tray", self.close_to_tray);
         ini.set("options", "mode", self.mode.as_str());
+        ini.set("options", "theme", self.theme.as_str());
         ini.set("options", "ping_host", &self.ping_host);
         ini.set("options", "language", &self.language);
         ini.set("options", "log_dir", &self.log_dir);
@@ -476,6 +513,30 @@ mod tests {
         let all: Vec<_> = DialogId::ALL.iter().map(|d| d.ini_name()).collect();
         assert_eq!(all, ["mode.overlay", "mode.engine", "exit.keep", "exit.disconnect", "tunnel.disconnect"]);
         assert_eq!(DialogId::mode_help(Mode::Engine), DialogId::ModeEngine);
+    }
+
+    #[test]
+    fn theme_roundtrips_under_its_pinned_ini_name() {
+        // Имена закреплены: это формат файла.
+        assert_eq!(Theme::ALL.map(Theme::as_str), ["graphite", "slate", "daylight", "system"]);
+        for theme in Theme::ALL {
+            let mut s = Settings::default();
+            s.theme = theme;
+            assert_eq!(s.to_ini().get("options", "theme"), Some(theme.as_str()));
+            assert_eq!(reload(&s), s, "{theme:?}");
+        }
+    }
+
+    #[test]
+    fn missing_or_unknown_theme_falls_back_to_graphite() {
+        assert_eq!(Settings::default().theme, Theme::Graphite);
+        // Файл прежней версии: ключа нет, остальное грузится как было.
+        let old = Settings::from_ini(&Ini::parse("[options]\nmode=engine\n"));
+        assert_eq!((old.theme, old.mode()), (Theme::Graphite, Mode::Engine));
+        for value in ["neon", "", "Slate", "SYSTEM", "day light"] {
+            let s = Settings::from_ini(&Ini::parse(&format!("[options]\ntheme={value}\nmode=engine\n")));
+            assert_eq!((s.theme, s.mode()), (Theme::Graphite, Mode::Engine), "theme={value:?}");
+        }
     }
 
     #[test]

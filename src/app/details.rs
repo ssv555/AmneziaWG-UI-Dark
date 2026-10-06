@@ -1,10 +1,10 @@
 //! Правая часть окна: сведения о выбранном туннеле (состояние, трафик, график, конфиг).
 
-use eframe::egui::{self, Color32, RichText, Ui, Vec2};
+use eframe::egui::{self, RichText, Ui, Vec2};
 
 use super::a11y;
 use super::graph::{graph, stale_ping};
-use super::theme::{dot, level_color, mono, BLUE, GRAY, GREEN, RED, VIOLET};
+use super::theme::{dot, level_color, mono, palette};
 use super::list::Primary;
 use super::{menu, Action, ROW_H};
 use crate::conf::{PeerInfo, TunnelInfo};
@@ -143,26 +143,26 @@ pub(super) fn details(ui: &mut Ui, d: &Detail, s: &mut Settings, actions: &mut V
             let hs = st.last_handshake_sec();
             let age = if hs == 0 { tr("st.never") } else { fmt::ago(monitor::unix_now().saturating_sub(hs)) };
             let endpoint = st.peers.first().map(|p| p.endpoint.clone()).unwrap_or_else(|| "—".into());
-            rows.push([label(&tr("st.handshake")), mono(age, Color32::WHITE), label(&tr("st.endpoint")), mono(endpoint, Color32::WHITE)]);
+            rows.push([label(&tr("st.handshake")), mono(age, palette().text_strong), label(&tr("st.endpoint")), mono(endpoint, palette().text_strong)]);
             rows.push([
                 label(&tr("st.received")),
-                mono(fmt::bytes(st.rx_bytes() as f64), GREEN),
+                mono(fmt::bytes(st.rx_bytes() as f64), palette().graph_rx),
                 label(&tr("st.sent")),
-                mono(fmt::bytes(st.tx_bytes() as f64), BLUE),
+                mono(fmt::bytes(st.tx_bytes() as f64), palette().graph_tx),
             ]);
             rows.push([
                 label(&tr("st.rx_rate")),
-                mono(fmt::rate(rx_rate), GREEN),
+                mono(fmt::rate(rx_rate), palette().graph_rx),
                 label(&tr("st.tx_rate")),
-                mono(fmt::rate(tx_rate), BLUE),
+                mono(fmt::rate(tx_rate), palette().graph_tx),
             ]);
             if s.view.ping {
                 // Нет ответа — прошлое значение и «н/д» красным; причина видна в состоянии и на полосе пинга.
                 let value = match &d.ping.last {
-                    _ if d.ping_unavailable => mono(tr("agent.unavailable"), GRAY),
-                    None => mono("…", GRAY),
-                    Some(Ok(ms)) => mono(trf("unit.ms", &[&ms.to_string()]), VIOLET),
-                    Some(Err(_)) => mono(stale_ping(d.ping), RED),
+                    _ if d.ping_unavailable => mono(tr("agent.unavailable"), palette().idle),
+                    None => mono("…", palette().idle),
+                    Some(Ok(ms)) => mono(trf("unit.ms", &[&ms.to_string()]), palette().graph_ping),
+                    Some(Err(_)) => mono(stale_ping(d.ping), palette().error),
                 };
                 rows.push([label(&trf("st.ping_to", &[&d.ping.host])), value, label(""), label("")]);
             }
@@ -172,17 +172,17 @@ pub(super) fn details(ui: &mut Ui, d: &Detail, s: &mut Settings, actions: &mut V
                 let share = stats::share(d.stats, d.name);
                 rows.push([
                     label(&tr("tot.rx")),
-                    mono(fmt::bytes(t.rx as f64), GREEN),
+                    mono(fmt::bytes(t.rx as f64), palette().graph_rx),
                     label(&tr("tot.tx")),
-                    mono(fmt::bytes(t.tx as f64), BLUE),
+                    mono(fmt::bytes(t.tx as f64), palette().graph_tx),
                 ]);
                 rows.push([
                     label(&tr("tot.peak")),
-                    mono(fmt::rate(t.peak_rx), GREEN),
+                    mono(fmt::rate(t.peak_rx), palette().graph_rx),
                     label(&tr("tot.time")),
-                    mono(format!("{} ({})", fmt::duration(t.seconds), fmt::percent(share)), Color32::WHITE),
+                    mono(format!("{} ({})", fmt::duration(t.seconds), fmt::percent(share)), palette().text_strong),
                 ]);
-                rows.push([label(&tr("tot.since")), mono(fmt::date_time(t.since), GRAY), label(""), label("")]);
+                rows.push([label(&tr("tot.since")), mono(fmt::date_time(t.since), palette().idle), label(""), label("")]);
             }
         }
         fixed_grid(ui, "status-grid", &rows);

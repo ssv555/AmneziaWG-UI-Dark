@@ -75,12 +75,14 @@
   bottom right (**Open** / **Later**; it can be dragged by its title, the close button and `Esc` mean **Later**) without
   stealing focus or blocking the window; if the window is hidden in the
   tray, Windows shows a notification as well.
-- Every panel can be switched on or off in the **View** menu; behaviour is configured in the **Settings…** window (sections General, Notifications and tray,
+- Every panel can be switched on or off in the **View** menu; behaviour is configured in the **Settings…** window (sections General with the theme choice, Notifications and tray,
   Network, Working mode; **OK** / **Cancel** / **Apply**, **Reset to defaults** with a confirmation). The ping host is
   checked there: a host name or an IPv4 address, otherwise the window shows the error and does not save.
 - Sharp on any screen: the interface follows the Windows display scale of each monitor (Full HD, 2K, 4K, 8K) and
   can be made larger or smaller on top of it with **View -> Interface scale** or `Ctrl+Plus` / `Ctrl+Minus`.
-- Dark theme with a dark title bar. English by default, Russian built in, easy to add your own language.
+- Three themes: Graphite (dark, the default), Slate (soft blue-grey dark) and Daylight (light), or Follow Windows;
+  switched live in **Settings…**, the title bar follows the theme. English by default, Russian built in, easy to add
+  your own language.
 
 **Config editing**
 - Edit, import and delete tunnels through the native AmneziaWG window, driven for you with UI Automation.
@@ -250,7 +252,7 @@ The window keeps its own settings **next to the exe**, so it stays portable:
 
 | Path | Purpose |
 |------|---------|
-| `Settings.ini` | Window position and size, interface scale, panel and column widths, graph height, View / Settings switches, groups, tunnel source links. Saved 0.3 s after the last change. |
+| `Settings.ini` | Window position and size, interface scale, panel and column widths, graph height, View / Settings switches, theme (`theme` in `[options]`: `graphite` by default, `slate`, `daylight`, `system` = follow Windows; an unknown value means `graphite`), groups, tunnel source links. Saved 0.3 s after the last change. |
 | `lang\*.lng` | Additional interface languages. |
 | `logs\crash.log` | Why the window ended after an internal error or could not start (time, version, place). Folder set by `log_dir` in `Settings.ini`. |
 | `logs\window-errors.log` | Errors of the window's actions (the same lines as in its event log, so none is lost while it is hidden in the tray); rotated to `.1.log` at 1 MiB. |

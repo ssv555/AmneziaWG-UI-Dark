@@ -21,9 +21,16 @@ Rules for every window, dialog and notice in the app. The goal is a window that 
 ## Look
 
 1. Windows 11 Fluent: rounded corners (8 px windows, 4 px controls), Segoe UI Variable / Segoe UI, the system accent
-   colour, the system dark/light theme, a soft shadow, no hard borders. The one exception is the mode 2 accent
-   (yellow icon, taskbar button and frames).
-2. DPI: per-monitor scale; nothing is clipped at 100-300 %.
+   colour, a soft shadow, no hard borders. The one exception is the mode 2 accent (yellow icon, taskbar button and frames).
+2. Three themes: Graphite (dark, the default), Slate (soft blue-grey dark) and Daylight (light), plus Follow Windows
+   (Daylight when Windows apps use the light theme, otherwise Graphite). Chosen in Settings… - General - Theme
+   (option `theme` in `Settings.ini`). A change applies on the next frame, without a restart; the Windows title bar
+   follows the theme.
+3. Colours come only from the active theme's `Palette` in `src/app/theme.rs` (`palette()`); the test
+   `colours_come_only_from_the_palette` forbids colour literals and egui base visuals elsewhere in `src/app`. On
+   Daylight the selected row also gets a 3 px accent bar on the left: the light selection fill alone is hard to see.
+   Icons on the taskbar and in the tray do not depend on the theme.
+4. DPI: per-monitor scale; nothing is clipped at 100-300 %.
 
 ## Buttons and keyboard
 

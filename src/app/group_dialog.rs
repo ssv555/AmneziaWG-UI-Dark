@@ -7,7 +7,7 @@ use crate::i18n::{tr, trf};
 
 use super::dialog::{dialog_buttons, dialog_window};
 use super::modals::{Outcome, Turn};
-use super::theme::RED;
+use super::theme::palette;
 use super::App;
 
 pub(super) enum Dialog {
@@ -50,7 +50,7 @@ impl App {
                 // Пустое имя — не ошибка, пока пользователь ещё ничего не ввёл.
                 let error = check.err().filter(|e| *e != groups::NameError::Empty).map(name_error).unwrap_or_default();
                 // Строка ошибки занимает место всегда — окно не прыгает при наборе.
-                ui.add_sized([ui.available_width(), 18.0], egui::Label::new(RichText::new(error).color(RED).small()).truncate());
+                ui.add_sized([ui.available_width(), 18.0], egui::Label::new(RichText::new(error).color(palette().error).small()).truncate());
                 ui.add_space(4.0);
                 (ok, cancel) = dialog_buttons(ui, &tr("btn.ok"), valid, Some(&tr("btn.cancel")));
             });

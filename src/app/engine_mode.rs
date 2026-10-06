@@ -11,7 +11,8 @@ use eframe::egui::{self, RichText};
 use super::modals::{Modal, Outcome, Turn};
 use super::sources::{follow_stats, StatsChange};
 use super::dialog::dialog_window;
-use super::{dialog_buttons, App, Editor, RED, YELLOW};
+use super::theme::palette;
+use super::{dialog_buttons, App, Editor};
 use crate::archive::{self, ReadError};
 use crate::conf::TunnelInfo;
 use crate::daemon::proto::Request;
@@ -112,11 +113,11 @@ impl App {
                     ui.add_space(8.0);
                 }
                 if !running.is_empty() {
-                    ui.add(egui::Label::new(RichText::new(trf("mode.will_disconnect", &[&running.join(", ")])).color(YELLOW)).wrap());
+                    ui.add(egui::Label::new(RichText::new(trf("mode.will_disconnect", &[&running.join(", ")])).color(palette().warning)).wrap());
                     ui.add_space(8.0);
                 }
                 if let Some(p) = &problem {
-                    ui.add(egui::Label::new(RichText::new(trf("mode.missing", &[p])).color(RED)).wrap());
+                    ui.add(egui::Label::new(RichText::new(trf("mode.missing", &[p])).color(palette().error)).wrap());
                     ui.add_space(8.0);
                 }
                 ui.add_space(2.0);
@@ -310,7 +311,7 @@ impl App {
                     };
                     valid = !pass.is_empty() && problem.is_none();
                     let line = problem.or_else(|| error.clone()).unwrap_or_default();
-                    ui.add_sized([ui.available_width(), 18.0], egui::Label::new(RichText::new(line).color(RED).small()).truncate());
+                    ui.add_sized([ui.available_width(), 18.0], egui::Label::new(RichText::new(line).color(palette().error).small()).truncate());
                     (ok, cancel) = dialog_buttons(ui, &tr(if backup { "eng.backup_save" } else { "btn.ok" }), valid, Some(&tr("btn.cancel")));
                 });
             }
@@ -338,7 +339,7 @@ impl App {
                         String::new()
                     };
                     valid = !name.is_empty() && !same && error.is_empty();
-                    ui.add_sized([ui.available_width(), 34.0], egui::Label::new(RichText::new(error).color(RED).small()).wrap());
+                    ui.add_sized([ui.available_width(), 34.0], egui::Label::new(RichText::new(error).color(palette().error).small()).wrap());
                     (ok, cancel) = dialog_buttons(ui, &tr("btn.ok"), valid, Some(&tr("btn.cancel")));
                 });
             }

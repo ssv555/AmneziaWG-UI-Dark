@@ -189,3 +189,5 @@ Behavioral isolation tests in `src/daemon/server.rs`: `isolation_killed_agent_is
 A third fence is unrelated to the process split: `windows_follow_the_standard` in `src/app/dialog.rs` forbids creating `egui::Window` anywhere except the shared dialog constructor.
 
 A fourth: `context_menus_go_through_the_helper` in `src/app/menu.rs` forbids a raw right-click menu in `src/app` (`Popup::context_menu`, `Response::context_menu`, `secondary_clicked`); every context menu goes through `menu::context_menu`, which also opens it on Shift+F10 and the Menu key.
+
+A fifth: `colours_come_only_from_the_palette` in `src/app/theme.rs` forbids colour literals (`Color32::` constants and constructors other than `TRANSPARENT` and `PLACEHOLDER`) and egui's base `Visuals::dark()` / `Visuals::light()` in `src/app.rs` and `src/app/` outside `theme.rs`; every colour comes from the active theme's `Palette`.

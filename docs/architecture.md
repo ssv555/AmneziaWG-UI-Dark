@@ -84,9 +84,11 @@ The core owns the mode (`mode` in `core.ini`). It is switched at runtime without
 | Core prepares | ensures the service `AmneziaWGManager` is running | initializes the store; clears the services' own restart-on-failure actions (the supervisor is the only reconnector) |
 | Config requests | agent: `Native`, `Read`, `Write`, `Details`, `Delete` | agent: `Import`, `ExportAll`, `NewTunnel`, `TakeNative`, `Read`, `Write`, `Details`; the core deletes and renames (they touch the service) |
 | Engine files | not used | copied to `%ProgramFiles%` and checked against SHA-256 values pinned at build time or in the signed manifest (`src/engine.rs`) |
-| Window cue | default colors | yellow icon and frames |
+| Window cue | theme colours | yellow icons; frames, separators and the Windows 11 window border in the theme's mode 2 colour |
 
 In both modes the tunnel is a separate Windows service, outside the core process. Its state is read through the tunnel's UAPI pipe.
+
+The mode 2 cue colour depends on the theme (`mode2_frame` in `src/app/theme.rs`): FFD60A on Graphite and Slate, B07D00 on Daylight. `apply_look` in `src/app/core_ui.rs` sets the cue, the egui palette and the Windows title bar (dark or light, `src/win.rs`) every time the mode or the theme changes. winit resets the title bar to the Windows theme on any system setting change, without an event, so `apply_look` also marks it again (DWM attribute only) whenever the window gains or loses focus. In mode 1 the window border stays system-coloured.
 
 ## When something fails
 

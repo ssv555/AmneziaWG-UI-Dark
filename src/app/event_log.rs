@@ -9,7 +9,7 @@ use crate::i18n::{tr, trf};
 use crate::monitor::Shared;
 
 use super::menu::context_menu;
-use super::theme::{dot, mono, severity_color, GRAY};
+use super::theme::{dot, mono, palette, severity_color};
 use super::Action;
 
 /// Какие события показывать по важности.
@@ -145,7 +145,7 @@ fn lines(ui: &mut Ui, shown: &[&Event]) {
         nth = if prev.is_some_and(|p| p.at == e.at && p.tunnel == e.tunnel && p.text == e.text) { nth + 1 } else { 0 };
         prev = Some(e);
         let row = ui.horizontal(|ui| {
-            ui.label(mono(fmt::date_time_sec(e.at), GRAY));
+            ui.label(mono(fmt::date_time_sec(e.at), palette().idle));
             dot(ui, severity_color(e.severity), 4.0, e.severity.as_str());
             if !e.tunnel.is_empty() {
                 ui.strong(&e.tunnel);

@@ -3,7 +3,7 @@
 use eframe::egui::{self, Align2, FontId, Pos2, RichText, Sense, Stroke, Ui, Vec2};
 
 use super::a11y::{self, Painted};
-use super::theme::{mono, BLUE, GREEN, RED, VIOLET};
+use super::theme::{mono, palette};
 use crate::fmt;
 use crate::i18n::{tr, trf};
 use crate::monitor::Live;
@@ -61,8 +61,8 @@ pub(super) fn graph(ui: &mut Ui, live: &Live, ping: Option<&PingState>, s: &mut 
             .collect()
     };
     if points.len() >= 2 {
-        painter.add(egui::Shape::line(line(|p| p.1), Stroke::new(1.5_f32, BLUE)));
-        painter.add(egui::Shape::line(line(|p| p.0), Stroke::new(1.5_f32, GREEN)));
+        painter.add(egui::Shape::line(line(|p| p.1), Stroke::new(1.5_f32, palette().graph_tx)));
+        painter.add(egui::Shape::line(line(|p| p.0), Stroke::new(1.5_f32, palette().graph_rx)));
     }
     painter.text(
         rect.left_top() + Vec2::new(6.0, 4.0),
@@ -83,8 +83,8 @@ pub(super) fn graph(ui: &mut Ui, live: &Live, ping: Option<&PingState>, s: &mut 
             let x = rect.right() - i as f32 * step;
             let y = |v: f64| rect.bottom() - 4.0 - (v / scale) as f32 * (rect.height() - 8.0);
             painter.vline(x, rect.y_range(), Stroke::new(1.0_f32, ui.visuals().weak_text_color()));
-            painter.circle_filled(Pos2::new(x, y(p.0)), 3.5, GREEN);
-            painter.circle_filled(Pos2::new(x, y(p.1)), 3.5, BLUE);
+            painter.circle_filled(Pos2::new(x, y(p.0)), 3.5, palette().graph_rx);
+            painter.circle_filled(Pos2::new(x, y(p.1)), 3.5, palette().graph_tx);
             let when = fmt::ago((i * per_point) as u64);
             hover.on_hover_ui_at_pointer(|ui| {
                 ui.label(RichText::new(when).weak());
@@ -93,10 +93,10 @@ pub(super) fn graph(ui: &mut Ui, live: &Live, ping: Option<&PingState>, s: &mut 
                 }
                 egui::Grid::new("graph-tip").num_columns(2).spacing([16.0, 2.0]).show(ui, |ui| {
                     ui.label(&tr("st.rx_rate"));
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| ui.label(mono(fmt::rate(p.0), GREEN)));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| ui.label(mono(fmt::rate(p.0), palette().graph_rx)));
                     ui.end_row();
                     ui.label(&tr("st.tx_rate"));
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| ui.label(mono(fmt::rate(p.1), BLUE)));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| ui.label(mono(fmt::rate(p.1), palette().graph_tx)));
                     ui.end_row();
                 });
             });
@@ -144,10 +144,10 @@ fn ping_strip(ui: &mut Ui, ping: &PingState, period: f64) {
         match ms {
             Some(ms) => {
                 let y = rect.bottom() - 4.0 - (*ms as f32 / max) * (rect.height() - 4.0 - LEGEND_H);
-                painter.circle_filled(Pos2::new(x, y), 2.5, VIOLET);
+                painter.circle_filled(Pos2::new(x, y), 2.5, palette().graph_ping);
             }
             None => {
-                painter.vline(x, rect.y_range(), Stroke::new(2.0_f32, RED));
+                painter.vline(x, rect.y_range(), Stroke::new(2.0_f32, palette().error));
             }
         }
     }
@@ -173,8 +173,8 @@ fn ping_strip(ui: &mut Ui, ping: &PingState, period: f64) {
     let x = rect.right() - (*age / period) as f32 * rect.width();
     painter.vline(x, rect.y_range(), Stroke::new(1.0_f32, ui.visuals().weak_text_color()));
     let (text, color) = match ms {
-        Some(ms) => (trf("unit.ms", &[&ms.to_string()]), VIOLET),
-        None => (tr("st.no_reply"), RED),
+        Some(ms) => (trf("unit.ms", &[&ms.to_string()]), palette().graph_ping),
+        None => (tr("st.no_reply"), palette().error),
     };
     let when = fmt::ago(*age as u64);
     hover.on_hover_ui_at_pointer(|ui| {

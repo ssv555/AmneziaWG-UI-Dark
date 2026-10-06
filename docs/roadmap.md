@@ -23,6 +23,8 @@ Full per-version lists are in the [changelog](../CHANGELOG.md). Only the headlin
    double click and Enter); the core restarts a tunnel whose handshake stopped updating; a Settings window with
    OK / Cancel / Apply instead of the drop-down menu; keyboard access to the menus (F10, Alt, Alt+letter, arrows,
    Ctrl+N, Ctrl+I, F1, F5); screen reader support (accessibility tree, painted rows, graph and status dots are named).
+7. **0.5.2** (2026.10.06): three themes - Graphite, Slate and Daylight - plus Follow Windows, switched live
+   in the Settings window.
 
 ## Next
 
