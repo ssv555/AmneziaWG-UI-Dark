@@ -95,15 +95,15 @@ impl AgentStats {
     }
 
     /// Шаг записи: чистка по настоящему списку туннелей и сохранение. Ошибка записи — в журнал один раз, пока запись
-    /// снова не пройдёт.
-    pub(super) fn tick(&self, now_unix: u64) {
+    /// снова не пройдёт. Возвращает имена туннелей, убранных по сроку: их история скорости уходит вместе с ними.
+    pub(super) fn tick(&self, now_unix: u64) -> Vec<String> {
         let mut inner = lock(&self.inner);
         let pruned = match inner.listed.take() {
             Some(listed) => stats::prune(&mut inner.stats, &listed, now_unix),
             None => Vec::new(),
         };
-        for name in pruned {
-            (self.log)(Severity::Info, &trf("stats.pruned", &[&name, &stats::KEEP_ABSENT_DAYS.to_string()]));
+        for name in &pruned {
+            (self.log)(Severity::Info, &trf("stats.pruned", &[name, &stats::KEEP_ABSENT_DAYS.to_string()]));
         }
         let result = self.save_now(&mut inner);
         match (result, inner.save_failing.is_some()) {
@@ -114,6 +114,7 @@ impl AgentStats {
             }
             (Err(e), true) => inner.save_failing = Some(e),
         }
+        pruned
     }
 
     /// Запись без журнала: вызвавший решает, кому сообщить об ошибке (окну или в журнал).

@@ -36,6 +36,8 @@ mod errors;
 mod exit;
 mod graph;
 mod group_dialog;
+mod history_feed;
+mod history_graph;
 mod list;
 mod markdown;
 mod menu;
@@ -62,7 +64,7 @@ use modals::{Modal, Modals, Outcome, Turn};
 use native_reopen::{LiveNativeWindow, NativeReopen};
 use sources::Confirm;
 use updates::UpdatesWindow;
-use graph::GraphPause;
+use graph::{GraphPause, GraphState};
 use event_log::{event_log, LogFilter};
 use status::{status_bar, StatusBar};
 use theme::*;
@@ -158,8 +160,8 @@ pub struct App {
     autostart: Option<bool>,
     action_error: ErrorSink,
     search: String,
-    /// Пауза графика скорости: на время работы окна, в настройки не пишется.
-    graph_pause: GraphPause,
+    /// Пауза графика скорости и история от агента: на время работы окна, в настройки не пишется.
+    graph: GraphState,
     /// Фильтр и поиск панели журнала событий.
     log_filter: LogFilter,
     /// Клавиша меню (Apps) -> Shift+F10 для контекстных меню (`menu::context_menu`).
@@ -284,6 +286,7 @@ impl App {
         let updates = UpdatesWindow::new(updates::Link::new(agent.clone(), action_error.clone(), notice.clone(), ctx.clone()));
         let start_hidden = start.hidden && start.settings.tray;
         let saved_text = if start.settings_path.exists() { start.settings.to_ini().to_text() } else { String::new() };
+        let graph = GraphState { pause: GraphPause::default(), feed: history_feed::HistoryFeed::real(agent.clone(), ctx.clone()) };
         App {
             autostart: start.demo.is_none().then(win::autostart_enabled),
             s: start.settings,
@@ -297,7 +300,7 @@ impl App {
             notice,
             action_error,
             search: String::new(),
-            graph_pause: GraphPause::default(),
+            graph,
             log_filter: LogFilter::default(),
             menu_key: menu::MenuKey::default(),
             menu_nav: menu::MenuNav::default(),
@@ -667,7 +670,7 @@ impl eframe::App for App {
                         core_lost: snap.core_lost,
                         snap: &snap,
                     };
-                    details(ui, &ctx, &mut self.s, &mut self.graph_pause, &mut actions)
+                    details(ui, &ctx, &mut self.s, &mut self.graph, &mut actions)
                 }
                 None => {
                     ui.label(tr("empty.no_tunnels"));

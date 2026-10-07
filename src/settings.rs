@@ -72,6 +72,49 @@ impl Theme {
     }
 }
 
+/// Масштаб графика скорости. Первые три — замеры окна в памяти, последние три — история, которую копит агент
+/// (`daemon::agent::history`); какой источник у масштаба, решает окно (`app::graph::source`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum GraphRange {
+    #[default]
+    Min2,
+    Min10,
+    Hour1,
+    Day,
+    Month,
+    Year,
+}
+
+impl GraphRange {
+    pub const ALL: [GraphRange; 6] = [GraphRange::Min2, GraphRange::Min10, GraphRange::Hour1, GraphRange::Day, GraphRange::Month, GraphRange::Year];
+
+    /// Имя в INI. Не менять: оно записано в файлах пользователей.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            GraphRange::Min2 => "2m",
+            GraphRange::Min10 => "10m",
+            GraphRange::Hour1 => "1h",
+            GraphRange::Day => "day",
+            GraphRange::Month => "month",
+            GraphRange::Year => "year",
+        }
+    }
+
+    fn parse(s: &str) -> Option<GraphRange> {
+        GraphRange::ALL.into_iter().find(|r| r.as_str() == s)
+    }
+
+    /// Прежний ключ `[layout] graph_period` (до 0.5.4): период в секундах.
+    fn from_period(secs: &str) -> Option<GraphRange> {
+        match secs.trim() {
+            "120" => Some(GraphRange::Min2),
+            "600" => Some(GraphRange::Min10),
+            "3600" => Some(GraphRange::Hour1),
+            _ => None,
+        }
+    }
+}
+
 /// Диалог с «Больше не показывать». Имя в `[hidden_dialogs]` — `ini_name`, оно записано в файлах пользователей и
 /// от переводов не зависит: переименование ключа в `i18n` не должно сбрасывать запомненный выбор.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
@@ -220,8 +263,8 @@ pub struct Settings {
     /// Множитель масштаба интерфейса поверх масштаба Windows (1.0 = как в системе).
     pub ui_scale: f32,
     pub graph_height: f32,
-    /// Период графика, секунд.
-    pub graph_period: u32,
+    /// Масштаб графика; выбор в окне пишется сразу, как прочий вид.
+    pub graph_range: GraphRange,
     pub columns: Columns,
     pub view: View,
     pub sort: SortKey,
@@ -261,7 +304,7 @@ impl Default for Settings {
             log_height: 140.0,
             ui_scale: 1.0,
             graph_height: 140.0,
-            graph_period: 120,
+            graph_range: GraphRange::default(),
             columns: Columns::default(),
             view: View::default(),
             sort: SortKey::Name,
@@ -306,7 +349,12 @@ impl Settings {
             log_height: ini.get_or("layout", "log_height", d.log_height),
             ui_scale: ini.get_or("layout", "ui_scale", d.ui_scale).clamp(MIN_SCALE, MAX_SCALE),
             graph_height: ini.get_or("layout", "graph_height", d.graph_height),
-            graph_period: ini.get_or("layout", "graph_period", d.graph_period),
+            // Неизвестное имя (опечатка, файл новой версии) — 2 мин: это вид, не данные. Ключа нет — файл прежней версии
+            // с периодом в секундах.
+            graph_range: match ini.get("layout", "graph_range") {
+                Some(name) => GraphRange::parse(name).unwrap_or(d.graph_range),
+                None => ini.get("layout", "graph_period").and_then(GraphRange::from_period).unwrap_or(d.graph_range),
+            },
             columns: Columns {
                 rx: ini.get_or("columns", "rx", d.columns.rx),
                 tx: ini.get_or("columns", "tx", d.columns.tx),
@@ -370,7 +418,7 @@ impl Settings {
         ini.set("layout", "log_height", self.log_height.round());
         ini.set("layout", "ui_scale", (self.ui_scale * 100.0).round() / 100.0);
         ini.set("layout", "graph_height", self.graph_height.round());
-        ini.set("layout", "graph_period", self.graph_period);
+        ini.set("layout", "graph_range", self.graph_range.as_str());
         ini.set("columns", "rx", self.columns.rx.round());
         ini.set("columns", "tx", self.columns.tx.round());
         ini.set("columns", "peak", self.columns.peak.round());
@@ -460,7 +508,7 @@ mod tests {
         s.window = Some(WindowRect { x: -1200.0, y: 40.0, width: 1300.0, height: 800.0 });
         s.maximized = true;
         s.left_width = 610.0;
-        s.graph_period = 3600;
+        s.graph_range = GraphRange::Month;
         s.view.groups = false;
         s.view.col_tx = true;
         s.sort = SortKey::Share;
@@ -525,6 +573,37 @@ mod tests {
             assert_eq!(s.to_ini().get("options", "theme"), Some(theme.as_str()));
             assert_eq!(reload(&s), s, "{theme:?}");
         }
+    }
+
+    #[test]
+    fn graph_range_roundtrips_under_its_pinned_ini_name() {
+        // Имена закреплены: это формат файла.
+        let all: Vec<_> = GraphRange::ALL.iter().map(|r| r.as_str()).collect();
+        assert_eq!(all, ["2m", "10m", "1h", "day", "month", "year"]);
+        for range in GraphRange::ALL {
+            let mut s = Settings::default();
+            s.graph_range = range;
+            assert_eq!(s.to_ini().get("layout", "graph_range"), Some(range.as_str()));
+            assert_eq!(reload(&s), s, "{range:?}");
+        }
+    }
+
+    #[test]
+    fn missing_or_unknown_graph_range_falls_back_to_two_minutes() {
+        assert_eq!(Settings::default().graph_range, GraphRange::Min2);
+        let range = |text: &str| Settings::from_ini(&Ini::parse(text)).graph_range;
+        assert_eq!(range(""), GraphRange::Min2);
+        for value in ["", "week", "Day", "3600"] {
+            assert_eq!(range(&format!("[layout]\ngraph_range={value}\n")), GraphRange::Min2, "graph_range={value:?}");
+        }
+        // Файл 0.5.3 и раньше: период в секундах переносится; незнакомое число — 2 мин.
+        assert_eq!(range("[layout]\ngraph_period=3600\n"), GraphRange::Hour1);
+        assert_eq!(range("[layout]\ngraph_period=600\n"), GraphRange::Min10);
+        assert_eq!(range("[layout]\ngraph_period=90\n"), GraphRange::Min2);
+        // Новый ключ важнее прежнего; прежний больше не пишется.
+        let both = Settings::from_ini(&Ini::parse("[layout]\ngraph_range=year\ngraph_period=600\n"));
+        assert_eq!(both.graph_range, GraphRange::Year);
+        assert_eq!(both.to_ini().get("layout", "graph_period"), None);
     }
 
     #[test]

@@ -48,7 +48,7 @@ Top-level files, by layer. Layers are explained in [modules](modules.md).
 | `stats.rs` | Cumulative per-tunnel statistics model and `Stats.ini` format |
 | `ping.rs` | ICMP ping through the VPN and its state; ping host check (`valid_host`) |
 | `groups.rs` | Tunnel book: nested groups, assignments, selection |
-| `settings.rs` | Window settings (`Settings.ini`), the working-mode type and the window theme (`Theme`: `graphite`, `slate`, `daylight`, `system`; unknown value → `graphite`) |
+| `settings.rs` | Window settings (`Settings.ini`), the working-mode type and the window theme (`Theme`: `graphite`, `slate`, `daylight`, `system`; unknown value → `graphite`) and the graph range (`GraphRange`, `[layout] graph_range`: `2m`, `10m`, `1h`, `day`, `month`, `year`; unknown value → `2m`; the 0.5.3 key `graph_period` in seconds is read once) |
 | `health.rs` | Tunnel state to level (dot color, tray icon, events) and text |
 | `i18n.rs` | Localization: English default, Russian built in, other languages from `lang\*.lng` |
 | `ini.rs` | Minimal INI reader and writer |
@@ -63,7 +63,8 @@ Top-level files, by layer. Layers are explained in [modules](modules.md).
 |---|---|
 | `window.rs` | Window state: size and position, closing, settings saving, scaling, `--snapshot` |
 | `list.rs`, `list/rows.rs` | Tunnel table: columns, keyboard, group and tunnel rows, menus, drag and drop; the primary action of a tunnel (`Primary`: button, menus, tray, double click and `Enter` only connect) and the disconnect confirmation rule (`asks_first`) |
-| `details.rs`, `graph.rs`, `status.rs` | Selected tunnel details (right click on a value: Copy; private and preshared keys are never shown or copied), speed graph with ping strip (speed scale on the right; pause button: a frozen snapshot of the graph and the ping strip for the window session, `GraphPause`, dropped when another tunnel is shown), status bar |
+| `details.rs`, `graph.rs`, `status.rs` | Selected tunnel details (right click on a value: Copy; private and preshared keys are never shown or copied), speed graph with ping strip (speed scale on the right; pause button: a frozen snapshot of the graph and the ping strip for the window session, `GraphPause`, dropped when another tunnel or a range with another source is shown; range drop-down: 2 min, 10 min and 1 h from the window's samples, Day, Month and Year from the agent's history), status bar |
+| `history_feed.rs`, `history_graph.rs` | Speed history for the graph's Day, Month and Year ranges: `HistoryFeed` asks the agent (`AgentApi::history`) in a background thread at once on a tunnel or range change, then once a minute while shown; the frame only reads the last answer. `history_graph` draws averages as lines and peaks as thin lines, a gap where an interval is missing, a time axis in local hours (Day), local dates (Month) or UTC months (Year), a tooltip with the interval time, averages, peaks and connected time; "Loading history…", "No history yet" or "History unavailable" (reason in the tooltip) instead of the curves |
 | `event_log.rs` | Event log panel: severity and tunnel filter, search, copy, "Save as…"; the filter is a pure function (`visible`) |
 | `menu.rs`, `theme.rs` | Menu bar with its keyboard (`MenuNav`: F10, lone Alt, Alt+letter mnemonics, arrows and submenus, command shortcuts; window filter for `SC_KEYMENU`), the one context-menu helper (right click, Shift+F10, Menu key); theme palettes (`Palette` by role: Graphite, Slate, Daylight; the active one from `palette()`, `resolve` turns "follow Windows" into Daylight or Graphite, `Palette::visuals` builds the egui look) and fonts |
 | `a11y.rs` | Screen reader names for custom-painted elements (tunnel and group rows, speed graph, ping strip, status dots): one helper `describe` |
@@ -96,10 +97,11 @@ Top-level files, by layer. Layers are explained in [modules](modules.md).
 | `phase_trace.rs` | Test-only timing trace of the Switch path; empty in a non-test build (see [development](development.md#flaky-test-logs)) |
 | `agent/mod.rs` | Agent process: pipe server, request dispatch |
 | `agent/proto.rs`, `agent/client.rs` | Agent protocol; window-side client and request routing |
-| `agent/core_poll.rs` | One-second poll of the core state shared by the language follower, statistics and the journal |
+| `agent/core_poll.rs` | One-second poll of the core state shared by the language follower, statistics, speed history and the journal |
 | `agent/language.rs` | The agent's language: the core's `language` from `core.ini`, re-read when the file changes |
 | `agent/journal.rs` | Writes `events.log` |
 | `agent/stats.rs`, `agent/ping.rs`, `agent/settings.rs` | Statistics, ping, `agent.ini` |
+| `agent/history.rs` | Per-tunnel speed history (day, month and year series) and `history.bin` |
 | `agent/updates.rs` | Starts the update manager and forwards its log to the journal |
 | `agent/tunnels.rs` | Config requests: mode 2 store and the helper for the original window |
 

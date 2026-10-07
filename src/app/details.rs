@@ -3,7 +3,7 @@
 use eframe::egui::{self, RichText, Ui, Vec2};
 
 use super::a11y;
-use super::graph::{graph, stale_ping, GraphPause};
+use super::graph::{self, graph, stale_ping, GraphState};
 use super::theme::{dot, level_color, mono, palette};
 use super::list::Primary;
 use super::{menu, Action, ROW_H};
@@ -91,7 +91,7 @@ fn label(text: &str) -> RichText {
     RichText::new(text).weak()
 }
 
-pub(super) fn details(ui: &mut Ui, d: &Detail, s: &mut Settings, pause: &mut GraphPause, actions: &mut Vec<Action>) {
+pub(super) fn details(ui: &mut Ui, d: &Detail, s: &mut Settings, view: &mut GraphState, actions: &mut Vec<Action>) {
     let status = d.live.and_then(|l| l.status.as_ref());
     let running = d.live.is_some();
     egui::Frame::group(ui.style()).inner_margin(egui::Margin::same(12)).show(ui, |ui| {
@@ -187,9 +187,11 @@ pub(super) fn details(ui: &mut Ui, d: &Detail, s: &mut Settings, pause: &mut Gra
         }
         fixed_grid(ui, "status-grid", &rows);
 
-        if let (true, Some(live)) = (s.view.graph, d.live) {
+        // Живые масштабы — только у подключённого туннеля; историю агент хранит и для отключённого.
+        let history = matches!(graph::source(s.graph_range), graph::Source::History(_));
+        if s.view.graph && (d.live.is_some() || history) {
             ui.add_space(8.0);
-            graph(ui, d.name, live, (s.view.ping && !d.ping_unavailable).then_some(d.ping), s, pause);
+            graph(ui, d.name, d.live, (s.view.ping && !d.ping_unavailable).then_some(d.ping), s, view);
         }
     });
 

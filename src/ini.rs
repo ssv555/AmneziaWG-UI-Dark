@@ -23,8 +23,9 @@ impl Unreadable {
     }
 }
 
-/// Отодвинуть нечитаемый `path` в `<имя>.unreadable-<дата>` рядом; занятое имя не затирается.
-fn quarantine(path: &Path) -> Result<PathBuf, String> {
+/// Отодвинуть нечитаемый `path` в `<имя>.unreadable-<дата>` рядом; занятое имя не затирается. Им же агент отодвигает
+/// повреждённую историю скорости (`daemon::agent::history`).
+pub(crate) fn quarantine(path: &Path) -> Result<PathBuf, String> {
     let stamp = crate::fmt::file_stamp(crate::monitor::unix_now());
     let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
     let target = (1..100)

@@ -150,7 +150,8 @@ current core.
       show an event twice).
 2. **Ping and statistics**
    1. `SetPing { enabled, host }` - stored in `agent.ini`; a failed write is an `Err` with the path.
-   2. `StatsRename { old, new }` and `StatsForget(tunnel)` - the window reports a rename or a removal after the core has answered.
+   2. `StatsRename { old, new }` and `StatsForget(tunnel)` - the window reports a rename or a removal after the core has answered. The tunnel's speed history follows: renamed or removed together with the statistics and written to disk at once.
+   3. `History { tunnel, range }` - the tunnel's speed history for the graph (`src/daemon/agent/history.rs`, see [architecture](architecture.md#speed-history)); `range` is `Day` (1-minute intervals, 1440), `Month` (1-hour, 744) or `Year` (1-day UTC, 366). Read-only, open to the owner account, takes a slot of the owner's connection budget like `State`. The answer `History { bucket_s, buckets }` holds only intervals with data, oldest first; a missing interval is a gap (tunnel down, PC off), not zero. An interval: `start` (unix seconds, a multiple of `bucket_s`), `secs` (seconds the tunnel was connected in it), average `rx` and `tx` over those seconds, `peak_rx` and `peak_tx`, all in bytes per second. The answer is bounded by the series length (at most 1440 intervals, about 100 KB of JSON). An unknown tunnel gets an empty list. An agent of an older version refuses the request as an unknown variant; the window shows that as "History unavailable" in the graph area (`AgentApi::history` returns `Err`).
 3. **Updates.** `Updates(UpdateOp)` with `State`, `Check`, `Apply(list of component and confirmed version)` and `Restore(history row)`; the answer is
    `Updates(UpdatesState)`. See [Updates](updates.md).
 4. **Tunnel configs and the native window.** `Tunnel(TunnelRequest)`: `Read`, `Write`, `Details`, `Delete` (mode 1 only; deleting a mode 2 tunnel stays in
@@ -161,7 +162,7 @@ current core.
 ### Responses (`AgentResponse`)
 
 `Hello { version }`, `Ok`, `Err(text)`, `Refused(text)` (unreadable line, unknown variant - the serde message names it - busy, bad name, refused
-script directive, no updates manager), `State`, `Events`, `Updates`, `Text`, `Info`, `Entries`, `Report`.
+script directive, no updates manager), `State`, `Events`, `Updates`, `Text`, `Info`, `Entries`, `Report`, `History`.
 
 ## Internal calls
 

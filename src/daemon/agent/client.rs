@@ -4,7 +4,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use super::proto::{AgentEvents, AgentRequest, AgentResponse, AgentState, TunnelRequest};
+use super::proto::{AgentEvents, AgentRequest, AgentResponse, AgentState, History, HistoryRange, TunnelRequest};
 use crate::daemon::pipe::Timeouts;
 use crate::daemon::proto::{Request, Response};
 use crate::daemon::CoreApi;
@@ -50,6 +50,15 @@ pub trait AgentApi: Send + Sync {
     fn version(&self) -> Result<String, String> {
         match self.call(AgentRequest::Hello)? {
             AgentResponse::Hello { version } => Ok(version),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    /// История скорости туннеля за `range` (интервалы с данными, по возрастанию). Ошибка — агент недоступен или прежней
+    /// версии (запроса не знает и отвечает отказом «unknown variant»): окно показывает «история недоступна».
+    fn history(&self, tunnel: &str, range: HistoryRange) -> Result<History, String> {
+        match self.call(AgentRequest::History { tunnel: tunnel.into(), range })? {
+            AgentResponse::History(h) => Ok(*h),
             other => Err(unexpected(other)),
         }
     }
@@ -157,7 +166,7 @@ impl Routed {
             AgentResponse::Info(i) => Response::Info(i),
             AgentResponse::Entries(e) => Response::Entries(e),
             AgentResponse::Report(r) => Response::Report(r),
-            AgentResponse::Hello { .. } | AgentResponse::Updates(_) | AgentResponse::State(_) | AgentResponse::Events(_) => {
+            AgentResponse::Hello { .. } | AgentResponse::Updates(_) | AgentResponse::State(_) | AgentResponse::Events(_) | AgentResponse::History(_) => {
                 return Err("agent: unexpected answer to a tunnel request".into());
             }
         })
@@ -295,6 +304,20 @@ mod tests {
 
         let error = routed.read_config("a").unwrap_err();
         assert!(error.starts_with(&crate::i18n::tr("agent.unavailable")) && error.contains("pipe: not found"), "{error}");
+    }
+
+    /// История: ответ агента доходит как есть; агент прежней версии (отказ на неизвестный вариант) и недоступный
+    /// агент — ошибка, а не пустой ответ и не паника.
+    #[test]
+    fn history_reaches_the_window_and_an_older_agent_is_an_error() {
+        let history = History { bucket_s: 3600, buckets: vec![super::super::proto::HistoryBucket { start: 3600, secs: 10.0, ..Default::default() }] };
+        let (agent, seen) = recording_agent(AgentResponse::History(Box::new(history.clone())));
+        assert_eq!(agent.history("a", HistoryRange::Month).unwrap(), history);
+        assert_eq!(*seen.lock().unwrap(), [r#"History { tunnel: "a", range: Month }"#]);
+        let older = "pipe: unknown variant `History`, expected one of `Hello`, `Updates`";
+        let (agent, _) = recording_agent(AgentResponse::Refused(older.into()));
+        assert_eq!(agent.history("a", HistoryRange::Day).unwrap_err(), older);
+        assert!(FakeAgent::unreachable("pipe: not found").history("a", HistoryRange::Year).is_err());
     }
 
     /// Отказ и ошибка агента доходят до окна его текстом.

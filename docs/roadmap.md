@@ -29,11 +29,12 @@ Full per-version lists are in the [changelog](../CHANGELOG.md). Only the headlin
    and its window reopens after an AmneziaWG update; dialogs fit the main window, aligned tables in the Updates
    window; a background thread failure no longer breaks the window; a lone Alt opens the menu; brighter faint text in
    Graphite; the helper process follows the program language.
+9. **0.5.4** (2026.10.07): graph range as a drop-down - 2 min, 10 min, 1 h, day, month, year - remembered between
+   starts; speed history kept by the helper process; an active tunnel stands out in the list in every theme.
 
 ## Next
 
-1. **0.5.4**: graph range as a drop-down - 2 min, 10 min, 1 h, day, month, year - remembered between starts;
-   speed history kept by the helper process.
+Nothing scheduled.
 
 ## Later, not scheduled
 

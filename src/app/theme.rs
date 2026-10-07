@@ -17,7 +17,8 @@ use super::a11y::{self, Painted};
 
 pub(super) const NUM_FONT: f32 = 13.5;
 
-/// Цвета одной темы по ролям. Текст и цвета состояний читаются на `panel`, `window` и `graph_bg` (тест контраста).
+/// Цвета одной темы по ролям. Текст и цвета состояний читаются на `panel`, `window` и `graph_bg` (тест контраста);
+/// `connected` и `warning` ещё и на `selection_fill` (имя активного туннеля в выбранной строке) и насыщенные.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(super) struct Palette {
     /// Тёмная тема: от неё база egui (`Visuals::dark`/`light`) и тёмный заголовок окна Windows.
@@ -96,10 +97,12 @@ pub(super) const GRAPHITE: Palette = Palette {
     selection_fill: hex(0x005C80),
     selection_text: hex(0xC0DEFF),
     selection_bar: false,
-    connected: hex(0x5AC878),
-    warning: hex(0xE6B946),
+    // Было 5AC878/E6B946: имя активного туннеля в выбранной строке (005C80) давало 3.51/4.01 (тест
+    // `active_tunnel_name_reads_on_every_row_background`). Тот же оттенок, светлее: 4.64/4.60; график не менялся.
+    connected: hex(0x7CE296),
+    warning: hex(0xF0C850),
     error: hex(0xEB5F55),
-    // Было 787878: контраст с фоном 3.90, меньше 4.5 для текста. Единственное намеренное отличие от прежнего вида.
+    // Было 787878: контраст с фоном 3.90, меньше 4.5 для текста.
     idle: hex(0x9A9A9A),
     graph_rx: hex(0x5AC878),
     graph_tx: hex(0x5AA0F0),
@@ -129,8 +132,10 @@ pub(super) const SLATE: Palette = Palette {
     selection_fill: hex(0x3B4A63),
     selection_text: hex(0xECEFF4),
     selection_bar: false,
-    connected: hex(0xA3BE8C),
-    warning: hex(0xEBCB8B),
+    // Было A3BE8C/EBCB8B: пастельные, кружок подключённого почти не отличался от серого (тест
+    // `active_status_colours_stand_out_from_idle`), A3BE8C в выбранной строке — 4.39.
+    connected: hex(0x5FD47F),
+    warning: hex(0xF2C14E),
     error: hex(0xE57F87),
     // 8A93A3 давал 4.28 на фоне диалогов (2A303B); чуть светлее — 4.56.
     idle: hex(0x8F98A8),
@@ -162,7 +167,8 @@ pub(super) const DAYLIGHT: Palette = Palette {
     selection_fill: hex(0xCCE4F7),
     selection_text: hex(0x0A2E50),
     selection_bar: true,
-    connected: hex(0x0F7B0F),
+    // Было 0F7B0F: в выбранной строке (CCE4F7) 4.15; чуть темнее — 4.60.
+    connected: hex(0x0E730E),
     warning: hex(0x8A5300),
     error: hex(0xC42B1C),
     idle: hex(0x6B6B6B),
@@ -328,11 +334,13 @@ mod tests {
 
     /// Относительная яркость WCAG 2.x по sRGB.
     fn luminance(c: Color32) -> f64 {
-        let lin = |v: u8| {
-            let v = f64::from(v) / 255.0;
-            if v <= 0.04045 { v / 12.92 } else { ((v + 0.055) / 1.055).powf(2.4) }
-        };
-        0.2126 * lin(c.r()) + 0.7152 * lin(c.g()) + 0.0722 * lin(c.b())
+        0.2126 * linear(c.r()) + 0.7152 * linear(c.g()) + 0.0722 * linear(c.b())
+    }
+
+    /// Канал sRGB в линейный свет: общий шаг яркости WCAG и CIELAB.
+    fn linear(v: u8) -> f64 {
+        let v = f64::from(v) / 255.0;
+        if v <= 0.04045 { v / 12.92 } else { ((v + 0.055) / 1.055).powf(2.4) }
     }
 
     fn contrast(a: Color32, b: Color32) -> f64 {
@@ -394,6 +402,81 @@ mod tests {
             }
         }
         assert!(failures.is_empty(), "{failures:#?}");
+    }
+
+    /// Имя активного туннеля пишется цветом состояния (`list::rows::name_color`) — на фоне окна, диалога и выбранной
+    /// строки. Последняя и ловила старые цвета: выбранную строку владелец и смотрит.
+    #[test]
+    fn active_tunnel_name_reads_on_every_row_background() {
+        let mut failures = Vec::new();
+        for (name, p) in PALETTES {
+            for (role, fg) in [("connected", p.connected), ("warning", p.warning)] {
+                for (bg_name, bg) in [("panel", p.panel), ("window", p.window), ("selection_fill", p.selection_fill)] {
+                    let c = contrast(fg, bg);
+                    if c < 4.5 {
+                        failures.push(format!("{name}: {role} on {bg_name} = {c:.2} < 4.5"));
+                    }
+                }
+            }
+        }
+        assert!(failures.is_empty(), "{failures:#?}");
+    }
+
+    /// CIELAB (D65) из sRGB: в нём насыщенность — хрома C*, а «на глаз разные» — расстояние ΔE76.
+    fn lab(c: Color32) -> [f64; 3] {
+        let (r, g, b) = (linear(c.r()), linear(c.g()), linear(c.b()));
+        let x = (0.412_456_4 * r + 0.357_576_1 * g + 0.180_437_5 * b) / 0.950_47;
+        let y = 0.212_672_9 * r + 0.715_152_2 * g + 0.072_175 * b;
+        let z = (0.019_333_9 * r + 0.119_192 * g + 0.950_304_1 * b) / 1.088_83;
+        let f = |t: f64| if t > 216.0 / 24389.0 { t.cbrt() } else { (24389.0 / 27.0 * t + 16.0) / 116.0 };
+        let (fx, fy, fz) = (f(x), f(y), f(z));
+        [116.0 * fy - 16.0, 500.0 * (fx - fy), 200.0 * (fy - fz)]
+    }
+
+    fn chroma(c: Color32) -> f64 {
+        let [_, a, b] = lab(c);
+        a.hypot(b)
+    }
+
+    fn delta_e76(x: Color32, y: Color32) -> f64 {
+        let (p, q) = (lab(x), lab(y));
+        ((p[0] - q[0]).powi(2) + (p[1] - q[1]).powi(2) + (p[2] - q[2]).powi(2)).sqrt()
+    }
+
+    /// Кружок активного туннеля — 10 px; пастельный цвет на нём читается серым. Правило «заметен»: хрома C* ≥ 45
+    /// (насыщенный) и ΔE76 до серого `idle` ≥ 45. Старый зелёный Сланца A3BE8C: 28.8 и 38.4 — владелец его не отличил.
+    const VIVID_CHROMA: f64 = 45.0;
+    const VIVID_FROM_IDLE: f64 = 45.0;
+
+    fn vivid_failures(name: &str, role: &str, c: Color32, idle: Color32) -> Vec<String> {
+        let (ch, de) = (chroma(c), delta_e76(c, idle));
+        let mut out = Vec::new();
+        if ch < VIVID_CHROMA {
+            out.push(format!("{name}: {role} {c:?} chroma {ch:.1} < {VIVID_CHROMA}"));
+        }
+        if de < VIVID_FROM_IDLE {
+            out.push(format!("{name}: {role} {c:?} ΔE76 to idle {de:.1} < {VIVID_FROM_IDLE}"));
+        }
+        out
+    }
+
+    #[test]
+    fn active_status_colours_stand_out_from_idle() {
+        let mut failures = Vec::new();
+        for (name, p) in PALETTES {
+            failures.extend(vivid_failures(name, "connected", p.connected, p.idle));
+            failures.extend(vivid_failures(name, "warning", p.warning, p.idle));
+        }
+        assert!(failures.is_empty(), "{failures:#?}");
+    }
+
+    /// Правило ловит то, на что жаловался владелец: пастельные зелёный и жёлтый Сланца до 0.5.4.
+    #[test]
+    fn vivid_rule_rejects_the_old_pastel_slate_colours() {
+        assert!(chroma(hex(0x808080)) < 1e-3, "серый без хромы");
+        assert!((lab(Color32::WHITE)[0] - 100.0).abs() < 1e-3);
+        assert_eq!(vivid_failures("slate", "connected", hex(0xA3BE8C), SLATE.idle).len(), 2);
+        assert_eq!(vivid_failures("slate", "warning", hex(0xEBCB8B), SLATE.idle).len(), 1);
     }
 
     /// Тема по умолчанию не меняет вида: режим 1 — `Visuals::dark()`, режим 2 — то, что до тем ставил
@@ -487,11 +570,11 @@ mod tests {
         assert_eq!(SLATE.severity(Severity::Info), SLATE.connected);
         assert_eq!(SLATE.severity(Severity::Warn), SLATE.warning);
         assert_eq!(SLATE.severity(Severity::Bad), SLATE.error);
-        // Графит — прежние цвета окна (кроме серого 9A9A9A), и функции по умолчанию берут его.
+        // Графит — прежние цвета окна (кроме серого 9A9A9A и светлее зелёного и жёлтого), и функции по умолчанию берут его.
         let g = &GRAPHITE;
         assert_eq!([g.connected, g.warning, g.mode2_frame, g.error, g.idle, g.accent, g.graph_ping], [
-            Color32::from_rgb(90, 200, 120),
-            Color32::from_rgb(230, 185, 70),
+            Color32::from_rgb(124, 226, 150),
+            Color32::from_rgb(240, 200, 80),
             Color32::from_rgb(255, 214, 10),
             Color32::from_rgb(235, 95, 85),
             Color32::from_rgb(154, 154, 154),

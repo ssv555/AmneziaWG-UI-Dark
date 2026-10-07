@@ -17,6 +17,8 @@ pub(super) enum Painted<'a> {
     Group { name: &'a str, expanded: bool, active: usize, total: usize, selected: bool },
     /// График скорости: текущие приём и передача, пик за показанный период (уже отформатированы); `paused` — на паузе.
     Graph { rx: &'a str, tx: &'a str, peak: &'a str, paused: bool },
+    /// Надпись на месте графика (история загружается, её нет или она недоступна): текст как есть.
+    GraphNote { text: &'a str },
     /// Кнопка паузы графика (нарисована значком): подпись — что она сделает, `paused` — нажата.
     GraphPause { paused: bool },
     /// Полоса пинга: узел и последний результат.
@@ -57,6 +59,7 @@ impl Painted<'_> {
                 }
             }
             Painted::GraphPause { paused } => tr(if *paused { "gr.resume" } else { "gr.pause" }),
+            Painted::GraphNote { text } => text.to_string(),
             Painted::Ping { host, last } => trf("a11y.ping", &[host, last]),
             Painted::Dot { meaning } => meaning.to_string(),
         }
@@ -69,7 +72,7 @@ impl Painted<'_> {
             Painted::Group { selected, .. } => WidgetInfo::selected(WidgetType::CollapsingHeader, true, *selected, self.label()),
             // Как у кнопки-переключателя egui: пауза — состояние «нажата».
             Painted::GraphPause { paused } => WidgetInfo::selected(WidgetType::Button, true, *paused, self.label()),
-            Painted::Graph { .. } | Painted::Ping { .. } | Painted::Dot { .. } => WidgetInfo::labeled(WidgetType::Image, true, self.label()),
+            Painted::Graph { .. } | Painted::GraphNote { .. } | Painted::Ping { .. } | Painted::Dot { .. } => WidgetInfo::labeled(WidgetType::Image, true, self.label()),
         }
     }
 

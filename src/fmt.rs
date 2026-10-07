@@ -77,6 +77,10 @@ const DATE: &str = "%Y.%m.%d";
 const DATE_TIME: &str = "%Y.%m.%d %H:%M";
 const DATE_TIME_SEC: &str = "%Y.%m.%d %H:%M:%S";
 const TIME_SEC: &str = "%H:%M:%S";
+/// Метка часа на оси графика истории.
+const TIME: &str = "%H:%M";
+/// Месяц на оси графика за год: дата без дня.
+const MONTH: &str = "%Y.%m";
 /// Для имён файлов: без точек и пробелов.
 const FILE_STAMP: &str = "%Y%m%d-%H%M%S";
 /// Прежний формат строк `events.log` (до единого формата): читается, пишется уже новый.
@@ -106,6 +110,52 @@ pub fn date_time_sec(unix: u64) -> String {
 /// `14:07:33`.
 pub fn time_sec(unix: u64) -> String {
     local_time(unix, TIME_SEC)
+}
+
+/// `14:07` — метка часа на оси графика истории.
+pub fn time(unix: u64) -> String {
+    local_time(unix, TIME)
+}
+
+/// Смещение местного времени от UTC в момент `unix`, секунд (Москва: +10 800). Нужен для делений оси графика по
+/// местным часам и суткам; неизвестный момент — 0 (UTC).
+pub fn utc_offset(unix: u64) -> i64 {
+    use chrono::{Offset, TimeZone};
+    chrono::Local.timestamp_opt(unix as i64, 0).single().map(|t| t.offset().fix().local_minus_utc() as i64).unwrap_or(0)
+}
+
+/// Дата суток UTC: интервалы истории за год — сутки UTC, местная дата их начала западнее Гринвича была бы вчерашней.
+pub fn utc_date(unix: u64) -> String {
+    utc_time(unix, DATE)
+}
+
+/// `2026.10` — месяц UTC (ось графика за год).
+pub fn utc_month(unix: u64) -> String {
+    utc_time(unix, MONTH)
+}
+
+/// Начала месяцев UTC в `[from, to]`: момент и номер месяца 1–12.
+pub fn utc_month_starts(from: u64, to: u64) -> Vec<(u64, u32)> {
+    use chrono::{Datelike, TimeZone};
+    let Some(first) = chrono::Utc.timestamp_opt(from as i64, 0).single() else { return Vec::new() };
+    let (mut year, mut month) = (first.year(), first.month());
+    let mut out = Vec::new();
+    loop {
+        let Some(start) = chrono::Utc.with_ymd_and_hms(year, month, 1, 0, 0, 0).single() else { return out };
+        let at = start.timestamp();
+        if at > to as i64 {
+            return out;
+        }
+        if at >= from as i64 {
+            out.push((at as u64, month));
+        }
+        (year, month) = if month == 12 { (year + 1, 1) } else { (year, month + 1) };
+    }
+}
+
+fn utc_time(unix: u64, format: &str) -> String {
+    use chrono::TimeZone;
+    chrono::Utc.timestamp_opt(unix as i64, 0).single().map(|t| t.format(format).to_string()).unwrap_or_default()
 }
 
 /// `20261005-140733` — часть имени файла.
@@ -188,8 +238,24 @@ mod tests {
         shape(&date_time(at), "9999.99.99 99:99");
         shape(&date_time_sec(at), "9999.99.99 99:99:99");
         shape(&time_sec(at), "99:99:99");
+        shape(&time(at), "99:99");
+        shape(&utc_date(at), "9999.99.99");
+        shape(&utc_month(at), "9999.99");
+        assert_eq!(utc_date(at), "2026.10.05");
+        assert_eq!(utc_month(at), "2026.10");
         assert!(date(at).starts_with("2026.1"), "{}", date(at));
         assert_eq!(date_time_sec(at)[..16], date_time(at), "минуты совпадают");
+    }
+
+    #[test]
+    fn utc_month_starts_cover_the_range_across_a_new_year() {
+        let nov_15 = 1_794_700_800; // 2026-11-15 00:00 UTC
+        let feb_10 = 1_802_217_600; // 2027-02-10 00:00 UTC
+        let starts = utc_month_starts(nov_15, feb_10);
+        assert_eq!(starts.iter().map(|s| s.1).collect::<Vec<_>>(), [12, 1, 2]);
+        assert_eq!(starts.iter().map(|s| utc_date(s.0)).collect::<Vec<_>>(), ["2026.12.01", "2027.01.01", "2027.02.01"]);
+        assert_eq!(utc_month_starts(starts[0].0, starts[0].0).len(), 1, "начало месяца на границе входит");
+        assert!(utc_month_starts(nov_15, nov_15 + 86_400).is_empty());
     }
 
     #[test]

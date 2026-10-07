@@ -40,6 +40,12 @@ Rules for every window, dialog and notice in the app. The goal is a window that 
    Daylight the selected row also gets a 3 px accent bar on the left: the light selection fill alone is hard to see.
    Every text colour, weak text included, has contrast of at least 4.5 (WCAG AA) on the theme's backgrounds; weak text
    stays dimmer than plain text (test `every_palette_meets_wcag_contrast_targets`).
+   An active tunnel stands out in the list: its status dot is slightly larger and its name is drawn in the dot's
+   colour - green when connected, yellow while connecting, reconnecting or when pings fail (`name_color` in
+   `src/app/list/rows.rs`). Disconnected tunnels, an unknown state (no link to the core) and errors keep plain text;
+   an error is shown by the red dot and the tooltip. These two status colours are saturated (CIELAB chroma at least
+   45, colour difference CIE76 from the grey of disconnected tunnels at least 45) and readable at 4.5 on the selected
+   row too (tests `active_status_colours_stand_out_from_idle`, `active_tunnel_name_reads_on_every_row_background`).
    Icons on the taskbar and in the tray do not depend on the theme.
 4. DPI: per-monitor scale; nothing is clipped at 100-300 %.
 

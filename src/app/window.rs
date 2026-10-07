@@ -214,7 +214,12 @@ impl App {
             ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::pos2(0.0, 0.0)));
         }
         let elapsed = self.window.started.elapsed();
-        let period = self.s.graph_period.max(60) as f64 + 3.0;
+        // Масштаб истории живых замеров не ждёт: хватает двух минут.
+        let live_secs = match super::graph::source(self.s.graph_range) {
+            super::graph::Source::Live(secs) => secs,
+            super::graph::Source::History(_) => 120,
+        };
+        let period = live_secs as f64 + 3.0;
         let graph_full = self.shared.observed_for(period);
         if elapsed > Duration::from_secs(6) && (graph_full || elapsed > SNAPSHOT_TIMEOUT) {
             ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(Default::default()));

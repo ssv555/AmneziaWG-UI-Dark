@@ -29,6 +29,69 @@ pub enum AgentRequest {
     Events { after: u64 },
     /// Конфиги туннелей и родное окно AmneziaWG (`tunnels`): долгие действия помощника и хранилище режима 2.
     Tunnel(TunnelRequest),
+    /// История скорости туннеля за сутки, месяц или год (`history`, файл `history.bin`); только чтение. Агент прежней
+    /// версии отвечает на него отказом «unknown variant» — окно показывает это как «истории нет».
+    History { tunnel: String, range: HistoryRange },
+}
+
+/// Ряд истории скорости: ширина интервала и сколько их хранится. Часть протокола: окно рисует по `bucket_s`.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HistoryRange {
+    /// 1440 интервалов по минуте.
+    Day,
+    /// 744 интервала по часу (31 сутки).
+    Month,
+    /// 366 интервалов по суткам (UTC).
+    Year,
+}
+
+impl HistoryRange {
+    pub const ALL: [HistoryRange; 3] = [HistoryRange::Day, HistoryRange::Month, HistoryRange::Year];
+
+    /// Ширина интервала, секунды; интервал начинается на кратном ей unix-времени.
+    pub fn bucket_secs(self) -> u64 {
+        match self {
+            HistoryRange::Day => 60,
+            HistoryRange::Month => 3600,
+            HistoryRange::Year => 86_400,
+        }
+    }
+
+    /// Сколько интервалов хранится: столько же — наибольший ответ на `History`.
+    pub fn capacity(self) -> usize {
+        match self {
+            HistoryRange::Day => 1440,
+            HistoryRange::Month => 744,
+            HistoryRange::Year => 366,
+        }
+    }
+}
+
+/// Ответ на `History`: интервалы с данными по возрастанию `start`. Интервала нет — туннель тогда не был подключён
+/// (или агент не работал): это разрыв, а не ноль.
+#[derive(Serialize, Deserialize, Debug, Default, Clone, PartialEq)]
+#[serde(default)]
+pub struct History {
+    /// Ширина интервала, секунды (`HistoryRange::bucket_secs`).
+    pub bucket_s: u64,
+    pub buckets: Vec<HistoryBucket>,
+}
+
+/// Один интервал истории. Средние — по времени, когда туннель был подключён внутри интервала (`secs`), а не по всей
+/// его ширине; пик — наибольшая скорость между двумя замерами, не меньше среднего.
+#[derive(Serialize, Deserialize, Debug, Default, Clone, PartialEq)]
+#[serde(default)]
+pub struct HistoryBucket {
+    /// Начало интервала, unix-секунды.
+    pub start: u64,
+    /// Сколько секунд интервала туннель был подключён и замерялся.
+    pub secs: f64,
+    /// Средняя скорость приёма и передачи, байт/с.
+    pub rx: f64,
+    pub tx: f64,
+    /// Пиковая скорость приёма и передачи, байт/с.
+    pub peak_rx: f64,
+    pub peak_tx: f64,
 }
 
 /// Запросы окна о конфигах туннелей — те, что раньше обслуживало ядро (`daemon::proto::Request` с теми же именами).
@@ -65,6 +128,7 @@ pub enum AgentResponse {
     Info(TunnelInfo),
     Entries(Vec<Entry>),
     Report(ImportReport),
+    History(Box<History>),
 }
 
 /// Состояние агента для окна. Каждое поле — `serde(default)` (на всей структуре): агент другой версии, который поля
@@ -161,6 +225,32 @@ mod tests {
             assert!(!line.contains('\n'));
             assert_eq!(serde_json::from_str::<AgentResponse>(&line).unwrap(), reply);
         }
+    }
+
+    /// Запрос и ответ истории — одной строкой и без потерь; ответ агента без полей (другой версии) — пустая история.
+    #[test]
+    fn history_messages_survive_the_pipe() {
+        for range in HistoryRange::ALL {
+            let request = AgentRequest::History { tunnel: "office".into(), range };
+            let line = serde_json::to_string(&request).unwrap();
+            assert!(!line.contains('\n'));
+            assert_eq!(serde_json::from_str::<AgentRequest>(&line).unwrap(), request);
+        }
+        assert_eq!(serde_json::to_string(&AgentRequest::History { tunnel: "a".into(), range: HistoryRange::Day }).unwrap(), r#"{"History":{"tunnel":"a","range":"Day"}}"#);
+        let bucket = HistoryBucket { start: 120, secs: 59.5, rx: 1000.0, tx: 10.0, peak_rx: 4000.0, peak_tx: 50.0 };
+        let reply = AgentResponse::History(Box::new(History { bucket_s: 60, buckets: vec![bucket] }));
+        let line = serde_json::to_string(&reply).unwrap();
+        assert!(!line.contains('\n'));
+        assert_eq!(serde_json::from_str::<AgentResponse>(&line).unwrap(), reply);
+        assert_eq!(serde_json::from_str::<History>("{}").unwrap(), History::default());
+    }
+
+    /// Ряды по заданию: сутки по минуте, месяц по часу, год по суткам — и каждый покрывает свой срок.
+    #[test]
+    fn history_ranges_have_the_agreed_shape() {
+        let shape: Vec<_> = HistoryRange::ALL.iter().map(|r| (r.bucket_secs(), r.capacity())).collect();
+        assert_eq!(shape, [(60, 1440), (3600, 744), (86_400, 366)]);
+        assert_eq!(HistoryRange::Day.bucket_secs() * HistoryRange::Day.capacity() as u64, 86_400);
     }
 
     #[test]

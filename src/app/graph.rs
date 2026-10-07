@@ -1,16 +1,21 @@
-//! График скорости и полоса пинга под ним: шкала скоростей справа, кнопка паузы в правом верхнем углу.
+//! График скорости и полоса пинга под ним: масштаб выпадающим списком над графиком, шкала скоростей справа, кнопка
+//! паузы в правом верхнем углу. 2 мин, 10 мин и 1 ч — замеры окна; День, Месяц и Год — история агента
+//! (`history_feed`, рисует `history_graph`).
 
 use std::time::Instant;
 
-use eframe::egui::{self, Align2, FontId, Pos2, Rect, Response, RichText, Sense, Stroke, Ui, Vec2};
+use eframe::egui::{self, Align2, Color32, FontId, Painter, Pos2, Rect, Response, RichText, Sense, Stroke, Ui, Vec2};
 
 use super::a11y::{self, Painted};
+use super::history_feed::{HistoryFeed, Shown};
+use super::history_graph;
 use super::theme::{mono, palette};
+use crate::daemon::agent::proto::HistoryRange;
 use crate::fmt;
 use crate::i18n::{tr, trf};
 use crate::monitor::Live;
 use crate::ping::PingState;
-use crate::settings::Settings;
+use crate::settings::{GraphRange, Settings};
 
 const GRAPH_MIN_H: f32 = 40.0;
 const GRAPH_MAX_H: f32 = 600.0;
@@ -18,8 +23,7 @@ const PING_STRIP_H: f32 = 50.0;
 /// Высота подписи над точками полосы пинга.
 const LEGEND_H: f32 = 24.0;
 /// Верх графика = пик × запас.
-const GRAPH_HEADROOM: f64 = 1.15;
-const PERIODS: [(u32, &str); 3] = [(120, "period.2m"), (600, "period.10m"), (3600, "period.1h")];
+pub(super) const GRAPH_HEADROOM: f64 = 1.15;
 /// Полоса над кривыми: подпись пика, метка паузы и кнопка паузы. Кривые туда не заходят — ничего не закрыто.
 const TOP_BAND_H: f32 = 20.0;
 const PAUSE_BUTTON: f32 = 16.0;
@@ -65,8 +69,54 @@ pub(super) fn nice_ticks(top: f64) -> Vec<Tick> {
         .collect()
 }
 
+/// Откуда график берёт данные: замеры окна за последние секунды или история агента.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Source {
+    /// Замеры окна в памяти (раз в секунду, не дольше часа), за столько секунд.
+    Live(u32),
+    /// История, которую копит агент (`AgentApi::history`), и при закрытом окне.
+    History(HistoryRange),
+}
+
+/// Источник масштаба: 2 мин, 10 мин и 1 ч — живые замеры окна; День, Месяц и Год — история агента.
+pub(super) fn source(range: GraphRange) -> Source {
+    match range {
+        GraphRange::Min2 => Source::Live(120),
+        GraphRange::Min10 => Source::Live(600),
+        GraphRange::Hour1 => Source::Live(3600),
+        GraphRange::Day => Source::History(HistoryRange::Day),
+        GraphRange::Month => Source::History(HistoryRange::Month),
+        GraphRange::Year => Source::History(HistoryRange::Year),
+    }
+}
+
+fn range_title(range: GraphRange) -> String {
+    tr(match range {
+        GraphRange::Min2 => "period.2m",
+        GraphRange::Min10 => "period.10m",
+        GraphRange::Hour1 => "period.1h",
+        GraphRange::Day => "period.day",
+        GraphRange::Month => "period.month",
+        GraphRange::Year => "period.year",
+    })
+}
+
+/// Что показывает кадр: живые замеры за столько секунд или историю масштаба (ответ агента или снимок паузы).
+enum Shows {
+    Live(u32),
+    History(HistoryRange, Shown),
+}
+
+/// Состояние графика на время работы окна (в настройки не пишется): пауза и история от агента.
+pub(super) struct GraphState {
+    pub(super) pause: GraphPause,
+    pub(super) feed: HistoryFeed,
+}
+
 /// Пауза графика — снимок данных на момент нажатия, чтобы навести мышь на пик, пока он не уехал. Живёт, пока открыто
 /// окно (в настройки не пишется); показан другой туннель — пауза снята. Опрос идёт дальше: снимок просто не обновляется.
+/// История (День, Месяц, Год) замирает тоже — снимком того масштаба, на котором нажали: выбран масштаб с другим
+/// источником — пауза снята; между 2 мин, 10 мин и 1 ч пауза стоит (снимок замеров покрывает час).
 #[derive(Default)]
 pub(super) struct GraphPause {
     frozen: Option<Frozen>,
@@ -74,8 +124,10 @@ pub(super) struct GraphPause {
 
 struct Frozen {
     tunnel: String,
+    range: GraphRange,
     live: Live,
     ping: Option<PingState>,
+    history: Option<Shown>,
     at: Instant,
 }
 
@@ -91,19 +143,33 @@ pub(super) struct GraphData<'a> {
 }
 
 impl GraphPause {
-    /// Показан другой туннель — пауза снята: снимок одного туннеля под именем другого не показывается.
-    pub(super) fn follow(&mut self, tunnel: &str) {
-        if self.frozen.as_ref().is_some_and(|f| f.tunnel != tunnel) {
+    /// Показан другой туннель или выбран масштаб с другим источником — пауза снята: снимок одного туннеля под именем
+    /// другого или снимок суток под заголовком «Год» не показывается.
+    pub(super) fn follow(&mut self, tunnel: &str, range: GraphRange) {
+        let history = |r: GraphRange| matches!(source(r), Source::History(_));
+        if self.frozen.as_ref().is_some_and(|f| f.tunnel != tunnel || (f.range != range && (history(f.range) || history(range)))) {
             self.frozen = None;
         }
     }
 
-    /// На паузу — снимок `live` и `ping` на момент `now`; с паузы — снова живые данные.
-    pub(super) fn toggle(&mut self, tunnel: &str, live: &Live, ping: Option<&PingState>, now: Instant) {
+    /// На паузу — снимок `live`, `ping` и показанной истории на момент `now`; с паузы — снова живые данные.
+    pub(super) fn toggle(&mut self, tunnel: &str, range: GraphRange, live: &Live, ping: Option<&PingState>, history: Option<&Shown>, now: Instant) {
         self.frozen = match self.frozen.take() {
             Some(_) => None,
-            None => Some(Frozen { tunnel: tunnel.to_string(), live: live.clone(), ping: ping.cloned(), at: now }),
+            None => Some(Frozen {
+                tunnel: tunnel.to_string(),
+                range,
+                live: live.clone(),
+                ping: ping.cloned(),
+                history: history.cloned(),
+                at: now,
+            }),
         };
+    }
+
+    /// Снимок истории на паузе; `None` — не на паузе или нажали на живом масштабе.
+    pub(super) fn frozen_history(&self) -> Option<&Shown> {
+        self.frozen.as_ref().and_then(|f| f.history.as_ref())
     }
 
     /// Данные кадра. Полоса пинга скрыта сейчас (`ping` — `None`) — её нет и на паузе.
@@ -122,8 +188,32 @@ impl GraphPause {
 }
 
 /// Высота значения `v` байт/с в области кривых `plot` при верхе шкалы `scale`.
-fn y_of(plot: Rect, scale: f64, v: f64) -> f32 {
+pub(super) fn y_of(plot: Rect, scale: f64, v: f64) -> f32 {
     plot.bottom() - 4.0 - (v / scale) as f32 * (plot.height() - 8.0)
+}
+
+/// Шкала скоростей справа и деления поперёк для пика `max` байт/с (верх — с запасом `GRAPH_HEADROOM`). Возвращает
+/// область кривых — левее подписей шкалы, ниже полосы паузы, выше `bottom_band` (подписи оси времени) — и верх шкалы.
+pub(super) fn scale_frame(painter: &Painter, rect: Rect, max: f64, bottom_band: f32, weak: Color32) -> (Rect, f64) {
+    let scale = max * GRAPH_HEADROOM;
+    let ticks: Vec<_> = nice_ticks(scale)
+        .into_iter()
+        .map(|t| (t.value, painter.layout_no_wrap(t.label, FontId::proportional(SCALE_FONT), weak)))
+        .collect();
+    let scale_w = ticks.iter().map(|(_, g)| g.size().x).fold(0.0, f32::max) + 2.0 * SCALE_PAD;
+    let plot = Rect::from_min_max(Pos2::new(rect.left(), rect.top() + TOP_BAND_H), Pos2::new(rect.right() - scale_w, rect.bottom() - bottom_band));
+    for (value, galley) in ticks {
+        let y = y_of(plot, scale, value);
+        painter.hline(plot.x_range(), y, Stroke::new(1.0_f32, palette().border));
+        let top = (y - galley.size().y / 2.0).clamp(plot.top(), rect.bottom() - galley.size().y);
+        painter.galley(Pos2::new(rect.right() - SCALE_PAD - galley.size().x, top), galley, weak);
+    }
+    (plot, scale)
+}
+
+/// Подпись в полосе над кривыми, слева: пик или легенда истории.
+pub(super) fn top_note(painter: &Painter, rect: Rect, text: String, weak: Color32) {
+    painter.text(rect.left_top() + Vec2::new(6.0, 4.0), Align2::LEFT_TOP, text, FontId::proportional(12.0), weak);
 }
 
 /// Кнопка паузы значком: «пауза» — две полосы, на паузе — нажата, значок «продолжить» (треугольник).
@@ -151,52 +241,101 @@ pub(super) fn bucket_max(series: &[(f64, f64)], buckets: usize) -> Vec<(f64, f64
     series.chunks(k).map(|c| c.iter().fold((0.0f64, 0.0f64), |a, s| (a.0.max(s.0), a.1.max(s.1)))).collect()
 }
 
-/// График скорости (вход — зелёный, выход — синий), под ним полоса пинга. Высота тянется за нижний край.
-/// `pause` — пауза окна: на паузе график и полоса пинга показывают снимок, шкала идёт за снимком.
-pub(super) fn graph(ui: &mut Ui, tunnel: &str, live: &Live, ping: Option<&PingState>, s: &mut Settings, pause: &mut GraphPause) {
+/// Заголовок с выбором масштаба справа — выпадающий список. Выбор сразу в настройках: они пишутся сами, как прочий вид.
+fn range_picker(ui: &mut Ui, s: &mut Settings) {
     ui.horizontal(|ui| {
         ui.weak(tr("gr.speed"));
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            for (secs, title) in PERIODS.iter().rev() {
-                ui.selectable_value(&mut s.graph_period, *secs, tr(title));
-            }
+            egui::ComboBox::from_id_salt("graph-range").selected_text(range_title(s.graph_range)).show_ui(ui, |ui| {
+                for range in GraphRange::ALL {
+                    ui.selectable_value(&mut s.graph_range, range, range_title(range));
+                }
+            });
         });
     });
-    let period = s.graph_period.max(60) as f64;
+}
+
+/// График скорости (вход — зелёный, выход — синий), под ним полоса пинга. Высота тянется за нижний край.
+/// `live` — замеры подключённого туннеля; `None` — не подключён (тогда график зовут только ради истории).
+/// `view.pause` — пауза окна: на паузе график и полоса пинга показывают снимок, шкала идёт за снимком.
+pub(super) fn graph(ui: &mut Ui, tunnel: &str, live: Option<&Live>, ping: Option<&PingState>, s: &mut Settings, view: &mut GraphState) {
+    range_picker(ui, s);
     let height = s.graph_height.clamp(GRAPH_MIN_H, GRAPH_MAX_H);
     let (rect, hover) = ui.allocate_exact_size(Vec2::new(ui.available_width(), height), Sense::hover());
 
     // Кнопка — раньше данных: нажатие в этом кадре уже показывает снимок (или живые данные).
     let now = Instant::now();
-    pause.follow(tunnel);
+    view.pause.follow(tunnel, s.graph_range);
+    let no_live = Live::default();
+    let live = live.unwrap_or(&no_live);
+    // На паузе история не запрашивается: показан снимок.
+    let shows = match source(s.graph_range) {
+        Source::Live(secs) => Shows::Live(secs),
+        Source::History(range) => Shows::History(range, match view.pause.frozen_history() {
+            Some(frozen) => frozen.clone(),
+            None => view.feed.shown(tunnel, range, now),
+        }),
+    };
     let button_rect = Rect::from_min_size(Pos2::new(rect.right() - 2.0 - PAUSE_BUTTON, rect.top() + 2.0), Vec2::splat(PAUSE_BUTTON));
     let button = ui.interact(button_rect, hover.id.with("pause"), Sense::click());
     if button.clicked() {
-        pause.toggle(tunnel, live, ping, now);
+        let history = match &shows {
+            Shows::History(_, shown) => Some(shown),
+            Shows::Live(_) => None,
+        };
+        view.pause.toggle(tunnel, s.graph_range, live, ping, history, now);
     }
-    let data = pause.data(live, ping, now);
+    let data = view.pause.data(live, ping, now);
 
     let painter = ui.painter_at(rect);
-    let weak = ui.visuals().weak_text_color();
     painter.rect_filled(rect, egui::CornerRadius::same(4), ui.visuals().extreme_bg_color);
+    let over_button = button.hovered();
+    match &shows {
+        Shows::Live(secs) => live_plot(ui, &painter, &hover, rect, *secs as f64, &data, over_button),
+        Shows::History(range, shown) => {
+            history_graph::plot(ui, &painter, &hover, &history_graph::Plot { rect, range: *range, shown, paused: data.paused, over_button });
+        }
+    }
+    if data.paused {
+        let weak = ui.visuals().weak_text_color();
+        painter.text(Pos2::new(button_rect.left() - 6.0, button_rect.center().y), Align2::RIGHT_CENTER, tr("gr.paused"), FontId::proportional(12.0), weak);
+    }
+    paint_pause_button(ui, &button, data.paused);
+    a11y::describe(&button, Painted::GraphPause { paused: data.paused });
+    button.on_hover_text(tr(if data.paused { "gr.resume" } else { "gr.pause" }));
+
+    match (&shows, data.ping) {
+        (Shows::Live(secs), Some(ping)) => {
+            ui.add_space(4.0);
+            ping_strip(ui, ping, *secs as f64, data.at, data.lag_secs);
+        }
+        // Агент пингует один узел и истории пинга не хранит.
+        (Shows::History(..), Some(_)) => {
+            ui.add_space(4.0);
+            ui.weak(tr("gr.ping_live_only"));
+        }
+        (_, None) => {}
+    }
+
+    // Ручка изменения высоты под графиком.
+    let (handle, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 8.0), Sense::drag());
+    if resp.hovered() || resp.dragged() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeVertical);
+        ui.painter().hline(handle.x_range(), handle.center().y, Stroke::new(2.0_f32, ui.visuals().weak_text_color()));
+    }
+    if resp.dragged() {
+        s.graph_height = (s.graph_height + resp.drag_delta().y).clamp(GRAPH_MIN_H, GRAPH_MAX_H);
+    }
+}
+
+/// Живые замеры за `period` секунд: кривые по секундам (сжатые до ширины максимумом), подсказка с возрастом точки.
+fn live_plot(ui: &Ui, painter: &Painter, hover: &Response, rect: Rect, period: f64, data: &GraphData, over_button: bool) {
+    let weak = ui.visuals().weak_text_color();
     let series = data.live.rate_series(period);
     // Пик по всем замерам — тот же, что по корзинам (`bucket_max` пиков не теряет), а нужен раньше: от него шкала,
     // от ширины её подписей — ширина области кривых, от неё — число корзин.
     let max = series.iter().map(|(r, t)| r.max(*t)).fold(1.0, f64::max);
-    // Запас сверху, чтобы пик не упирался в верх.
-    let scale = max * GRAPH_HEADROOM;
-    let ticks: Vec<_> = nice_ticks(scale)
-        .into_iter()
-        .map(|t| (t.value, painter.layout_no_wrap(t.label, FontId::proportional(SCALE_FONT), weak)))
-        .collect();
-    let scale_w = ticks.iter().map(|(_, g)| g.size().x).fold(0.0, f32::max) + 2.0 * SCALE_PAD;
-    let plot = Rect::from_min_max(Pos2::new(rect.left(), rect.top() + TOP_BAND_H), Pos2::new(rect.right() - scale_w, rect.bottom()));
-    for (value, galley) in ticks {
-        let y = y_of(plot, scale, value);
-        painter.hline(plot.x_range(), y, Stroke::new(1.0_f32, palette().border));
-        let top = (y - galley.size().y / 2.0).clamp(plot.top(), rect.bottom() - galley.size().y);
-        painter.galley(Pos2::new(rect.right() - SCALE_PAD - galley.size().x, top), galley, weak);
-    }
+    let (plot, scale) = scale_frame(painter, rect, max, 0.0, weak);
 
     let points = bucket_max(&series, plot.width().max(1.0) as usize);
     // Замер раз в секунду; после сжатия одна точка покрывает `per_point` секунд.
@@ -209,59 +348,35 @@ pub(super) fn graph(ui: &mut Ui, tunnel: &str, live: &Live, ping: Option<&PingSt
         painter.add(egui::Shape::line(line(|p| p.1), Stroke::new(1.5_f32, palette().graph_tx)));
         painter.add(egui::Shape::line(line(|p| p.0), Stroke::new(1.5_f32, palette().graph_rx)));
     }
-    painter.text(rect.left_top() + Vec2::new(6.0, 4.0), Align2::LEFT_TOP, trf("gr.peak", &[&fmt::rate(max)]), FontId::proportional(12.0), weak);
-    if data.paused {
-        painter.text(Pos2::new(button_rect.left() - 6.0, button_rect.center().y), Align2::RIGHT_CENTER, tr("gr.paused"), FontId::proportional(12.0), weak);
-    }
-    paint_pause_button(ui, &button, data.paused);
-    let over_button = button.hovered();
-    a11y::describe(&button, Painted::GraphPause { paused: data.paused });
-    button.on_hover_text(tr(if data.paused { "gr.resume" } else { "gr.pause" }));
+    top_note(painter, rect, trf("gr.peak", &[&fmt::rate(max)]), weak);
     // Диктору — то, что зрячий видит с одного взгляда: текущие приём и передача (как в карточке, за 3 с) и пик.
     let (rx_now, tx_now) = data.live.rate(3.0);
     let (rx, tx, peak) = (fmt::rate(rx_now), fmt::rate(tx_now), fmt::rate(max));
-    a11y::describe(&hover, Painted::Graph { rx: &rx, tx: &tx, peak: &peak, paused: data.paused });
+    a11y::describe(hover, Painted::Graph { rx: &rx, tx: &tx, peak: &peak, paused: data.paused });
 
     // Наведение: ближайшая точка — вертикальная линия, точки на кривых, подсказка со значениями. Над кнопкой — её подсказка.
-    if let Some(pos) = hover.hover_pos().filter(|_| !over_button) {
-        if let Some(i) = nearest_from_right(plot.right() - pos.x, step, points.len()) {
-            let p = points[points.len() - 1 - i];
-            let x = plot.right() - i as f32 * step;
-            painter.vline(x, plot.y_range(), Stroke::new(1.0_f32, weak));
-            painter.circle_filled(Pos2::new(x, y_of(plot, scale, p.0)), 3.5, palette().graph_rx);
-            painter.circle_filled(Pos2::new(x, y_of(plot, scale, p.1)), 3.5, palette().graph_tx);
-            let when = fmt::ago((i * per_point) as u64 + data.lag_secs);
-            hover.on_hover_ui_at_pointer(|ui| {
-                ui.label(RichText::new(when).weak());
-                if per_point > 1 {
-                    ui.label(RichText::new(trf("gr.bucket", &[&fmt::duration(per_point as f64)])).weak());
-                }
-                egui::Grid::new("graph-tip").num_columns(2).spacing([16.0, 2.0]).show(ui, |ui| {
-                    ui.label(&tr("st.rx_rate"));
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| ui.label(mono(fmt::rate(p.0), palette().graph_rx)));
-                    ui.end_row();
-                    ui.label(&tr("st.tx_rate"));
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| ui.label(mono(fmt::rate(p.1), palette().graph_tx)));
-                    ui.end_row();
-                });
-            });
+    let Some(pos) = hover.hover_pos().filter(|_| !over_button) else { return };
+    let Some(i) = nearest_from_right(plot.right() - pos.x, step, points.len()) else { return };
+    let p = points[points.len() - 1 - i];
+    let x = plot.right() - i as f32 * step;
+    painter.vline(x, plot.y_range(), Stroke::new(1.0_f32, weak));
+    painter.circle_filled(Pos2::new(x, y_of(plot, scale, p.0)), 3.5, palette().graph_rx);
+    painter.circle_filled(Pos2::new(x, y_of(plot, scale, p.1)), 3.5, palette().graph_tx);
+    let when = fmt::ago((i * per_point) as u64 + data.lag_secs);
+    hover.clone().on_hover_ui_at_pointer(|ui| {
+        ui.label(RichText::new(when).weak());
+        if per_point > 1 {
+            ui.label(RichText::new(trf("gr.bucket", &[&fmt::duration(per_point as f64)])).weak());
         }
-    }
-
-    if let Some(ping) = data.ping {
-        ui.add_space(4.0);
-        ping_strip(ui, ping, period, data.at, data.lag_secs);
-    }
-
-    // Ручка изменения высоты под графиком.
-    let (handle, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 8.0), Sense::drag());
-    if resp.hovered() || resp.dragged() {
-        ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeVertical);
-        ui.painter().hline(handle.x_range(), handle.center().y, Stroke::new(2.0_f32, ui.visuals().weak_text_color()));
-    }
-    if resp.dragged() {
-        s.graph_height = (s.graph_height + resp.drag_delta().y).clamp(GRAPH_MIN_H, GRAPH_MAX_H);
-    }
+        egui::Grid::new("graph-tip").num_columns(2).spacing([16.0, 2.0]).show(ui, |ui| {
+            ui.label(&tr("st.rx_rate"));
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| ui.label(mono(fmt::rate(p.0), palette().graph_rx)));
+            ui.end_row();
+            ui.label(&tr("st.tx_rate"));
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| ui.label(mono(fmt::rate(p.1), palette().graph_tx)));
+            ui.end_row();
+        });
+    });
 }
 
 /// Пинг не прошёл: последнее удачное значение и «н/д», если оно было, иначе только «н/д».
@@ -442,14 +557,14 @@ mod tests {
         ping.history.push_back((t0, Some(40)));
         let mut pause = GraphPause::default();
         let at_pause = t0 + std::time::Duration::from_secs(2);
-        pause.toggle("office", &live, Some(&ping), at_pause);
+        pause.toggle("office", GraphRange::Min2, &live, Some(&ping), None, at_pause);
         let frozen = live.rate_series(120.0);
 
         // Опрос идёт дальше: новые замеры и пинги в живых данных.
         live = live_with(&[0, 100, 200, 5000, 9000], t0);
         ping.history.push_back((t0 + std::time::Duration::from_secs(4), Some(900)));
         let later = t0 + std::time::Duration::from_secs(14);
-        pause.follow("office");
+        pause.follow("office", GraphRange::Min2);
         let data = pause.data(&live, Some(&ping), later);
         assert!(data.paused && pause.frozen.is_some());
         assert_eq!(data.live.rate_series(120.0), frozen, "на паузе — снимок");
@@ -460,7 +575,7 @@ mod tests {
         assert!(pause.data(&live, None, later).ping.is_none());
 
         // Продолжить — снова живые данные.
-        pause.toggle("office", &live, Some(&ping), later);
+        pause.toggle("office", GraphRange::Min2, &live, Some(&ping), None, later);
         let data = pause.data(&live, Some(&ping), later);
         assert!(!data.paused && pause.frozen.is_none());
         assert_eq!(data.live.rate_series(120.0), live.rate_series(120.0));
@@ -474,16 +589,82 @@ mod tests {
         let office = live_with(&[0, 100, 200], t0);
         let home = live_with(&[0, 7, 7, 7], t0);
         let mut pause = GraphPause::default();
-        pause.toggle("office", &office, None, t0);
-        pause.follow("office");
+        pause.toggle("office", GraphRange::Min2, &office, None, None, t0);
+        pause.follow("office", GraphRange::Min2);
         assert!(pause.frozen.is_some(), "тот же туннель — пауза стоит");
-        pause.follow("home");
+        pause.follow("home", GraphRange::Min2);
         assert!(pause.frozen.is_none());
         let data = pause.data(&home, None, t0);
         assert!(!data.paused);
         assert_eq!(data.live.rate_series(120.0), home.rate_series(120.0), "снимок чужого туннеля не показан");
         // Назад к первому туннелю — живые данные, пауза не вернулась.
-        pause.follow("office");
+        pause.follow("office", GraphRange::Min2);
         assert!(!pause.data(&office, None, t0).paused);
+    }
+
+    #[test]
+    fn live_ranges_use_window_samples_and_long_ones_the_agents_history() {
+        let sources: Vec<_> = GraphRange::ALL.into_iter().map(source).collect();
+        assert_eq!(
+            sources,
+            [
+                Source::Live(120),
+                Source::Live(600),
+                Source::Live(3600),
+                Source::History(HistoryRange::Day),
+                Source::History(HistoryRange::Month),
+                Source::History(HistoryRange::Year),
+            ]
+        );
+        // Живой масштаб не длиннее того, что окно держит в памяти.
+        for s in sources {
+            if let Source::Live(secs) = s {
+                assert!(secs as usize <= crate::monitor::HISTORY_SECS, "{secs}");
+            }
+        }
+    }
+
+    fn history_of(rx: f64) -> Shown {
+        let bucket = crate::daemon::agent::proto::HistoryBucket { start: 0, secs: 60.0, rx, ..Default::default() };
+        let history = crate::daemon::agent::proto::History { bucket_s: 60, buckets: vec![bucket] };
+        Shown::Ready { history: std::sync::Arc::new(history), at_unix: 600 }
+    }
+
+    #[test]
+    fn pause_freezes_the_shown_history_until_the_source_changes() {
+        let t0 = Instant::now();
+        let live = Live::default();
+        let mut pause = GraphPause::default();
+        assert!(pause.frozen_history().is_none());
+        pause.toggle("office", GraphRange::Day, &live, None, Some(&history_of(1.0)), t0);
+        pause.follow("office", GraphRange::Day);
+        assert_eq!(pause.frozen_history(), Some(&history_of(1.0)), "на паузе — снимок, а не новый ответ агента");
+        assert!(pause.data(&live, None, t0).paused);
+
+        // Другой масштаб истории — снимок суток под заголовком «Месяц» не показывается.
+        pause.follow("office", GraphRange::Month);
+        assert!(pause.frozen_history().is_none() && !pause.data(&live, None, t0).paused);
+
+        // С истории на живой масштаб и обратно — тоже другой источник.
+        pause.toggle("office", GraphRange::Year, &live, None, Some(&history_of(2.0)), t0);
+        pause.follow("office", GraphRange::Min10);
+        assert!(!pause.data(&live, None, t0).paused);
+        pause.toggle("office", GraphRange::Min2, &live, None, None, t0);
+        pause.follow("office", GraphRange::Year);
+        assert!(!pause.data(&live, None, t0).paused);
+
+        // Между живыми масштабами пауза стоит, как в 0.5.3; другой туннель — снята и на истории.
+        pause.toggle("office", GraphRange::Min2, &live, None, None, t0);
+        pause.follow("office", GraphRange::Hour1);
+        assert!(pause.data(&live, None, t0).paused);
+        pause.toggle("office", GraphRange::Hour1, &live, None, None, t0);
+        pause.toggle("office", GraphRange::Day, &live, None, Some(&history_of(3.0)), t0);
+        pause.follow("home", GraphRange::Day);
+        assert!(pause.frozen_history().is_none());
+
+        // Снова на паузу и с паузы — история опять от агента.
+        pause.toggle("home", GraphRange::Day, &live, None, Some(&history_of(4.0)), t0);
+        pause.toggle("home", GraphRange::Day, &live, None, Some(&history_of(4.0)), t0);
+        assert!(pause.frozen_history().is_none());
     }
 }

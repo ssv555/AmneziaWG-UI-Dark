@@ -1,13 +1,14 @@
 //! Агент — второй процесс (`awg-ui.exe --agent`, SYSTEM): всё, что не должно мешать VPN-ядру (обновления, пинг,
 //! статистика, журнал на диске — по мере переноса, см. план core-split). Сейчас здесь канал агента, `Hello`, пинг
-//! (`agent.ini`), язык ядра (`language`), обновления (`updates`), статистика (`stats`), журнал событий (`journal`,
-//! единственный писатель `events.log`) и конфиги туннелей с помощником родного окна (`tunnels`). Запускает и
-//! сторожит его ядро (`daemon::agent_watch`). VPN-кода здесь нет и быть не должно: туннели,
-//! переключение и переподключение — только в ядре; тест `agent_does_not_reach_into_vpn_code` сторожит это по тексту
-//! модуля.
+//! (`agent.ini`), язык ядра (`language`), обновления (`updates`), статистика (`stats`) и история скорости
+//! (`history`), журнал событий (`journal`, единственный писатель `events.log`) и конфиги туннелей с помощником
+//! родного окна (`tunnels`). Запускает и сторожит его ядро (`daemon::agent_watch`). VPN-кода здесь нет и быть не
+//! должно: туннели, переключение и переподключение — только в ядре; тест `agent_does_not_reach_into_vpn_code`
+//! сторожит это по тексту модуля.
 
 pub mod client;
 mod core_poll;
+mod history;
 mod journal;
 mod language;
 mod ping;
@@ -23,6 +24,7 @@ pub(crate) use stats::AgentStats;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use history::AgentHistory;
 use journal::AgentJournal;
 use language::AgentLanguage;
 use ping::AgentPing;
@@ -56,10 +58,12 @@ pub fn main() -> i32 {
     // stderr агента никто не читает: паника любого потока — в журнал событий, как у ядра.
     crate::crash::install_core(super::events_file());
     let agent = Arc::new(Agent::start());
-    let journal = agent.journal.clone();
+    let (journal, history) = (agent.journal.clone(), agent.history.clone());
     crate::crash::spawn_named("agent-pipe-accept", move || serve(agent));
     loop {
         if crate::crash::core_failure().is_some() {
+            // История скорости — тоже на диск: снаружи агента завершают без предупреждения, а этот выход ещё свой.
+            history.tick();
             // Причина уже в журнале: дописать его очередь в файл до выхода, иначе последние события пропали бы.
             journal.flush_before_exit(super::events_file());
             return FAILED;
@@ -73,6 +77,8 @@ struct Agent {
     ping: Arc<AgentPing>,
     /// Статистика трафика по `State` ядра (`core_poll`), файл `Stats.ini`.
     stats: Arc<AgentStats>,
+    /// История скорости туннелей для графика окна (`history`), файл `history.bin`.
+    history: Arc<AgentHistory>,
     /// Журнал событий: единственный писатель `events.log` (события ядра по курсору и свои).
     journal: Arc<AgentJournal>,
     /// Обновления и откаты; `None` — только у агента в проверках других запросов (отказ с объяснением).
@@ -97,11 +103,12 @@ impl Agent {
         let ping = Arc::new(AgentPing::real(config, path, note_to(&journal)));
         crate::ping::spawn(ping.clone());
         let stats = Arc::new(AgentStats::real(log_to(&journal)));
-        spawn_core_poll(stats.clone(), journal.clone(), language);
+        let history = Arc::new(AgentHistory::real(log_to(&journal)));
+        spawn_core_poll(stats.clone(), history.clone(), journal.clone(), language);
         // Обновления ведёт агент; ядро на `Updates` отвечает окну прежней версии отказом.
         let updates = updates::start(journal.clone());
         let tunnels = Tunnels::real(log_to(&journal));
-        Agent { ping, stats, journal, updates: Some(updates), tunnels }
+        Agent { ping, stats, history, journal, updates: Some(updates), tunnels }
     }
 
     fn state(&self) -> AgentState {
@@ -109,17 +116,26 @@ impl Agent {
     }
 }
 
-/// Опрос ядра раз в секунду (`core_poll`): язык (смена `core.ini`), статистика и журнал событий (события ядра по
-/// курсору). Свой поток записи `Stats.ini` — медленный диск не задерживает опрос (файл журнала пишет его
-/// `events-writer`). Все вторичные: паника — запись в журнал и пауза.
-fn spawn_core_poll(traffic: Arc<AgentStats>, journal: Arc<AgentJournal>, language: Arc<AgentLanguage>) {
+/// Опрос ядра раз в секунду (`core_poll`): язык (смена `core.ini`), статистика, история скорости и журнал событий
+/// (события ядра по курсору). Свои потоки записи `Stats.ini` и `history.bin` — медленный диск не задерживает опрос
+/// (файл журнала пишет его `events-writer`). Все вторичные: паника — запись в журнал и пауза.
+fn spawn_core_poll(traffic: Arc<AgentStats>, speed: Arc<AgentHistory>, journal: Arc<AgentJournal>, language: Arc<AgentLanguage>) {
     // Язык первым: строки журнала с этого же ответа ядра уже на новом языке.
-    let feeds: Vec<Arc<dyn core_poll::CoreFeed>> = vec![language, traffic.clone(), journal.clone()];
+    let feeds: Vec<Arc<dyn core_poll::CoreFeed>> = vec![language, traffic.clone(), speed.clone(), journal.clone()];
     core_poll::spawn(core_poll::CorePoll::real(log_to(&journal)), feeds, Box::new(report_panic(&journal)));
     let report = report_panic(&journal);
+    let pruned_history = speed.clone();
     crate::crash::spawn_named("agent-stats-save", move || {
         crate::crash::nonfatal_loop(stats::SAVE_EVERY, &std::thread::sleep, &report, || {
-            traffic.tick(crate::monitor::unix_now());
+            // История туннеля, чья статистика убрана по сроку, уходит вместе с ней.
+            pruned_history.drop_pruned(&traffic.tick(crate::monitor::unix_now()));
+            std::ops::ControlFlow::Continue(())
+        });
+    });
+    let report = report_panic(&journal);
+    crate::crash::spawn_named("agent-history-save", move || {
+        crate::crash::nonfatal_loop(history::SAVE_EVERY, &std::thread::sleep, &report, || {
+            speed.tick();
             std::ops::ControlFlow::Continue(())
         });
     });
@@ -154,8 +170,17 @@ fn handle(agent: &Agent, request: Result<AgentRequest, String>, caller: &Caller)
             Ok(()) => AgentResponse::Ok,
             Err(e) => AgentResponse::Err(e),
         },
-        Ok(AgentRequest::StatsRename { old, new }) => done(agent.stats.rename(&old, &new)),
-        Ok(AgentRequest::StatsForget(tunnel)) => done(agent.stats.forget(&tunnel)),
+        // История скорости идёт за статистикой: то же новое имя, то же удаление. Выполняются обе, ошибка — первая.
+        Ok(AgentRequest::StatsRename { old, new }) => {
+            let stats = agent.stats.rename(&old, &new);
+            done(stats.and(agent.history.rename(&old, &new)))
+        }
+        Ok(AgentRequest::StatsForget(tunnel)) => {
+            let stats = agent.stats.forget(&tunnel);
+            done(stats.and(agent.history.forget(&tunnel)))
+        }
+        // Только чтение, как `State`: место — из бюджета программ владельца (`AGENT_LIMITS`), ответ ограничен длиной ряда.
+        Ok(AgentRequest::History { tunnel, range }) => AgentResponse::History(Box::new(agent.history.history(&tunnel, range))),
         Ok(AgentRequest::Events { after }) => AgentResponse::Events(Box::new(agent.journal.since(after))),
         Ok(AgentRequest::Tunnel(req)) => agent.tunnels.handle(req, caller),
         // Нечитаемая строка или неизвестный вариант запроса: причина (serde называет вариант) уходит клиенту.
@@ -249,7 +274,43 @@ mod tests {
         let ping = AgentPing::new(config, dir.join("agent.ini"), Box::new(|| Ok(false)), Box::new(|_| Ok(1)), Box::new(|_| {}));
         let traffic = AgentStats::new(dir.join("Stats.ini"), Box::new(crate::stats::save), Box::new(|_, _| {}));
         let tunnels = Tunnels::real(Box::new(|_, _| {}));
-        Agent { ping: Arc::new(ping), stats: Arc::new(traffic), journal: Arc::new(AgentJournal::memory()), updates: None, tunnels }
+        let history = AgentHistory::new(dir.join("history.bin"), Box::new(|| HISTORY_NOW), Box::new(|_, _| {}));
+        Agent { ping: Arc::new(ping), stats: Arc::new(traffic), history: Arc::new(history), journal: Arc::new(AgentJournal::memory()), updates: None, tunnels }
+    }
+
+    /// Часы истории в проверках агента: полночь UTC.
+    const HISTORY_NOW: u64 = 1_789_948_800;
+
+    /// Ответ ядра с туннелями `names`, у каждого принято `rx` байт.
+    fn core_with(names: &[&str], rx: u64) -> crate::daemon::proto::CoreState {
+        let status = crate::uapi::Status { listen_port: 1, peers: vec![crate::uapi::Peer { rx_bytes: rx, ..Default::default() }], ..Default::default() };
+        let running = names.iter().map(|n| (n.to_string(), Ok(status.clone()))).collect();
+        crate::daemon::proto::CoreState { tunnels: names.iter().map(|n| n.to_string()).collect(), running, ..Default::default() }
+    }
+
+    fn history_of(agent: &Agent, tunnel: &str, range: proto::HistoryRange) -> proto::History {
+        let line = serde_json::to_string(&AgentRequest::History { tunnel: tunnel.into(), range }).unwrap();
+        match handle(agent, decode(&line), &by(false)) {
+            AgentResponse::History(h) => *h,
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// Запрос истории окна (без прав администратора) отвечается рядом агента; туннеля нет — пустой ряд, не ошибка.
+    #[test]
+    fn history_request_is_answered_from_the_agents_series() {
+        use core_poll::CoreFeed;
+        use proto::HistoryRange;
+        let dir = temp_dir("history");
+        let agent = agent_in(&dir);
+        let t0 = Instant::now();
+        agent.history.accept(&core_with(&["a"], 0), t0);
+        agent.history.accept(&core_with(&["a"], 3_000), t0 + Duration::from_secs(1));
+        let day = history_of(&agent, "a", HistoryRange::Day);
+        assert_eq!(day.bucket_s, 60);
+        assert_eq!(day.buckets.iter().map(|b| (b.start, b.rx)).collect::<Vec<_>>(), [(HISTORY_NOW, 3_000.0)]);
+        assert_eq!(history_of(&agent, "b", HistoryRange::Year), proto::History { bucket_s: 86_400, buckets: vec![] });
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     /// Клиент проверок: без сеанса и SID (помощник не запускается); `elevated` — с правами администратора.
@@ -321,12 +382,22 @@ mod tests {
         }
         agent.stats.accept(&core, Instant::now());
         assert_eq!(stats_names(&agent), ["a", "b"]);
+        // История скорости тех же туннелей идёт за статистикой.
+        let t0 = Instant::now();
+        agent.history.accept(&core_with(&["a", "b"], 0), t0);
+        agent.history.accept(&core_with(&["a", "b"], 100), t0 + Duration::from_secs(1));
         let rename = serde_json::to_string(&AgentRequest::StatsRename { old: "a".into(), new: "c".into() }).unwrap();
         assert_eq!(handle(&agent, decode(&rename), &by(false)), AgentResponse::Ok);
         let forget = serde_json::to_string(&AgentRequest::StatsForget("b".into())).unwrap();
         assert_eq!(handle(&agent, decode(&forget), &by(false)), AgentResponse::Ok);
         assert_eq!(stats_names(&agent), ["c"]);
         assert_eq!(crate::stats::load(&dir.join("Stats.ini")).into_keys().collect::<Vec<_>>(), ["c"]);
+        let has_history = |name| !history_of(&agent, name, proto::HistoryRange::Day).buckets.is_empty();
+        assert_eq!((has_history("a"), has_history("b"), has_history("c")), (false, false, true));
+        // В файле сразу, не через минуту: перезапущенный агент видит то же.
+        let again = agent_in(&dir);
+        assert_eq!(history_of(&again, "c", proto::HistoryRange::Day).buckets.len(), 1);
+        assert!(history_of(&again, "b", proto::HistoryRange::Day).buckets.is_empty());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -462,6 +533,7 @@ mod tests {
             ("core_poll.rs", include_str!("core_poll.rs")),
             ("journal.rs", include_str!("journal.rs")),
             ("stats.rs", include_str!("stats.rs")),
+            ("history.rs", include_str!("history.rs")),
             ("updates.rs", include_str!("updates.rs")),
             ("tunnels.rs", include_str!("tunnels.rs")),
             ("language.rs", include_str!("language.rs")),

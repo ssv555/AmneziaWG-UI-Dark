@@ -5,7 +5,7 @@ use std::sync::Arc;
 use eframe::egui::{self, Align2, Color32, FontId, Pos2, Rect, RichText, Sense, Stroke, Ui, Vec2};
 
 use crate::app::a11y::{self, Painted};
-use crate::app::theme::{level_color, palette, NUM_FONT};
+use crate::app::theme::{level_color, palette, Palette, NUM_FONT};
 use crate::app::{menu, Action, Confirm, Dialog};
 use crate::daemon::proto::Plan;
 use crate::groups::{self, Agg, Verdict, UNGROUPED};
@@ -251,6 +251,21 @@ fn group_menu(ui: &mut Ui, s: &Settings, of: Option<&str>, tunnel: &str, actions
     }
 }
 
+/// Имя активного туннеля — цветом его кружка, чтобы вся строка читалась включённой: подключён — `connected`,
+/// подключается, переподключается или пинг не проходит — `warning`. `None` — обычный текст: отключён, состояние
+/// неизвестно (нет связи с ядром, кружок жёлтый, но туннель не показан включённым) и ошибка (`Level::Bad`): красный
+/// в выбранной строке Графита нечитаем (2.2 на 005C80), о сбое говорят кружок и подсказка.
+fn name_color(p: &Palette, level: Level, primary: Primary) -> Option<Color32> {
+    if !primary.is_on() {
+        return None;
+    }
+    match level {
+        Level::Ok => Some(p.connected),
+        Level::Busy | Level::Warn => Some(p.warning),
+        Level::Off | Level::Bad => None,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) fn tunnel_row(
     ui: &mut Ui,
@@ -276,12 +291,16 @@ pub(super) fn tunnel_row(
         painter.rect_filled(row, 2.0, ui.visuals().widgets.hovered.weak_bg_fill);
     }
     let text_color = if selected { ui.visuals().selection.stroke.color } else { ui.visuals().text_color() };
+    let primary = Primary::of(h.level, l.snap.core_lost);
+    let active = name_color(palette(), h.level, primary);
     guides(ui, &painter, row, depth);
     let indent = depth as f32 * INDENT + 6.0;
     let c = cells(row, cols);
-    painter.circle_filled(Pos2::new(c.name.left() + indent + 5.0, row.center().y), 5.0, level_color(h.level));
-    let galley = truncated(ui, name, FontId::proportional(15.0), text_color, c.name.width() - indent - 22.0);
-    painter.galley(Pos2::new(c.name.left() + indent + 16.0, row.center().y - galley.size().y / 2.0), galley, text_color);
+    let dot_r = if active.is_some() { 6.0 } else { 5.0 };
+    painter.circle_filled(Pos2::new(c.name.left() + indent + 5.0, row.center().y), dot_r, level_color(h.level));
+    let name_color = active.unwrap_or(text_color);
+    let galley = truncated(ui, name, FontId::proportional(15.0), name_color, c.name.width() - indent - 22.0);
+    painter.galley(Pos2::new(c.name.left() + indent + 16.0, row.center().y - galley.size().y / 2.0), galley, name_color);
     let st = l.stats.get(name).cloned().unwrap_or_default();
     let share = stats::share(l.stats, name);
     for (key, rect) in &c.nums {
@@ -302,7 +321,6 @@ pub(super) fn tunnel_row(
     if resp.clicked() {
         actions.push(Action::Select(name.clone()));
     }
-    let primary = Primary::of(h.level, l.snap.core_lost);
     let running = primary.is_on();
     let busy = h.level == Level::Busy;
     if let Some(plan) = primary.activation().filter(|_| resp.double_clicked()) {
@@ -418,4 +436,25 @@ pub(super) fn tunnel_row(
             ui.close();
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::app::theme::{DAYLIGHT, GRAPHITE, SLATE};
+
+    #[test]
+    fn active_tunnel_name_takes_the_colour_of_its_dot() {
+        for p in [&GRAPHITE, &SLATE, &DAYLIGHT] {
+            let of = |level| name_color(p, level, Primary::of(level, false));
+            assert_eq!(of(Level::Ok), Some(p.connected));
+            assert_eq!((of(Level::Busy), of(Level::Warn)), (Some(p.warning), Some(p.warning)), "подключается, переподключается");
+            assert_eq!(of(Level::Ok), Some(p.level(Level::Ok)), "имя того же цвета, что кружок");
+            assert_eq!(of(Level::Warn), Some(p.level(Level::Warn)));
+            // Отключён и ошибка — обычный текст.
+            assert_eq!((of(Level::Off), of(Level::Bad)), (None, None));
+            // Нет связи с ядром: уровень Warn, кружок жёлтый, но туннель не включён — имя обычное.
+            assert_eq!(name_color(p, Level::Warn, Primary::of(Level::Warn, true)), None);
+        }
+    }
 }
