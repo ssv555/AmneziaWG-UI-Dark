@@ -42,6 +42,7 @@ mod list;
 mod markdown;
 mod menu;
 mod modals;
+mod notice;
 mod native_reopen;
 mod reminder;
 mod settings_dialog;
@@ -52,6 +53,8 @@ mod tray_menu;
 mod updates;
 mod watcher;
 mod window;
+#[cfg(test)]
+mod fit;
 use core_ui::{send_language, CoreLink, Look, Probe};
 use details::{details, Detail};
 use dialog::dialog_buttons;
@@ -62,6 +65,7 @@ use list::{tunnel_list, Keys, List, ROW_H};
 use menu::menu_bar;
 use modals::{Modal, Modals, Outcome, Turn};
 use native_reopen::{LiveNativeWindow, NativeReopen};
+use notice::Notices;
 use sources::Confirm;
 use updates::UpdatesWindow;
 use graph::{GraphPause, GraphState};
@@ -154,8 +158,8 @@ pub struct App {
     sources: SourceWatcher,
     /// Туннели, удалённые в AmneziaWG фоновым потоком, — убрать из настроек.
     deleted: Arc<Mutex<Vec<String>>>,
-    /// Подсказка пользователю в строке состояния.
-    notice: Arc<Mutex<Option<String>>>,
+    /// Подсказка пользователю в строке состояния (успех и предупреждение — ещё и в журнал событий).
+    notice: Notices,
     /// None — неизвестно (демо-режим).
     autostart: Option<bool>,
     action_error: ErrorSink,
@@ -193,28 +197,46 @@ pub struct App {
     tray_layout: tray_menu::SharedLayout,
 }
 
+/// Стиль egui окна, не зависящий от темы: размеры шрифтов и поправки к новым умолчаниям egui. Отдельно от `App::new`,
+/// чтобы тест умещаемости (`fit`) раскладывал окно теми же шрифтами и отступами.
+fn base_style(ctx: &egui::Context) {
+    ctx.all_styles_mut(|s| {
+        for (style, font) in s.text_styles.iter_mut() {
+            font.size = match style {
+                egui::TextStyle::Heading => 20.0,
+                egui::TextStyle::Small => 12.0,
+                egui::TextStyle::Monospace => 14.0,
+                _ => 15.0,
+            };
+        }
+        // egui 0.34 затеняет края прокручиваемых областей; нижняя строка списка выглядела бы недорисованной.
+        s.spacing.scroll.fade.strength = 0.0;
+        // egui 0.35 замедлил анимации до 0,2 с; меню и подсказки появлялись бы заметно медленнее, чем раньше.
+        s.animation_time = 0.1;
+        // egui 0.35 обрезает содержимое прокрутки ровно по краю, а 0.36 убрал clip_rect_margin; без отступа внутри
+        // прокрутки подсветка крайних строк списка срезалась бы.
+        s.spacing.scroll.content_margin = egui::Margin::same(3);
+    });
+}
+
+/// Наименьшая ширина таблицы туннелей и наименьшая ширина карточки туннеля справа от неё: две кнопки по 140–150 pt
+/// и хотя бы ~80 pt имени рядом с ними, сетка состояния из четырёх колонок (4x60 + 3x24). Таблица не шире, чем
+/// остаётся после карточки, и не больше 60 % окна: раньше сохранённые 520 pt в окне 760 оставляли карточке 240, и её
+/// кнопки с сеткой обрезались справа.
+const LEFT_MIN: f32 = 260.0;
+const CARD_MIN: f32 = 420.0;
+
+/// Предел ширины таблицы туннелей в окне шириной `window`.
+fn left_panel_max(window: f32) -> f32 {
+    (window - CARD_MIN).min(window * 0.6).max(LEFT_MIN)
+}
+
 impl App {
     pub fn new(cc: &eframe::CreationContext, shared: Arc<Shared>, start: Start) -> Self {
         let ctx = cc.egui_ctx.clone();
         // Тему (стиль egui, заголовок и рамку окна Windows) ставит `apply_look` в каждом кадре до рисования.
         add_fallback_fonts(&ctx);
-        ctx.all_styles_mut(|s| {
-            for (style, font) in s.text_styles.iter_mut() {
-                font.size = match style {
-                    egui::TextStyle::Heading => 20.0,
-                    egui::TextStyle::Small => 12.0,
-                    egui::TextStyle::Monospace => 14.0,
-                    _ => 15.0,
-                };
-            }
-            // egui 0.34 затеняет края прокручиваемых областей; нижняя строка списка выглядела бы недорисованной.
-            s.spacing.scroll.fade.strength = 0.0;
-            // egui 0.35 замедлил анимации до 0,2 с; меню и подсказки появлялись бы заметно медленнее, чем раньше.
-            s.animation_time = 0.1;
-            // egui 0.35 обрезает содержимое прокрутки ровно по краю, а 0.36 убрал clip_rect_margin; без отступа внутри
-            // прокрутки подсветка крайних строк списка срезалась бы.
-            s.spacing.scroll.content_margin = egui::Margin::same(3);
-        });
+        base_style(&ctx);
         // egui 0.34 закрывает окно по Ctrl+Q. У нас закрытие — по крестику и из меню, с вопросом про туннели и трей.
         ctx.options_mut(|o| o.quit_shortcuts.clear());
         let exit_request = Arc::new(AtomicBool::new(false));
@@ -282,7 +304,7 @@ impl App {
         if start.about {
             modals.open(Modal::About);
         }
-        let notice = Arc::<Mutex<Option<String>>>::default();
+        let notice = Notices::new(shared.clone());
         let updates = UpdatesWindow::new(updates::Link::new(agent.clone(), action_error.clone(), notice.clone(), ctx.clone()));
         let start_hidden = start.hidden && start.settings.tray;
         let saved_text = if start.settings_path.exists() { start.settings.to_ini().to_text() } else { String::new() };
@@ -396,7 +418,7 @@ impl App {
                 self.unseen_error = false;
             }
             Action::SaveLog(text) => self.save_log(&text),
-            Action::ClearNotice => *lock(&self.notice) = None,
+            Action::ClearNotice => self.notice.clear(),
             Action::Confirm(c) => self.modals.open(Modal::Confirm(c)),
             Action::ReadNative(tunnel) => {
                 let (core, infos, loading, error) =
@@ -416,7 +438,7 @@ impl App {
             }
             // Сначала задача запуска без UAC: ярлык ведёт на exe, а тот поднимает себя через неё.
             Action::DesktopShortcut => match crate::shortcut::create_on_desktop(crate::APP_TITLE, &tr("about.text")) {
-                Ok(path) => *lock(&self.notice) = Some(trf("set.shortcut_done", &[&path.display().to_string()])),
+                Ok(path) => self.notice.done(trf("set.shortcut_done", &[&path.display().to_string()])),
                 Err(e) => self.action_error.push(e),
             },
             Action::Language(code) => {
@@ -458,7 +480,7 @@ impl App {
                 let Some(path) = self.s.book.source(&tunnel).map(PathBuf::from) else { return };
                 match win::shell_open(&path) {
                     Ok(()) => {
-                        *lock(&self.notice) = Some(trf("src.watching", &[&path.display().to_string()]));
+                        self.notice.done(trf("src.watching", &[&path.display().to_string()]));
                         self.sources.watch(tunnel, path);
                     }
                     Err(e) => self.action_error.push(trf("err.open_file", &[&path.display().to_string(), &e])),
@@ -519,7 +541,7 @@ impl App {
     /// другой (неверный пароль — снова окно пароля); открытые так ложатся поверх оставшихся.
     fn show_modals(&mut self, ctx: &egui::Context) {
         let mut modals = std::mem::take(&mut self.modals);
-        modals.run(|modal, turn| self.show_modal(ctx, modal, turn));
+        modals.run(ctx, |modal, turn| self.show_modal(ctx, modal, turn));
         let opened = std::mem::replace(&mut self.modals, modals);
         self.modals.absorb(opened);
     }
@@ -596,6 +618,8 @@ impl eframe::App for App {
 
     fn ui(&mut self, root: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = &root.ctx().clone();
+        // До рисования: Enter и Esc при открытом списке или меню — его, а не диалога (`dialog_keys`).
+        dialog::note_popups(ctx);
         let mut actions = Vec::new();
         {
             let shared = self.shared.clone();
@@ -605,7 +629,7 @@ impl eframe::App for App {
             self.apply_deleted();
             let infos = self.sources.infos_snapshot();
             let info_loading = self.sources.loading_snapshot();
-            let notice = lock(&self.notice).clone();
+            let notice = self.notice.current();
             let ping_ref = self.s.view.ping.then_some(&ping);
             let healths: BTreeMap<String, Health> = snap
                 .tunnels
@@ -631,9 +655,9 @@ impl eframe::App for App {
                     service: &service,
                     poll_error: snap.error.as_deref(),
                     unseen_error: self.unseen_error,
-                    notice: notice.as_deref(),
+                    notice: notice.as_ref(),
                 };
-                status_bar(ui, &bar, &mut actions)
+                status_bar(ui, &bar, &mut actions);
             });
             // Простой show, не show_collapsible: с 0.35 тот даёт закрыть панель перетаскиванием края или двойным щелчком,
             // а список туннелей не скрывается вовсе, журнал — только из меню «Вид».
@@ -648,7 +672,7 @@ impl eframe::App for App {
             let resp = egui::Panel::left("tunnels")
                 .resizable(true)
                 .default_size(self.s.left_width)
-                .size_range(260.0..=1200.0)
+                .size_range(LEFT_MIN..=left_panel_max(root.available_width()))
                 .show(root, |ui| {
                     let list = List { snap: &snap, healths: &healths, stats: &stats, keys };
                     tunnel_list(ui, &mut self.s, &mut self.search, &list, &mut actions)
@@ -659,7 +683,7 @@ impl eframe::App for App {
                     let ctx = Detail {
                         name: &name,
                         live: snap.running.get(&name),
-                        health: healths.get(&name).cloned().unwrap_or(Health { level: Level::Off, text: tr("health.off") }),
+                        health: healths.get(&name).cloned().unwrap_or(Health::new(Level::Off, tr("health.off"))),
                         busy: pending.contains_key(&name),
                         ping: &ping,
                         ping_unavailable: agent_down,
@@ -670,7 +694,7 @@ impl eframe::App for App {
                         core_lost: snap.core_lost,
                         snap: &snap,
                     };
-                    details(ui, &ctx, &mut self.s, &mut self.graph, &mut actions)
+                    details(ui, &ctx, &mut self.s, &mut self.graph, &mut actions);
                 }
                 None => {
                     ui.label(tr("empty.no_tunnels"));
@@ -759,7 +783,7 @@ fn switch_transport_error(reply: Result<Response, String>) -> Option<String> {
     match reply {
         Ok(Response::Ok | Response::Err(_)) => None,
         Ok(Response::Refused(e)) => Some(e),
-        Ok(other) => Some(format!("core: unexpected answer {other:?}")),
+        Ok(other) => Some(trf("err.core_unexpected", &[&crate::explain::variant_name(&other)])),
         Err(e) => Some(e),
     }
 }
@@ -807,6 +831,16 @@ mod tests {
         assert_eq!(table_keys(&modals, updates_open, None, false, false), none);
         // Окно «Обновления» открыто — тоже.
         assert_eq!(table_keys(&Modals::default(), true, None, false, false), none);
+    }
+
+    /// Карточке туннеля всегда остаётся не меньше `CARD_MIN`; в широком окне таблица не шире 60 %; в узком — не у́же
+    /// своего минимума, даже если карточке тогда не хватает (меньше 760 главное окно не бывает).
+    #[test]
+    fn left_panel_leaves_room_for_the_card() {
+        assert_eq!(left_panel_max(760.0), 340.0);
+        assert_eq!(left_panel_max(1280.0), 768.0);
+        assert_eq!(left_panel_max(500.0), LEFT_MIN);
+        assert!(left_panel_max(760.0) + CARD_MIN <= 760.0);
     }
 
     #[test]
@@ -869,6 +903,6 @@ mod tests {
         switch_through_core(&core, "office", Plan::Disconnect, false, &error);
         let logged = errors(&shared);
         assert_eq!(logged.len(), 1);
-        assert!(logged[0].1.starts_with("core: unexpected answer"), "{logged:?}");
+        assert_eq!(logged[0].1, trf("err.core_unexpected", &["Text"]), "имя варианта, не дамп ответа");
     }
 }

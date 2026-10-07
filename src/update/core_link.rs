@@ -34,6 +34,8 @@ pub(crate) mod fake {
         pub(crate) calls: Mutex<Vec<String>>,
         pub(crate) native: Vec<String>,
         pub(crate) refuse_hold: bool,
+        /// Ядро «пропало» по ходу проверки (`refuse_hold_now`): дальнейшие `HoldNative` не проходят.
+        pub(crate) hold_refused: AtomicBool,
         pub(crate) refuse_reconnect: AtomicBool,
     }
 
@@ -41,12 +43,16 @@ pub(crate) mod fake {
         pub(crate) fn calls(&self) -> Vec<String> {
             self.calls.lock().unwrap().clone()
         }
+
+        pub(crate) fn refuse_hold_now(&self) {
+            self.hold_refused.store(true, Ordering::SeqCst);
+        }
     }
 
     impl CoreLink for RecordingCore {
         fn hold_native(&self, lease: Duration) -> Result<Vec<String>, String> {
             self.calls.lock().unwrap().push(format!("hold {}", lease.as_secs()));
-            if self.refuse_hold {
+            if self.refuse_hold || self.hold_refused.load(Ordering::SeqCst) {
                 return Err("core: stopped".into());
             }
             Ok(self.native.clone())

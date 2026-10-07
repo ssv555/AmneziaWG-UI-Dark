@@ -267,12 +267,24 @@ pub fn uninstall(product_code: &str, log: &Path) -> Result<(), String> {
     msiexec(&uninstall_args(product_code, log))
 }
 
-/// msiexec по абсолютному пути; 0, 3010 (нужна перезагрузка) и 1641 (перезагрузка начата) — успех.
+/// msiexec по абсолютному пути, ждёт его без срока (для проверок; менеджер ждёт сам — со сроком и продлением
+/// аренды, `component::native`).
 fn msiexec(args: &[String]) -> Result<(), String> {
+    let status = spawn_msiexec(args)?.wait().map_err(|e| format!("msiexec: {e}"))?;
+    exit_result(status.code())
+}
+
+/// Запустить msiexec из System32 с `args`, не дожидаясь конца: конца ждёт вызывающий (`try_wait`), чтобы зависший
+/// установщик не держал работу без срока.
+pub fn spawn_msiexec(args: &[String]) -> Result<std::process::Child, String> {
     use windows_sys::Win32::UI::Shell::FOLDERID_System;
     let exe = crate::win::known_folder(&FOLDERID_System).ok_or("папка System32 не найдена")?.join("msiexec.exe");
-    let status = std::process::Command::new(&exe).args(args).status().map_err(|e| format!("msiexec: {e}"))?;
-    match status.code() {
+    std::process::Command::new(&exe).args(args).spawn().map_err(|e| format!("msiexec: {e}"))
+}
+
+/// Итог msiexec по коду выхода: 0, 3010 (нужна перезагрузка) и 1641 (перезагрузка начата) — успех.
+pub fn exit_result(code: Option<i32>) -> Result<(), String> {
+    match code {
         Some(0 | 3010 | 1641) => Ok(()),
         Some(c) => Err(format!("msiexec завершился с кодом {c}")),
         None => Err("msiexec завершился без кода".into()),
@@ -365,6 +377,16 @@ mod tests {
             uninstall_args("{ABC}", log),
             ["/x", "{ABC}", "/qn", "/norestart", "/l*v", r"C:\t\i.log"]
         );
+    }
+
+    /// Коды «нужна перезагрузка» — успех: установка прошла, перезагрузку менеджер не делает (`/norestart`).
+    #[test]
+    fn exit_codes() {
+        for ok in [0, 3010, 1641] {
+            assert_eq!(exit_result(Some(ok)), Ok(()), "{ok}");
+        }
+        assert!(exit_result(Some(1603)).unwrap_err().contains("1603"));
+        assert!(exit_result(None).is_err());
     }
 
     /// Сигнатуры API для менеджера обновлений; install и uninstall здесь не вызываются.

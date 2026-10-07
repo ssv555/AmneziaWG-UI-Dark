@@ -16,6 +16,9 @@ const FORWARD_EVERY: Duration = Duration::from_secs(1);
 
 /// Менеджер обновлений агента и поток, переносящий его записи в журнал агента.
 pub(super) fn start(journal: Arc<AgentJournal>) -> Arc<Manager> {
+    // Замена файлов, оборванная гибелью прошлого агента при живом ядре: доводится до первой работы менеджера (ядро
+    // доводит только при своём старте).
+    crate::update::ours::recover_swaps(&mut |severity, text| journal.log(severity, text));
     let options = Options { ping: false, ping_host: String::new(), notify: false, tray: false, taskbar: false };
     let shared = Arc::new(Shared::new(None, options, None));
     let log = shared.clone();

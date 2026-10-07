@@ -53,13 +53,24 @@ unsafe extern "system" fn service_main(_argc: u32, _argv: *mut *mut u16) {
     }
     HANDLE.store(handle, Ordering::SeqCst);
     report(SERVICE_START_PENDING, 0);
+    // Замена файлов (exe, DLL движка), оборванная пропаданием питания или снятым агентом, доводится до согласного
+    // набора раньше всего остального: до туннелей, которым нужен движок, до агента и до уборки `.old-` в `ready`.
+    // План не прочитался — уборки в этот старт нет: его `.old-` могут быть единственной целой копией.
+    let cleanup = super::install::recover_swaps_at_start();
     let started = Cell::new(false);
     let result = super::server::run(&STOP, || {
         started.set(true);
         report(SERVICE_RUNNING, 0);
         // Новое ядро отвечает — отодвинутые обновлением файлы (exe, DLL) прошлой версии больше не нужны. Удаляются
         // только теперь: если новая версия не поднимется, прежняя остаётся рядом. Занятые ещё кем-то — до следующего раза.
-        super::install::remove_old_copies(&crate::engine::install_dir());
+        // Незавершённая замена уже доведена при старте (`recover_swaps_at_start`), её файлы уборка не трогает.
+        if cleanup {
+            super::install::remove_old_copies(&crate::engine::install_dir());
+        }
+        // Действия при сбое службы заново: помощник `--restart-core` снимает их на время перезапуска и мог не вернуть.
+        if let Err(e) = super::install::reapply_failure_actions() {
+            super::log_notice(super::events_file(), crate::events::Severity::Warn, &crate::i18n::trf("core.failure_actions_failed", &[&e]));
+        }
     }, |tail| {
         // События последних мгновений ядра, которых агент не успел забрать (он гибнет вместе со службой), — прямо в
         // файл, как и причина сбоя ниже: служба уже не работает, живых путей здесь нет.

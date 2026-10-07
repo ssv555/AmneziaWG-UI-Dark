@@ -1,13 +1,12 @@
 //! Диалог имени группы: новая группа или переименование.
 
-use eframe::egui::{self, RichText};
+use eframe::egui;
 
 use crate::groups;
 use crate::i18n::{tr, trf};
 
-use super::dialog::{dialog_buttons, dialog_window};
+use super::dialog::{dialog_body, dialog_buttons, error_line};
 use super::modals::{Outcome, Turn};
-use super::theme::palette;
 use super::App;
 
 pub(super) enum Dialog {
@@ -18,7 +17,7 @@ pub(super) enum Dialog {
 }
 
 impl App {
-    pub(super) fn show_group_dialog(&mut self, ctx: &egui::Context, dialog: &mut Dialog, turn: Turn) -> Outcome {
+    pub(super) fn show_group_dialog(&mut self, ctx: &egui::Context, dialog: &mut Dialog, mut turn: Turn) -> Outcome {
         let (title, text, parent, except) = match dialog {
             Dialog::NewGroup { parent, name, .. } => {
                 let title = match parent {
@@ -34,23 +33,23 @@ impl App {
         let focus = turn.fresh;
         let (mut ok, mut cancel, mut valid) = (false, false, false);
         let mut open = true;
-        dialog_window(ctx, title, "group-dialog", &mut open)
+        turn.window(ctx, title, "group-dialog", &mut open)
             .show(ctx, |ui| {
-                ui.set_width(340.0);
-                ui.label(tr("dlg.name"));
-                let mut out = egui::TextEdit::singleline(text).desired_width(f32::INFINITY).show(ui);
-                if focus {
-                    out.response.request_focus();
-                    let end = egui::text::CCursor::new(text.chars().count());
-                    out.state.cursor.set_char_range(Some(egui::text::CCursorRange::two(egui::text::CCursor::new(0), end)));
-                    out.state.store(ui.ctx(), out.response.id);
-                }
-                let check = book.check_name(parent.as_deref(), text, except.as_deref());
-                valid = check.is_ok();
-                // Пустое имя — не ошибка, пока пользователь ещё ничего не ввёл.
-                let error = check.err().filter(|e| *e != groups::NameError::Empty).map(name_error).unwrap_or_default();
-                // Строка ошибки занимает место всегда — окно не прыгает при наборе.
-                ui.add_sized([ui.available_width(), 18.0], egui::Label::new(RichText::new(error).color(palette().error).small()).truncate());
+                dialog_body(ui, 340.0, |ui| {
+                    ui.label(tr("dlg.name"));
+                    let mut out = egui::TextEdit::singleline(text).desired_width(f32::INFINITY).show(ui);
+                    if focus {
+                        out.response.request_focus();
+                        let end = egui::text::CCursor::new(text.chars().count());
+                        out.state.cursor.set_char_range(Some(egui::text::CCursorRange::two(egui::text::CCursor::new(0), end)));
+                        out.state.store(ui.ctx(), out.response.id);
+                    }
+                    let check = book.check_name(parent.as_deref(), text, except.as_deref());
+                    valid = check.is_ok();
+                    // Пустое имя — не ошибка, пока пользователь ещё ничего не ввёл.
+                    let error = check.err().filter(|e| *e != groups::NameError::Empty).map(name_error).unwrap_or_default();
+                    error_line(ui, &error);
+                });
                 ui.add_space(4.0);
                 (ok, cancel) = dialog_buttons(ui, &tr("btn.ok"), valid, Some(&tr("btn.cancel")));
             });

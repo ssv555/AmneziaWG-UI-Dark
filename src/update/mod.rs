@@ -28,9 +28,10 @@ mod clock;
 mod history;
 /// Цель кнопки «Вернуть» строки истории: одно правило для окна (через состояние) и для ядра.
 mod restore_target;
-pub use restore_target::{RestoreBlock, RestoreOffer};
+pub use restore_target::{RestoreBlock, RestoreOffer, MIN_APP_RESTORE};
 /// Файловые помощники хранилища: JSON, перенос файла, ротация журналов, имена копий.
 mod jsonstore;
+pub(crate) mod journal;
 /// Источники релизов и файлов за интерфейсом (настоящие — GitHub; в тестах — подделка).
 mod sources;
 /// Модель окна: строки компонентов, версии без пояснений, о чём сообщать.

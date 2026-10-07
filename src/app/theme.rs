@@ -35,6 +35,10 @@ pub(super) struct Palette {
     pub(super) code_bg: Color32,
     pub(super) control: Color32,
     pub(super) control_hover: Color32,
+    /// Кромка кнопок, флажков, переключателей, списков и полей (1 px), контраст с `window` и `panel` не меньше 3
+    /// (WCAG 1.4.11): без неё на светлом фоне заливка `control` сливается с окном и видны одни надписи. `None` —
+    /// как у egui (Графит: прежний вид, его контролы отличает заливка). Тест `controls_have_visible_boundaries`.
+    pub(super) control_edge: Option<Color32>,
     /// Разделители, рамки окон. Контраст не проверяется: границы намеренно тихие.
     pub(super) border: Color32,
     /// Обычный текст (надписи). В Графите тусклее текста кнопок — так у egui.
@@ -47,8 +51,10 @@ pub(super) struct Palette {
     /// Слабый текст (подписи, даты, линии графика). Всегда свой цвет: производный egui (`label` на 60 %) давал ≈2.7.
     pub(super) text_weak: Color32,
     pub(super) link: Color32,
-    /// Цель перетаскивания, передача в подробностях.
+    /// Цель перетаскивания, передача в подробностях, заливка главной кнопки диалога.
     pub(super) accent: Color32,
+    /// Текст на заливке `accent`: главная кнопка диалога (кнопка по умолчанию) залита акцентом.
+    pub(super) on_accent: Color32,
     pub(super) selection_fill: Color32,
     pub(super) selection_text: Color32,
     /// Полоса цвета `accent` у выбранной строки: светлая заливка выбора одна почти не видна.
@@ -85,6 +91,7 @@ pub(super) const GRAPHITE: Palette = Palette {
     code_bg: hex(0x404040),
     control: hex(0x3C3C3C),
     control_hover: hex(0x464646),
+    control_edge: None,
     border: hex(0x3C3C3C),
     label: hex(0x8C8C8C),
     text: hex(0xB4B4B4),
@@ -94,6 +101,7 @@ pub(super) const GRAPHITE: Palette = Palette {
     text_weak: hex(0x838383),
     link: hex(0x5AAAFF),
     accent: hex(0x5AA0F0),
+    on_accent: hex(0x000000),
     selection_fill: hex(0x005C80),
     selection_text: hex(0xC0DEFF),
     selection_bar: false,
@@ -121,6 +129,8 @@ pub(super) const SLATE: Palette = Palette {
     code_bg: hex(0x3B4252),
     control: hex(0x3B4252),
     control_hover: hex(0x434C5E),
+    // Заливка 3B4252 на 2A303B — 1.3: поля и кнопки читались плоскими; кромка даёт 3.7 на окне и 4.0 на панели.
+    control_edge: Some(hex(0x7E8797)),
     border: hex(0x434C5E),
     label: hex(0xD8DEE9),
     text: hex(0xD8DEE9),
@@ -129,6 +139,7 @@ pub(super) const SLATE: Palette = Palette {
     text_weak: hex(0x98A2B3),
     link: hex(0x88C0D0),
     accent: hex(0x88C0D0),
+    on_accent: hex(0x2E3440),
     selection_fill: hex(0x3B4A63),
     selection_text: hex(0xECEFF4),
     selection_bar: false,
@@ -155,7 +166,10 @@ pub(super) const DAYLIGHT: Palette = Palette {
     faint: hex(0xEBEBEB),
     code_bg: hex(0xE6E6E6),
     control: hex(0xFBFBFB),
-    control_hover: hex(0xF0F0F0),
+    // Было F0F0F0: на панели F3F3F3 наведение (1.03) не было видно.
+    control_hover: hex(0xE5E5E5),
+    // FBFBFB на F9F9F9 — 1.01: без кромки кнопка выглядела надписью, флажок — одной подписью. 858585: 3.5 / 3.3.
+    control_edge: Some(hex(0x858585)),
     border: hex(0xD1D1D1),
     label: hex(0x1B1B1B),
     text: hex(0x1B1B1B),
@@ -164,6 +178,7 @@ pub(super) const DAYLIGHT: Palette = Palette {
     text_weak: hex(0x5C5C5C),
     link: hex(0x005FB8),
     accent: hex(0x005FB8),
+    on_accent: hex(0xFFFFFF),
     selection_fill: hex(0xCCE4F7),
     selection_text: hex(0x0A2E50),
     selection_bar: true,
@@ -222,6 +237,9 @@ impl Palette {
         w.hovered.weak_bg_fill = self.control_hover;
         w.hovered.fg_stroke.color = self.text_hover;
         w.active.fg_stroke.color = self.text_strong;
+        if let Some(edge) = self.control_edge {
+            w.inactive.bg_stroke = egui::Stroke::new(1.0, edge);
+        }
         let edge = if engine { self.mode2_frame } else { self.border };
         w.noninteractive.bg_stroke.color = edge;
         v.window_stroke.color = edge;
@@ -394,11 +412,27 @@ mod tests {
             check(name, "text", p.text, "control", p.control, 4.5);
             check(name, "text_hover", p.text_hover, "control_hover", p.control_hover, 4.5);
             check(name, "selection_text", p.selection_text, "selection_fill", p.selection_fill, 4.5);
+            check(name, "on_accent", p.on_accent, "accent", p.accent, 4.5);
         }
         // Слабый текст при всей своей читаемости остаётся второстепенным: тусклее обычного.
         for (name, p) in PALETTES {
             if contrast(p.text_weak, p.panel) >= contrast(p.label, p.panel) {
                 failures.push(format!("{name}: text_weak is not weaker than label"));
+            }
+        }
+        assert!(failures.is_empty(), "{failures:#?}");
+    }
+
+    /// Имя туннеля с ошибкой — цветом `error` (`list::rows::name_color`), кроме выбранной строки: там оно обычное.
+    #[test]
+    fn error_tunnel_name_reads_on_unselected_rows() {
+        let mut failures = Vec::new();
+        for (name, p) in PALETTES {
+            for (bg_name, bg) in [("panel", p.panel), ("window", p.window)] {
+                let c = contrast(p.error, bg);
+                if c < 4.5 {
+                    failures.push(format!("{name}: error on {bg_name} = {c:.2} < 4.5"));
+                }
             }
         }
         assert!(failures.is_empty(), "{failures:#?}");
@@ -493,6 +527,34 @@ mod tests {
         mode2.widgets.noninteractive.bg_stroke.color = neon;
         mode2.window_stroke.color = neon;
         assert_eq!(GRAPHITE.visuals(true), mode2);
+    }
+
+    /// Кромка контрола отличима от фона окна и панели на 3 (WCAG 1.4.11, нетекстовый контраст) и ложится в
+    /// `inactive.bg_stroke`. Графит — исключение владельца: прежний вид egui без кромки (`graphite_is_todays_look`).
+    #[test]
+    fn controls_have_visible_boundaries() {
+        let mut failures = Vec::new();
+        for (name, p) in PALETTES {
+            let v = p.visuals(false);
+            match p.control_edge {
+                None => {
+                    assert_eq!(name, "graphite", "{name}: only Graphite keeps egui's own edge-less controls");
+                    assert_eq!(v.widgets.inactive.bg_stroke, egui::Visuals::dark().widgets.inactive.bg_stroke);
+                }
+                Some(edge) => {
+                    assert_eq!(v.widgets.inactive.bg_stroke, egui::Stroke::new(1.0, edge), "{name}");
+                    for (bg_name, bg) in [("window", p.window), ("panel", p.panel)] {
+                        let c = contrast(edge, bg);
+                        if c < 3.0 {
+                            failures.push(format!("{name}: control_edge on {bg_name} = {c:.2} < 3"));
+                        }
+                    }
+                }
+            }
+        }
+        // Старый День ловился бы: заливка контрола без кромки на окне — 1.01.
+        assert!(contrast(DAYLIGHT.control, DAYLIGHT.window) < 1.1);
+        assert!(failures.is_empty(), "{failures:#?}");
     }
 
     #[test]

@@ -10,7 +10,7 @@ use crate::i18n::{tr, trf};
 use crate::settings::Mode;
 use crate::win;
 
-use super::dialog::{dialog_buttons, dialog_choice, dialog_window, window_escape};
+use super::dialog::{dialog_body, dialog_buttons, dialog_choice, dialog_window, window_escape};
 use super::modals::{Modal, Modals, Outcome, Turn};
 use super::theme::palette;
 use super::watcher::Infos;
@@ -45,11 +45,26 @@ pub(super) struct Editor {
     issues: Vec<Issue>,
     /// Запись с ошибками подтверждена в диалоге: выполнить её в следующем кадре редактора, затем это действие.
     confirmed: Option<AfterSave>,
+    /// Ошибки из `note`, ещё не отданные журналу событий: строка под кнопками пропадёт с редактором, журнал — нет.
+    to_log: Vec<String>,
 }
 
 impl Editor {
     pub(super) fn new(path: PathBuf, text: String, tunnel: Option<String>) -> Self {
-        Editor { path, saved: text.clone(), issues: conf::check(&text), text, note: None, tunnel, confirmed: None }
+        Editor { path, saved: text.clone(), issues: conf::check(&text), text, note: None, tunnel, confirmed: None, to_log: Vec::new() }
+    }
+
+    /// Сообщение под кнопками. Ошибка ещё и уходит в журнал событий (`take_errors`), как любая ошибка действия.
+    fn tell(&mut self, (text, is_error): (String, bool)) {
+        if is_error {
+            self.to_log.push(text.clone());
+        }
+        self.note = Some((text, is_error));
+    }
+
+    /// Ошибки для журнала событий, каждая один раз.
+    fn take_errors(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.to_log)
     }
 
     fn dirty(&self) -> bool {
@@ -84,17 +99,18 @@ impl Editor {
         match written {
             Ok(()) => {
                 self.saved = self.text.clone();
-                self.note = Some(match &self.tunnel {
+                let note = match &self.tunnel {
                     Some(t) => {
                         lock(&infos).remove(t);
                         (trf("eng.saved", &[t]), false)
                     }
                     None => (trf("ed.saved", &[&self.path.display().to_string()]), false),
-                });
+                };
+                self.tell(note);
                 true
             }
             Err(e) => {
-                self.note = Some((e, true));
+                self.tell((e, true));
                 false
             }
         }
@@ -167,10 +183,11 @@ impl App {
             match (win::pick_conf(true, Some(&ed.path)), &ed.tunnel) {
                 // Туннель хранилища: «Сохранить как» — копия в обычный файл, правка остаётся в хранилище.
                 (Some(path), Some(_)) => {
-                    ed.note = Some(match std::fs::write(&path, &ed.text) {
+                    let note = match std::fs::write(&path, &ed.text) {
                         Ok(()) => (trf("ed.saved", &[&path.display().to_string()]), false),
                         Err(e) => (crate::fsutil::io_ctx(&path, e), true),
-                    });
+                    };
+                    ed.tell(note);
                 }
                 (Some(path), None) => {
                     ed.path = path;
@@ -196,13 +213,17 @@ impl App {
             }
         }
         if import && engine {
-            ed.note = Some(import_into_store(core.as_ref(), &ed.path));
+            let note = import_into_store(core.as_ref(), &ed.path);
+            ed.tell(note);
             import = false;
+        }
+        for e in ed.take_errors() {
+            error.push(e);
         }
         if import {
             let path = ed.path.display().to_string();
             ctx.copy_text(path.clone());
-            ed.note = Some((trf("ed.import_hint", &[&path]), false));
+            ed.tell((trf("ed.import_hint", &[&path]), false));
             let file = ed.path.clone();
             std::thread::spawn(move || {
                 if let Err(e) = core.import_in_native(Some(&file)) {
@@ -222,14 +243,15 @@ impl App {
     }
 
     /// Редактор закрывают с несохранёнными изменениями: сохранить и закрыть, закрыть без сохранения или остаться.
-    pub(super) fn show_editor_unsaved(&mut self, ctx: &egui::Context, turn: Turn) -> Outcome {
+    pub(super) fn show_editor_unsaved(&mut self, ctx: &egui::Context, mut turn: Turn) -> Outcome {
         // Сохранили (Ctrl+S) или закрыли, пока висел вопрос, — спрашивать не о чем.
         let Some(file) = self.editor.as_ref().filter(|ed| ed.dirty()).map(Editor::file_name) else { return Outcome::Close };
         let (mut save, mut discard, mut cancel) = (false, false, false);
         let mut open = true;
-        dialog_window(ctx, tr("ed.unsaved_title"), "editor-unsaved", &mut open).show(ctx, |ui| {
-            ui.set_width(440.0);
-            ui.add(egui::Label::new(trf("ed.unsaved_text", &[&file])).wrap());
+        turn.window(ctx, tr("ed.unsaved_title"), "editor-unsaved", &mut open).show(ctx, |ui| {
+            dialog_body(ui, 440.0, |ui| {
+                ui.add(egui::Label::new(trf("ed.unsaved_text", &[&file])).wrap());
+            });
             ui.add_space(10.0);
             (save, discard, cancel) = dialog_choice(ui, &tr("ed.save"), &tr("ed.discard"), &tr("btn.cancel"));
         });
@@ -255,15 +277,16 @@ impl App {
     }
 
     /// Запись конфига с ошибками: движок его не примет. Записать всё равно (и затем `after`) или вернуться к правке.
-    pub(super) fn show_editor_invalid(&mut self, ctx: &egui::Context, after: AfterSave, turn: Turn) -> Outcome {
+    pub(super) fn show_editor_invalid(&mut self, ctx: &egui::Context, after: AfterSave, mut turn: Turn) -> Outcome {
         let Some(ed) = self.editor.as_mut() else { return Outcome::Close };
         // Ошибки исправили, пока висел вопрос, — спрашивать не о чем; Ctrl+S сохранит без вопроса.
         let Some(first) = ed.issues.first().map(issue_text) else { return Outcome::Close };
         let (mut yes, mut no) = (false, false);
         let mut open = true;
-        dialog_window(ctx, tr("chk.title"), "editor-invalid", &mut open).show(ctx, |ui| {
-            ui.set_width(480.0);
-            ui.add(egui::Label::new(trf("chk.confirm", &[&ed.issues.len().to_string(), &first])).wrap());
+        turn.window(ctx, tr("chk.title"), "editor-invalid", &mut open).show(ctx, |ui| {
+            dialog_body(ui, 480.0, |ui| {
+                ui.add(egui::Label::new(trf("chk.confirm", &[&ed.issues.len().to_string(), &first])).wrap());
+            });
             ui.add_space(10.0);
             (yes, no) = dialog_buttons(ui, &tr("chk.save_anyway"), true, Some(&tr("btn.cancel")));
         });
@@ -321,6 +344,7 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&path).unwrap(), ed.text);
         assert_eq!(ed.note, Some((trf("ed.saved", &[&path.display().to_string()]), false)));
         assert!(core.requests().is_empty());
+        assert!(ed.take_errors().is_empty(), "успех — не ошибка");
         std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 
@@ -333,6 +357,9 @@ mod tests {
         assert!(!ed.save(&core, &Infos::default()));
         assert!(ed.dirty());
         assert_eq!(ed.note, Some(("core unavailable".to_string(), true)));
+        // Строка под кнопками пропадёт с редактором — ошибка уходит и в журнал событий, один раз.
+        assert_eq!(ed.take_errors(), ["core unavailable"]);
+        assert!(ed.take_errors().is_empty());
     }
 
     #[test]

@@ -54,6 +54,7 @@ Top-level files, by layer. Layers are explained in [modules](modules.md).
 | `ini.rs` | Minimal INI reader and writer |
 | `fmt.rs` | Number and time formatting |
 | `fsutil.rs` | Atomic write, error text with a path, name checks, bounded waiting |
+| `explain.rs` | Errors for people: known Windows, WinHTTP and HTTP failures as a sentence in the program language (`short`), the raw text in parentheses for the event log (`log_line`), enum variant name instead of a `{:?}` dump |
 | `crash.rs` | Panic hook, isolated execution, lock recovery, non-fatal thread loops |
 | `tray.rs`, `taskbar.rs`, `icon.rs`, `shortcut.rs` | Tray icon and notifications, taskbar button and overlay badge, program icon, desktop shortcut |
 
@@ -63,7 +64,7 @@ Top-level files, by layer. Layers are explained in [modules](modules.md).
 |---|---|
 | `window.rs` | Window state: size and position, closing, settings saving, scaling, `--snapshot` |
 | `list.rs`, `list/rows.rs` | Tunnel table: columns, keyboard, group and tunnel rows, menus, drag and drop; the primary action of a tunnel (`Primary`: button, menus, tray, double click and `Enter` only connect) and the disconnect confirmation rule (`asks_first`) |
-| `details.rs`, `graph.rs`, `status.rs` | Selected tunnel details (right click on a value: Copy; private and preshared keys are never shown or copied), speed graph with ping strip (speed scale on the right; pause button: a frozen snapshot of the graph and the ping strip for the window session, `GraphPause`, dropped when another tunnel or a range with another source is shown; range drop-down: 2 min, 10 min and 1 h from the window's samples, Day, Month and Year from the agent's history), status bar |
+| `details.rs`, `graph.rs`, `status.rs` | Selected tunnel details (right click on a value: Copy; private and preshared keys are never shown or copied), speed graph with ping strip (speed scale on the right; pause button: a frozen snapshot of the graph and the ping strip for the window session, `GraphPause`, dropped when another tunnel or a range with another source is shown; range drop-down: 2 min, 10 min and 1 h from the window's samples, Day, Month and Year from the agent's history), status bar (only a link to the event log for errors) |
 | `history_feed.rs`, `history_graph.rs` | Speed history for the graph's Day, Month and Year ranges: `HistoryFeed` asks the agent (`AgentApi::history`) in a background thread at once on a tunnel or range change, then once a minute while shown; the frame only reads the last answer. `history_graph` draws averages as lines and peaks as thin lines, a gap where an interval is missing, a time axis in local hours (Day), local dates (Month) or UTC months (Year), a tooltip with the interval time, averages, peaks and connected time; "Loading history…", "No history yet" or "History unavailable" (reason in the tooltip) instead of the curves |
 | `event_log.rs` | Event log panel: severity and tunnel filter, search, copy, "Save as…"; the filter is a pure function (`visible`) |
 | `menu.rs`, `theme.rs` | Menu bar with its keyboard (`MenuNav`: F10, lone Alt, Alt+letter mnemonics, arrows and submenus, command shortcuts; window filter for `SC_KEYMENU`), the one context-menu helper (right click, Shift+F10, Menu key); theme palettes (`Palette` by role: Graphite, Slate, Daylight; the active one from `palette()`, `resolve` turns "follow Windows" into Daylight or Graphite, `Palette::visuals` builds the egui look) and fonts |
@@ -76,7 +77,7 @@ Top-level files, by layer. Layers are explained in [modules](modules.md).
 | `updates.rs`, `reminder.rs`, `markdown.rs` | "Updates and rollbacks" window, update reminder timing, release notes rendering |
 | `native_reopen.rs` | Reopens the AmneziaWG window an AmneziaWG update or restore closed, by the agent's `native_ui` mark |
 | `sources.rs`, `watcher.rs` | Source `.conf` files opened for editing and the config details cache |
-| `exit.rs`, `errors.rs` | Exit with the "keep the VPN" question, action errors into the event log |
+| `exit.rs`, `errors.rs`, `notice.rs` | Exit with the "keep the VPN" question, action errors into the event log, status bar notice (progress, done, warning; done and warning also go to the event log) |
 | `tray_menu.rs` | Tray menu with the tunnels (groups as submenus) and its click: the same switch request and the same primary action (`list::Primary`) as the window; a disconnect is confirmed in the window first (`list::asks_first`); without the core a note on top, tunnels unchecked and grey; a click on a tunnel notification selects the tunnel |
 | `demo_core.rs` | Fake core for `--demo` |
 
@@ -113,7 +114,8 @@ Top-level files, by layer. Layers are explained in [modules](modules.md).
 | `manager.rs` | Manager: checks, backup before each update and rollback, install, history, daily check |
 | `component.rs`, `component/native.rs` | Per-component strategy: original AmneziaWG (MSI), engine, app; MSI under a tunnel hold |
 | `native.rs` | Original AmneziaWG: installed version, installer signature check, install and removal |
-| `ours.rs`, `ours/` | Our releases: download, verification, file-set transaction, engine and app backups, `--restart-core` and rollback of the set |
+| `ours.rs`, `ours/` | Our releases: download, verification, file-set transaction (`ours/fileset.rs`) with its on-disk plan and replay after a crash (`ours/swap.rs`), engine and app backups, `--restart-core` and rollback of the set |
+| `journal.rs` | Durable step journal: a plan written atomically before the first step and removed after the last; shared by multi-step actions that a crash must not leave half-done |
 | `sources.rs`, `feed.rs`, `net.rs` | Update sources, GitHub releases, HTTPS download over WinHTTP |
 | `sign.rs` | Signed release manifest (Ed25519, SSHSIG) and SHA-256 |
 | `history.rs`, `backup.rs`, `jsonstore.rs`, `restore_target.rs` | History model, backup folders, JSON files with atomic write, what a "Restore" button restores |

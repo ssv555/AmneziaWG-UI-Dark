@@ -42,6 +42,13 @@ pub struct Core {
     /// `None` — только в памяти: тесты изоляции ядра (`tests::isolation_*`). Запись `core.ini` надёжная (сброс на диск
     /// дважды) и под нагрузкой на диск занимает больше секунды; их срок «Switch быстрее секунды» мерит ядро, а не диск.
     config_file: Option<std::path::PathBuf>,
+    /// Запись `config_file`: писатели по очереди, снимок настроек берётся уже под ней — на диске всегда последний.
+    /// Берётся до `config`, не наоборот; `config` под ней держится лишь на снимок, не на запись: `State` окна и агента
+    /// читает режим под `config` каждую секунду и не должен ждать диск.
+    saving: Mutex<Saving>,
+    /// Тесты: что сделать перед записью `config_file` (задержать её, чтобы проверить, что `config` на это время свободен).
+    #[cfg(test)]
+    save_hook: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
     /// Смена режима, переключения туннелей и запросы, зависящие от режима, не пересекаются.
     switching: Mutex<()>,
     /// Занятые места соединений; место держит `budget::Slot`.
@@ -73,6 +80,25 @@ enum Origin {
 
 /// Сколько ждём после старта, пока канал ядра ответит на собственный запрос; не ответил — ядро не поднялось.
 const READY_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Пауза до повторной записи `core.ini` после сбоя: первая, дальше удваивается до наибольшей.
+const SAVE_RETRY_MIN: Duration = Duration::from_secs(1);
+const SAVE_RETRY_MAX: Duration = Duration::from_secs(60);
+
+/// Запись настроек ядра на диск. Не записались (антивирус или резервное копирование держат `core.ini`) — в памяти
+/// они всё равно новые, а запись повторяется на тактах надзора с паузой от `SAVE_RETRY_MIN` до `SAVE_RETRY_MAX`, пока
+/// не пройдёт: иначе после перезагрузки поднялся бы прежний набор туннелей (отключённый пользователем — снова). В
+/// журнале — одно предупреждение о сбое и одна строка, когда записалось.
+#[derive(Default)]
+struct Saving {
+    retry: Option<SaveRetry>,
+}
+
+struct SaveRetry {
+    next_at: Instant,
+    pause: Duration,
+    failures: u32,
+}
 
 /// Почему ядро не поднялось или остановилось с ошибкой.
 #[derive(Debug, PartialEq)]
@@ -123,6 +149,9 @@ pub fn run(stop: &AtomicBool, ready: impl FnOnce(), persist_tail: impl FnOnce(Ve
         shared,
         config: Mutex::new(config),
         config_file: Some(Config::path()),
+        saving: Mutex::default(),
+        #[cfg(test)]
+        save_hook: Mutex::new(None),
         switching: Mutex::new(()),
         connections: Budgets::new(CORE_LIMITS),
         details: Mutex::default(),
@@ -588,32 +617,90 @@ impl Core {
         mark("switch: engine calls begin");
         let result = run_switch(b.as_ref(), name, plan, &others);
         mark("switch: engine calls done");
-        if let (Origin::User, Err(e)) = (origin, &result) {
-            self.shared.log(name, Severity::Bad, e);
+        if let Err(e) = &result {
+            if origin == Origin::User {
+                self.shared.log(name, Severity::Bad, e);
+            }
+            // Желаемый туннель не поднялся по нашей команде (пользователя или сторожа мёртвых) — дальше его поднимает
+            // надзор по расписанию. Попытка надзора ведёт свою запись сама (`outcome`); отключение желаемым не оставляет.
+            // Сорвалось ещё на отключении и туннель работает по-прежнему — надзору нечего поднимать: он счёл бы
+            // работающий «подключённым» (строка в журнале при мёртвом туннеле) и на время подтверждения снял бы с
+            // него сторожа мёртвых; работающим занимается сторож.
+            if origin != Origin::Retry && plan != Plan::Disconnect && !still_running(b.as_ref(), name) {
+                lock(&self.retries).supervise_failed(name, Instant::now(), e.clone());
+            }
         }
         result.map(|()| true)
     }
 
     /// Изменить желаемый набор туннелей и сохранить его. Не записался — набор в памяти всё равно новый (до перезапуска
-    /// ядра он верен), а в журнале предупреждение: после перезагрузки поднимется прежний набор.
+    /// ядра он верен), запись повторит такт надзора (`retry_save`), а в журнале предупреждение.
     fn update_desired(&self, tunnel: &str, change: impl FnOnce(&mut Config)) {
-        mark("desired: waiting for the config lock");
-        let mut config = lock(&self.config);
-        mark("desired: config lock held");
-        let mut next = config.clone();
-        change(&mut next);
-        if next == *config {
+        mark("desired: waiting for the saving lock");
+        let mut saving = lock(&self.saving);
+        let snapshot = {
+            mark("desired: waiting for the config lock");
+            let mut config = lock(&self.config);
+            mark("desired: config lock held");
+            let mut next = config.clone();
+            change(&mut next);
+            if next == *config {
+                return;
+            }
+            *config = next.clone();
+            next
+        };
+        // Исход — в `saving` и в журнале (`write_config`): набор в памяти уже новый, добавить нечего.
+        drop(self.write_config(&mut saving, &snapshot, Instant::now(), tunnel));
+    }
+
+    /// Записать снимок настроек в `config_file` (под `saving`, которую держит вызывающий). Сбой: предупреждение в
+    /// журнал (при первом подряд) и повтор по расписанию `Saving`; успех после сбоев: строка о нём.
+    fn write_config(&self, saving: &mut Saving, snapshot: &Config, now: Instant, tunnel: &str) -> Result<(), String> {
+        let Some(path) = self.config_file.as_deref() else { return Ok(()) };
+        #[cfg(test)]
+        self.run_save_hook();
+        let _write = super::phase_trace::Span::new("desired: config write and flush begin", "desired: config write and flush done");
+        match snapshot.save_to(path) {
+            Ok(()) => {
+                if let Some(retry) = saving.retry.take() {
+                    self.shared.log(tunnel, Severity::Info, &trf("core.desired_saved", &[&retry.failures.to_string()]));
+                }
+                Ok(())
+            }
+            Err(e) => {
+                match &mut saving.retry {
+                    Some(retry) => {
+                        retry.failures += 1;
+                        retry.pause = (retry.pause * 2).min(SAVE_RETRY_MAX);
+                        retry.next_at = now + retry.pause;
+                    }
+                    None => {
+                        self.shared.log(tunnel, Severity::Warn, &trf("core.desired_unsaved", &[&e]));
+                        saving.retry = Some(SaveRetry { next_at: now + SAVE_RETRY_MIN, pause: SAVE_RETRY_MIN, failures: 1 });
+                    }
+                }
+                Err(e)
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn run_save_hook(&self) {
+        if let Some(hook) = lock(&self.save_hook).as_ref() {
+            hook();
+        }
+    }
+
+    /// Такт надзора: срок повторной записи настал — записать текущие настройки (они новее любого сбойного снимка).
+    fn retry_save(&self, now: Instant) {
+        let mut saving = lock(&self.saving);
+        if !saving.retry.as_ref().is_some_and(|retry| retry.next_at <= now) {
             return;
         }
-        let saved = self.config_file.as_deref().map_or(Ok(()), |path| {
-            let _write = super::phase_trace::Span::new("desired: config write and flush begin", "desired: config write and flush done");
-            next.save_to(path)
-        });
-        *config = next;
-        drop(config);
-        if let Err(e) = saved {
-            self.shared.log(tunnel, Severity::Warn, &trf("core.desired_unsaved", &[&e]));
-        }
+        let snapshot = lock(&self.config).clone();
+        // Исход — в `saving` и в журнале (`write_config`).
+        drop(self.write_config(&mut saving, &snapshot, now, ""));
     }
 
     /// Вывести туннель из желаемого набора по решению надзора.
@@ -671,6 +758,7 @@ impl Core {
                 config_exists: &|t| host.configs().map_or(true, |c| c.iter().any(|n| n == t)),
                 stop_reason: &|t| host.stop_reason(t),
                 native_services: host.native_services(),
+                installer_running: &|| host.installer_running(),
                 network_changed,
             },
         );
@@ -689,8 +777,15 @@ impl Core {
         for t in &tick.expired {
             self.shared.log(t, Severity::Warn, &trf("core.hold_expired", &[t]));
         }
+        for t in &tick.installer_held {
+            self.shared.log(t, Severity::Info, &trf("core.installer_hold", &[t]));
+        }
+        for t in &tick.installer_done {
+            self.shared.log(t, Severity::Info, &trf("core.installer_done", &[t]));
+        }
         self.attempt(&tick.due, multiple);
         self.watch_dead(now, &desired, multiple);
+        self.retry_save(now);
         self.shared.set_retries(lock(&self.retries).view(Instant::now()));
     }
 
@@ -889,12 +984,16 @@ impl Core {
             running.iter().try_for_each(|t| old.disconnect(t))
         };
         disconnected?;
+        let mut saving = lock(&self.saving);
         let mut config = lock(&self.config).clone();
         config.mode = mode;
         // Туннели прежнего режима отключены по команде — восстанавливать после перезапуска нечего.
         config.tunnels = Some(Vec::new());
-        config.save()?;
+        // Сначала на диск, потом в память: режим без записи не меняется. В той же очереди писателей, что и набор:
+        // повтор сбойной записи набора берёт снимок уже с новым режимом и не вернёт прежний.
+        self.write_config(&mut saving, &config, Instant::now(), "")?;
         *lock(&self.config) = config;
+        drop(saving);
         lock(&self.retries).clear();
         self.shared.set_host(host_for(mode));
         self.shared.reset_snapshot();
@@ -931,12 +1030,16 @@ impl Core {
             return Err(format!("language: {code}"));
         }
         crate::i18n::set(&super::lang_dir(), &code);
-        let mut config = lock(&self.config);
-        if config.language != code {
+        let mut saving = lock(&self.saving);
+        let snapshot = {
+            let mut config = lock(&self.config);
+            if config.language == code {
+                return Ok(());
+            }
             config.language = code;
-            config.save()?;
-        }
-        Ok(())
+            config.clone()
+        };
+        self.write_config(&mut saving, &snapshot, Instant::now(), "")
     }
 
     /// Переименование туннеля хранилища (отключённого). Статистику ведёт агент: ей о переименовании сообщает окно.
@@ -983,6 +1086,11 @@ pub(crate) fn run_switch(host: &dyn TunnelHost, name: &str, plan: Plan, others: 
         mark("engine: service up (or wait timed out)");
     }
     Ok(())
+}
+
+/// Туннель работает после сорвавшегося переключения; список не прочитался — «нет»: надзор лучше, чем ничего.
+fn still_running(host: &dyn TunnelHost, name: &str) -> bool {
+    host.running().is_ok_and(|r| r.iter().any(|n| n == name))
 }
 
 /// Какие из подключённых отключить перед подключением `name`: все остальные — если туннель один; с `multiple` —
@@ -1172,6 +1280,8 @@ mod tests {
             shared,
             config: Mutex::new(config),
             config_file,
+            saving: Mutex::default(),
+            save_hook: Mutex::new(None),
             switching: Mutex::new(()),
             connections: Budgets::new(CORE_LIMITS),
             details: Mutex::default(),
@@ -1472,6 +1582,11 @@ mod tests {
         unreadable: bool,
         /// Конфиги AmneziaWG; `None` — те же, что работают.
         configs: Option<Vec<String>>,
+        /// Служба есть только у работающего туннеля (режим 1: отключение убирает службу, сорвавшееся подключение её
+        /// не создаёт); без этого — у любого (умолчание `TunnelHost`).
+        services_follow_running: bool,
+        /// Идёт чужой установщик Windows.
+        installer: std::sync::atomic::AtomicBool,
     }
 
     impl Recorder {
@@ -1515,6 +1630,167 @@ mod tests {
         fn native_services(&self) -> bool {
             self.native
         }
+        fn service_exists(&self, tunnel: &str) -> bool {
+            !self.services_follow_running || lock(&self.running).iter().any(|t| t == tunnel)
+        }
+        fn installer_running(&self) -> bool {
+            self.installer.load(Ordering::SeqCst)
+        }
+    }
+
+    /// Режим 1: перезапуск мёртвого туннеля снял его службу, а новую не поставил. Следующий такт не выводит туннель из
+    /// набора как отключённый в окне AmneziaWG, а поднимает его по расписанию надзора.
+    #[test]
+    fn failed_dead_restart_in_mode_1_keeps_the_tunnel_desired_and_retried() {
+        let host = Arc::new(Recorder { running: Mutex::new(vec!["a".into()]), native: true, fail: Some("up a"), services_follow_running: true, ..Default::default() });
+        let core = core_over(host.clone(), &["a"]);
+        let t0 = Instant::now();
+        core.supervise_tick(t0, false);
+        core.dead_round(t0, &["a".to_string()], &[("a".to_string(), Verdict::Dead)], false);
+        assert_eq!(calls(&host), ["down a", "up a"]);
+        core.supervise_tick(t0 + Duration::from_secs(1), false);
+        assert!(core.is_desired("a"), "туннель остаётся желаемым");
+        let outside = trf("core.retry_outside", &["a"]);
+        assert!(!journal(&core).iter().any(|t| *t == outside), "{:?}", journal(&core));
+        assert!(lock(&core.retries).view(t0).contains_key("a"), "под надзором повторов");
+        core.supervise_tick(t0 + retry::FAST_EVERY + Duration::from_secs(1), false);
+        assert_eq!(calls(&host), ["down a", "up a", "up a"], "попытка надзора через обычный шаг");
+    }
+
+    /// Перезапуск мёртвого туннеля сорвался ещё на отключении: служба работает по-прежнему. Надзору повторов он не
+    /// отдаётся — тот через 5 с счёл бы работающий «подключённым» (строка в журнале при мёртвом туннеле) и на это время
+    /// снял бы с него сторожа мёртвых; работающим мёртвым занимается сторож.
+    #[test]
+    fn failed_down_step_of_a_dead_restart_is_not_handed_to_the_retry_schedule() {
+        let host = Arc::new(Recorder { running: Mutex::new(vec!["a".into()]), native: true, fail: Some("down a"), services_follow_running: true, ..Default::default() });
+        let core = core_over(host.clone(), &["a"]);
+        let t0 = Instant::now();
+        core.supervise_tick(t0, false);
+        core.dead_round(t0, &["a".to_string()], &[("a".to_string(), Verdict::Dead)], false);
+        assert_eq!(calls(&host), ["down a"]);
+        assert!(lock(&core.retries).view(t0).is_empty(), "работающий туннель не под надзором повторов");
+        for s in 1..=(retry::CONFIRM_FOR.as_secs() + 2) {
+            core.supervise_tick(t0 + Duration::from_secs(s), false);
+        }
+        let connected = tr("ev.connected");
+        assert!(!journal(&core).iter().any(|t| *t == connected), "ложного «подключён» нет: {:?}", journal(&core));
+        assert!(core.is_desired("a"));
+        // Та же команда от пользователя: ошибка в журнале, надзора нет.
+        assert_eq!(core.switch("a", Plan::Reconnect, false), Err("down a: refused".into()));
+        assert!(lock(&core.retries).view(t0).is_empty());
+        assert_eq!(journal(&core).iter().filter(|t| *t == "down a: refused").count(), 1, "{:?}", journal(&core));
+    }
+
+    /// Режим 1: переподключение по команде пользователя сорвалось на `/installtunnelservice` — службы нет. Ошибка
+    /// в журнале одна (команды), туннель остаётся желаемым и дальше под надзором, а не «отключён вне программы».
+    #[test]
+    fn failed_user_reconnect_in_mode_1_is_supervised_not_dropped_as_outside() {
+        let host = Arc::new(Recorder { running: Mutex::new(vec!["a".into()]), native: true, fail: Some("up a"), services_follow_running: true, ..Default::default() });
+        let core = core_over(host.clone(), &["a"]);
+        let t0 = Instant::now();
+        core.supervise_tick(t0, false);
+        assert_eq!(core.switch("a", Plan::Reconnect, false), Err("up a: refused".into()));
+        for s in 1..3 {
+            core.supervise_tick(t0 + Duration::from_secs(s), false);
+        }
+        assert!(core.is_desired("a"));
+        let outside = trf("core.retry_outside", &["a"]);
+        assert!(!journal(&core).iter().any(|t| *t == outside), "{:?}", journal(&core));
+        assert_eq!(journal(&core).iter().filter(|t| t.contains("refused")).count(), 1, "ошибка команды — одна строка: {:?}", journal(&core));
+        core.supervise_tick(t0 + retry::FAST_EVERY + Duration::from_secs(1), false);
+        assert_eq!(calls(&host), ["down a", "up a", "up a"]);
+    }
+
+    /// Чужой установщик Windows убрал службу желаемого туннеля режима 1: ядро пишет об ожидании, не выводит туннель
+    /// из набора и не ставит службу, пока установщик работает; после него — переподключает и пишет об этом.
+    #[test]
+    fn foreign_installer_pauses_supervision_and_the_core_logs_both_ends() {
+        // Конфиг у AmneziaWG остаётся (установщик его не трогает): после аренды туннель возвращается, а не «конфиг удалён».
+        let host = Arc::new(Recorder { running: Mutex::new(vec!["a".into()]), configs: Some(vec!["a".into()]), native: true, services_follow_running: true, ..Default::default() });
+        let core = core_over(host.clone(), &["a"]);
+        let t0 = Instant::now();
+        core.supervise_tick(t0, false);
+        host.installer.store(true, Ordering::SeqCst);
+        lock(&host.running).clear();
+        for s in 1..40 {
+            core.supervise_tick(t0 + Duration::from_secs(s), false);
+        }
+        assert!(calls(&host).is_empty(), "{:?}", calls(&host));
+        assert!(core.is_desired("a"));
+        let texts = journal(&core);
+        assert_eq!(texts.iter().filter(|t| **t == trf("core.installer_hold", &["a"])).count(), 1, "{texts:?}");
+        assert!(!texts.iter().any(|t| *t == trf("core.retry_outside", &["a"])), "{texts:?}");
+        host.installer.store(false, Ordering::SeqCst);
+        let done = 39 + retry::INSTALLER_GRACE.as_secs();
+        for s in 40..=done {
+            core.supervise_tick(t0 + Duration::from_secs(s), false);
+        }
+        assert_eq!(calls(&host), ["up a"]);
+        assert!(journal(&core).iter().any(|t| *t == trf("core.installer_done", &["a"])), "{:?}", journal(&core));
+    }
+
+    /// Не записался `core.ini` (его место занято каталогом — как файл, который держит антивирус): предупреждение в
+    /// журнале одно, набор в памяти новый, такты надзора повторяют запись с растущей паузой (1 с, 2 с, …), и как только
+    /// файл можно записать — он записан, в журнале строка об этом.
+    #[test]
+    fn unsaved_desired_set_is_retried_on_the_tick_with_backoff_until_written() {
+        let dir = std::env::temp_dir().join(format!("awg-core-save-retry-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("core.ini");
+        // Непустой каталог на месте файла: переименование поверх него не проходит (`Ini::save` папку создаёт сам).
+        std::fs::create_dir_all(path.join("inner")).unwrap();
+        let host = Arc::new(Recorder { running: Mutex::new(vec!["a".into(), "b".into()]), ..Default::default() });
+        let core = core_saving_to(host, &["a", "b"], Some(path.clone()));
+        assert!(matches!(core.handle(Request::Forget("a".into()), None, true), Response::Ok));
+        // Первый повтор назначен на секунду после сбоя; такты идут от момента после него.
+        let t0 = Instant::now();
+        assert_eq!(lock(&core.config).tunnels.as_deref(), Some(&["b".to_string()][..]), "в памяти набор новый");
+        let unsaved = |core: &Core| journal(core).iter().filter(|t| t.starts_with(trf("core.desired_unsaved", &[""]).trim_end())).count();
+        assert_eq!(unsaved(&core), 1);
+
+        core.supervise_tick(t0 + Duration::from_millis(500), false);
+        core.supervise_tick(t0 + Duration::from_secs(1), false);
+        core.supervise_tick(t0 + Duration::from_secs(2), false);
+        assert!(path.is_dir(), "файл так и не записан");
+        assert_eq!(unsaved(&core), 1, "повторные сбои не пишутся: {:?}", journal(&core));
+        let retry = lock(&core.saving).retry.as_ref().map(|r| (r.failures, r.pause)).expect("повтор назначен");
+        assert_eq!(retry, (2, Duration::from_secs(2)), "первый повтор на 1 с не прошёл — пауза 2 с");
+
+        std::fs::remove_dir_all(&path).unwrap();
+        core.supervise_tick(t0 + Duration::from_secs(2) + Duration::from_millis(500), false);
+        assert!(!path.exists(), "срок повтора ещё не настал");
+        core.supervise_tick(t0 + Duration::from_secs(3), false);
+        let saved = Config::from_ini(&crate::ini::Ini::load(&path));
+        assert_eq!(saved.tunnels.as_deref(), Some(&["b".to_string()][..]), "записан текущий набор");
+        assert!(lock(&core.saving).retry.is_none());
+        assert!(journal(&core).iter().any(|t| *t == trf("core.desired_saved", &["2"])), "{:?}", journal(&core));
+        core.supervise_tick(t0 + Duration::from_secs(60), false);
+        assert!(journal(&core).iter().filter(|t| *t == &trf("core.desired_saved", &["2"])).count() == 1, "без сбоев повторов нет");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Пока `core.ini` пишется (диск медленный), замок настроек свободен: `State` окна и агента читают режим, не ждя диск.
+    #[test]
+    fn config_lock_is_free_while_core_ini_is_being_written() {
+        let core = core_over(Arc::new(Recorder::default()), &["a"]);
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let release_rx = Mutex::new(release_rx);
+        *lock(&core.save_hook) = Some(Box::new(move || {
+            entered_tx.send(()).unwrap();
+            lock(&release_rx).recv().unwrap();
+        }));
+        let writer = core.clone();
+        let thread = std::thread::spawn(move || writer.forget("a"));
+        entered_rx.recv_timeout(Duration::from_secs(5)).expect("запись началась");
+        assert!(core.config.try_lock().is_ok(), "замок настроек занят на время записи");
+        assert_eq!(core.mode(), Mode::Engine, "State читает режим во время записи");
+        assert_eq!(lock(&core.config).tunnels.as_deref(), Some(&[][..]), "в памяти набор уже новый");
+        release_tx.send(()).unwrap();
+        thread.join().unwrap();
+        let file = core.config_file.as_deref().unwrap();
+        assert_eq!(Config::from_ini(&crate::ini::Ini::load(file)).tunnels, Some(vec![]));
+        std::fs::remove_file(file).unwrap();
     }
 
     #[test]

@@ -29,7 +29,7 @@
   its whole subtree: active / total, downloaded, uploaded, peak speed and time share.
 - Drag and drop tunnels and groups, a right-click menu, keyboard navigation, instant search (`Ctrl+F`).
 - Screen readers (Narrator, NVDA): tunnel and group rows, the speed graph and status dots are read with their name and state.
-- Sortable, resizable columns: downloaded total, uploaded total, peak speed, share of connected time.
+- Sortable columns sized to their content: downloaded total, uploaded total, peak speed, share of connected time.
 
 **Live status**
 - Is there a handshake and how long ago, are packets flowing, download / upload speed, ping through the VPN.
@@ -252,7 +252,7 @@ The window keeps its own settings **next to the exe**, so it stays portable:
 
 | Path | Purpose |
 |------|---------|
-| `Settings.ini` | Window position and size, interface scale, panel and column widths, graph height, View / Settings switches, theme (`theme` in `[options]`: `graphite` by default, `slate`, `daylight`, `system` = follow Windows; an unknown value means `graphite`), groups, tunnel source links. Saved 0.3 s after the last change. |
+| `Settings.ini` | Window position and size, interface scale, panel widths, graph height, View / Settings switches, theme (`theme` in `[options]`: `graphite` by default, `slate`, `daylight`, `system` = follow Windows; an unknown value means `graphite`), groups, tunnel source links. Saved 0.3 s after the last change. |
 | `lang\*.lng` | Additional interface languages. |
 | `logs\crash.log` | Why the window ended after an internal error or could not start (time, version, place). Folder set by `log_dir` in `Settings.ini`. |
 | `logs\window-errors.log` | Errors of the window's actions (the same lines as in its event log, so none is lost while it is hidden in the tray); rotated to `.1.log` at 1 MiB. |

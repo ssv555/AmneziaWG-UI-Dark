@@ -28,7 +28,7 @@ Both pipes use the same transport (`src/daemon/pipe.rs`) and differ only in mess
    |---|---|---|
    | Window to core, all requests | 10 s | 300 s (longer than the longest legitimate request: two actions in the native window, 120 s each) |
    | Window to agent, regular requests (state, events, ping, updates) | 2 s | 5 s |
-   | Window to agent, `Tunnel(..)` requests (the helper in the native window runs up to 120 s) | 10 s | 300 s |
+   | Window to agent, `Tunnel(..)` requests (the helper in the native window runs up to 120 s; the next action waits at most 60 s for it, then is refused) | 10 s | 300 s |
    | Agent to core, `State` poll once a second | 2 s | 3 s |
    | Agent to core, the ping's `State` read | 5 s | 15 s |
    | Agent to core, `Hello`, `Forget`, `Footprint` | 10 s | 15 s |
@@ -104,7 +104,7 @@ Grouped by purpose.
    1. `Delete(tunnel)` - mode 2 only; in mode 1 the answer is `Refused` (moved to the agent).
    2. `Rename { old, new }` - mode 2, tunnel not running; otherwise an error.
 4. **Moved to the agent.** `Read`, `Write`, `Details`, `Import`, `ExportAll`, `NewTunnel`, `TakeNative` and `Native(NativeOp)` stay in the enum so that
-   an older window gets an explanation instead of a parse error: the core answers `Refused` ("now handled by the secondary service; restart the
+   an older window gets an explanation instead of a parse error: the core answers `Refused` ("now handled by the helper service; restart the
    window"). `SetPing { enabled, host }` and `Updates(..)` are refused the same way, each with its own text.
 5. **Internal, SYSTEM only** (the agent is the only caller):
    1. `HoldNative { lease_s }` and `Release { tunnels }` - take mode 1 tunnels off supervision for the time of an AmneziaWG installation and give them

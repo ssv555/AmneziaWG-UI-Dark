@@ -69,6 +69,21 @@ pub fn service_command(name: &str) -> Option<String> {
     Service::try_open(&scm, name, SERVICE_QUERY_CONFIG).ok().flatten()?.command_line()
 }
 
+/// Идёт установка, удаление или восстановление по MSI: Windows Installer держит мьютекс `Global\_MSIExecute` на время
+/// выполнения транзакции (именно тогда он убирает и ставит службы). Не открылся — установщика нет (или мьютекс недоступен
+/// — ядро работает от SYSTEM, ему он открыт).
+pub fn installer_running() -> bool {
+    use windows_sys::Win32::System::Threading::OpenMutexW;
+    /// `SYNCHRONIZE` (winnt.h): самое малое право, с которым мьютекс открывается.
+    const SYNCHRONIZE: u32 = 0x0010_0000;
+    let mutex = unsafe { OpenMutexW(SYNCHRONIZE, 0, wide(r"Global\_MSIExecute").as_ptr()) };
+    if mutex.is_null() {
+        return false;
+    }
+    unsafe { CloseHandle(mutex) };
+    true
+}
+
 /// `"C:\dir\app.exe" /arg` или `C:\dir\app.exe /arg` → путь к exe.
 pub fn exe_from_command_line(s: &str) -> Option<std::path::PathBuf> {
     let s = s.trim();

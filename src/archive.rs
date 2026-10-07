@@ -26,6 +26,17 @@ pub enum ReadError {
     Other(String),
 }
 
+/// Текст для журнала, когда пароль не ожидался (родной экспорт без пароля): не `{:?}` перечисления.
+impl std::fmt::Display for ReadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ReadError::NeedPassword => f.write_str(&crate::i18n::tr("eng.need_password")),
+            ReadError::WrongPassword => f.write_str(&crate::i18n::tr("eng.wrong_password")),
+            ReadError::Other(text) => f.write_str(text),
+        }
+    }
+}
+
 /// Все `*.conf` из архива (папки внутри не важны). Пароль нужен только для зашифрованных записей.
 pub fn read(file: &Path, password: Option<&str>) -> Result<Vec<Entry>, ReadError> {
     let other = |e: &dyn std::fmt::Display| ReadError::Other(crate::fsutil::io_ctx(&file, e));

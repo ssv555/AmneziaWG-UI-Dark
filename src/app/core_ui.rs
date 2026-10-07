@@ -203,7 +203,7 @@ impl App {
             match crate::elevated::run(&args, "core.setup_failed") {
                 Outcome::Done(note) => {
                     let done = if flag == crate::daemon::install::INSTALL_FLAG { "core.installed" } else { "core.uninstalled" };
-                    *lock(&notice) = Some(tr(done));
+                    notice.done(tr(done));
                     // У прежней версии был автозапуск через задачу планировщика — включаем его по-новому (ключ Run).
                     if note == crate::daemon::install::AUTOSTART_NOTE {
                         if let Err(e) = crate::win::set_autostart(true) {
@@ -213,7 +213,7 @@ impl App {
                 }
                 Outcome::Failed(e) => error.push(e),
                 // Отмена UAC — выбор пользователя, а не сбой: как у «Вернуть».
-                Outcome::Cancelled => *lock(&notice) = Some(tr("core.uac_declined")),
+                Outcome::Cancelled => notice.warn(tr("core.uac_declined")),
             }
             // Ядру нужно мгновение, чтобы открыть канал.
             std::thread::sleep(Duration::from_millis(500));
@@ -250,27 +250,56 @@ impl App {
             LinkState::Down(e) => (trf("core.down", &[e]), Some(tr("core.reinstall")), None),
             LinkState::Installing => (tr("core.installing"), None, None),
         };
-        let mut retry_clicked = false;
-        egui::Panel::top("core-banner").show(ui, |ui| {
-            ui.horizontal(|ui| {
-                if matches!(link, LinkState::Installing) {
-                    ui.spinner();
-                }
-                ui.label(RichText::new(text).color(theme::palette().warning));
-                if let Some(b) = button {
-                    if ui.button(b).on_hover_text(tr("core.uac_hint")).clicked() {
-                        actions.push(Action::InstallCore);
-                    }
-                }
-                if retry.is_some() && ui.button(tr("core.retry")).clicked() {
-                    retry_clicked = true;
-                }
-            });
-        });
-        if let (true, Some(v)) = (retry_clicked, &retry) {
+        let banner = Banner { text: &text, button: button.as_deref(), retry: retry.is_some(), installing: matches!(link, LinkState::Installing) };
+        let clicked = egui::Panel::top("core-banner").show(ui, |ui| banner_row(ui, &banner)).inner;
+        if clicked.fix {
+            actions.push(Action::InstallCore);
+        }
+        if let (true, Some(v)) = (clicked.retry, &retry) {
             self.self_update(v, true);
         }
     }
+}
+
+/// Что показать в полосе ядра: текст, кнопка-исправление («Установить», «Обновить», «Переустановить»), «Повторить».
+pub(super) struct Banner<'a> {
+    pub(super) text: &'a str,
+    pub(super) button: Option<&'a str>,
+    pub(super) retry: bool,
+    pub(super) installing: bool,
+}
+
+#[derive(Default)]
+pub(super) struct BannerClicks {
+    pub(super) fix: bool,
+    pub(super) retry: bool,
+}
+
+/// Строка полосы: кнопки прижаты к правому краю, текст переносится в остатке. Раньше текст шёл первым в одну строку,
+/// и с длинной ошибкой канала («…не отвечает: <ошибка>») кнопка оказывалась за правым краем окна — пользователь видел
+/// беду, но не действие. Тест умещаемости — `fit::core_banner_keeps_the_button_in_the_window`.
+pub(super) fn banner_row(ui: &mut egui::Ui, banner: &Banner) -> BannerClicks {
+    let mut clicked = BannerClicks::default();
+    ui.horizontal(|ui| {
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if let Some(b) = banner.button {
+                clicked.fix = ui.button(b).on_hover_text(tr("core.uac_hint")).clicked();
+            }
+            if banner.retry {
+                clicked.retry = ui.button(tr("core.retry")).clicked();
+            }
+            ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                if banner.installing {
+                    ui.spinner();
+                }
+                ui.add(egui::Label::new(RichText::new(banner.text).color(theme::palette().warning)).wrap());
+            });
+        });
+    });
+    clicked
+}
+
+impl App {
 
     /// Ядро новее окна и выложило свою сборку — окно ставит её себе и перезапускается. Само пробует один раз на
     /// каждую версию ядра (`again` — повтор по кнопке «Повторить»); не вышло — ошибка в окне и кнопка повтора.

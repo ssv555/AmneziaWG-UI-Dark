@@ -10,7 +10,7 @@ use eframe::egui::{self, RichText};
 use crate::i18n::tr;
 use crate::settings::{Mode, Settings, Theme};
 
-use super::dialog::{dialog_buttons, dialog_ok_cancel_apply, dialog_window};
+use super::dialog::{dialog_body, dialog_buttons, dialog_ok_cancel_apply};
 use super::modals::{Outcome, Turn};
 use super::theme::palette;
 use super::{Action, App, Modal};
@@ -132,21 +132,22 @@ impl App {
         self.modals.open(Modal::Settings(Box::new(SettingsDialog::new(&self.s, self.autostart))));
     }
 
-    pub(super) fn show_settings(&mut self, ctx: &egui::Context, dlg: &mut SettingsDialog, turn: Turn) -> Outcome {
+    pub(super) fn show_settings(&mut self, ctx: &egui::Context, dlg: &mut SettingsDialog, mut turn: Turn) -> Outcome {
         let (enter, escape) = turn.keys(ctx);
         if dlg.confirm_reset {
-            return self.show_reset_confirm(ctx, dlg, enter, escape);
+            return self.show_reset_confirm(ctx, dlg, &mut turn, (enter, escape));
         }
         let hidden = self.s.hidden_dialogs.len();
         let changed = dlg.changed(&self.s, self.autostart);
         let mut open = true;
         let (mut ok, mut apply, mut cancel, mut reset) = (false, false, false, false);
-        dialog_window(ctx, tr("set.title"), "settings", &mut open).show(ctx, |ui| {
-            ui.set_width(460.0);
-            sections(ui, &mut dlg.choices, hidden);
-            ui.add_space(10.0);
-            ui.horizontal(|ui| {
-                reset = ui.button(tr("set.reset")).clicked();
+        turn.window(ctx, tr("set.title"), "settings", &mut open).show(ctx, |ui| {
+            dialog_body(ui, SETTINGS_WIDTH, |ui| {
+                sections(ui, &mut dlg.choices, hidden);
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    reset = ui.button(tr("set.reset")).clicked();
+                });
             });
             ui.add_space(6.0);
             let valid = dlg.choices.ping_host_ok();
@@ -174,12 +175,13 @@ impl App {
     }
 
     /// «Сбросить к значениям по умолчанию?» поверх окна настроек: сбрасывается черновик, применяют его «ОК»/«Применить».
-    fn show_reset_confirm(&mut self, ctx: &egui::Context, dlg: &mut SettingsDialog, enter: bool, escape: bool) -> Outcome {
+    fn show_reset_confirm(&mut self, ctx: &egui::Context, dlg: &mut SettingsDialog, turn: &mut Turn, (enter, escape): (bool, bool)) -> Outcome {
         let mut open = true;
         let (mut yes, mut no) = (false, false);
-        dialog_window(ctx, tr("set.reset_title"), "settings-reset", &mut open).order(egui::Order::Foreground).show(ctx, |ui| {
-            ui.set_width(420.0);
-            ui.add(egui::Label::new(tr("set.reset_text")).wrap());
+        turn.window(ctx, tr("set.reset_title"), "settings-reset", &mut open).order(egui::Order::Foreground).show(ctx, |ui| {
+            dialog_body(ui, 420.0, |ui| {
+                ui.add(egui::Label::new(tr("set.reset_text")).wrap());
+            });
             ui.add_space(10.0);
             (yes, no) = dialog_buttons(ui, &tr("set.reset"), true, Some(&tr("btn.cancel")));
         });
@@ -193,6 +195,9 @@ impl App {
     }
 }
 
+/// Ширина окна «Настройки» (тело — `dialog_body`, при узкой области окон у́же). Её же берёт тест умещаемости.
+pub(super) const SETTINGS_WIDTH: f32 = 460.0;
+
 /// Ключ перевода подписи темы в списке.
 fn theme_key(theme: Theme) -> &'static str {
     match theme {
@@ -204,7 +209,7 @@ fn theme_key(theme: Theme) -> &'static str {
 }
 
 /// Разделы окна: Общие, Уведомления и трей, Сеть, Режим работы.
-fn sections(ui: &mut egui::Ui, c: &mut Choices, hidden: usize) {
+pub(super) fn sections(ui: &mut egui::Ui, c: &mut Choices, hidden: usize) {
     section(ui, "set.sec_general");
     ui.horizontal(|ui| {
         let label = ui.label(tr("set.theme"));

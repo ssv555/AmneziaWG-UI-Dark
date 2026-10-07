@@ -7,11 +7,16 @@
 //!
 //! У строк 2 и 3 копия указана явно (`prior_backup`); в истории прежних версий ссылки нет, и берётся последняя
 //! копия того же компонента той же версии, сделанная не позже строки. Копия, которой нет на диске (отброшена
-//! пределом или удалена), в цель не годится.
+//! пределом или удалена), в цель не годится. Сборка программы старше `MIN_APP_RESTORE` тоже: у неё нет агента, а окно
+//! этой версии ходит за обновлениями и конфигами только к нему — вернувшись, владелец не смог бы из окна ни обновиться
+//! обратно, ни править туннели.
 
 use serde::{Deserialize, Serialize};
 
-use super::{Action, Component, HistoryEntry};
+use super::{feed, Action, Component, HistoryEntry};
+
+/// Первая сборка с агентом: более старые сборки программы из окна не возвращаются.
+pub const MIN_APP_RESTORE: &str = "0.5.0";
 
 /// Что кнопка «Вернуть» строки истории делает сейчас.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
@@ -30,6 +35,8 @@ pub enum RestoreBlock {
     NoCopy,
     /// Версия цели уже установлена.
     Installed,
+    /// Сборка программы старше `MIN_APP_RESTORE`: без агента окно этой версии с ней не работает.
+    TooOld,
 }
 
 /// Куда вернуть: папка копии в хранилище и версия.
@@ -52,6 +59,9 @@ pub(super) fn resolve(
     let Some(version) = version else { return Some(Err(RestoreBlock::NoCopy)) };
     if installed.map(str::trim) == Some(version) {
         return Some(Err(RestoreBlock::Installed));
+    }
+    if row.component == Component::App && feed::newer(MIN_APP_RESTORE, version) {
+        return Some(Err(RestoreBlock::TooOld));
     }
     let backup = match row.action {
         Action::Backup => row.backup.as_deref().filter(|b| exists(b)),
@@ -186,6 +196,27 @@ mod tests {
         assert_eq!(resolve(&h, 2, Some("2.0"), &disk), Some(Err(RestoreBlock::Installed)));
         assert_eq!(resolve(&h, 3, Some(" 2.0 "), &disk), Some(Err(RestoreBlock::Installed)));
         assert!(resolve(&h, 3, None, &disk).unwrap().is_ok(), "версия не определена — сравнивать не с чем");
+    }
+
+    /// Сборка программы до агента (0.4.x) из окна не возвращается, даже с копией на диске; движок той же версии — да.
+    #[test]
+    fn app_build_older_than_the_first_with_an_agent_is_refused() {
+        let app = |id: u64, version: &str, name: &str| {
+            let mut e = backup(id, version, Some(name));
+            e.component = Component::App;
+            e
+        };
+        let h = vec![app(2, "0.4.0", "2-app-0.4.0"), app(3, "0.5.0", "3-app-0.5.0"), app(4, "0.4.9", "4-app-0.4.9"), backup(5, "0.4.0", Some("5-engine-0.4.0"))];
+        let disk = on_disk(&["2-app-0.4.0", "3-app-0.5.0", "4-app-0.4.9", "5-engine-0.4.0"]);
+        assert_eq!(resolve(&h, 2, Some("0.5.5"), &disk), Some(Err(RestoreBlock::TooOld)));
+        assert_eq!(resolve(&h, 4, Some("0.5.5"), &disk), Some(Err(RestoreBlock::TooOld)));
+        assert_eq!(resolve(&h, 3, Some("0.5.5"), &disk), target("3-app-0.5.0", "0.5.0"), "первая сборка с агентом годится");
+        assert_eq!(resolve(&h, 5, Some("3.0"), &disk), target("5-engine-0.4.0", "0.4.0"), "предел только для сборки программы");
+        // Уже установленная старая версия — «установлена», не «старая»: сравнение с установленной идёт первым.
+        assert_eq!(resolve(&h, 2, Some("0.4.0"), &disk), Some(Err(RestoreBlock::Installed)));
+        let o = offers(&h, &[(Component::App, Some("0.5.5".into()))], &disk);
+        assert_eq!(o.iter().find(|x| x.id == 2).unwrap().blocked, Some(RestoreBlock::TooOld));
+        assert!(feed::newer("0.5.0", "0.4.99") && !feed::newer(MIN_APP_RESTORE, "0.5.0"));
     }
 
     #[test]

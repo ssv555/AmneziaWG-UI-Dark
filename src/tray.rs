@@ -617,8 +617,52 @@ fn make_icon(size: u32, rgba: &[u8]) -> isize {
     }
 }
 
+/// Подсказка значка в трее: `szTip` на 128 единиц UTF-16 вместе с нулём.
+pub const TIP_UNITS: usize = 127;
+
+/// `s`, укороченная до `max` единиц UTF-16; обрезанная — с «…» в конце.
+fn ellipsize(s: &str, max: usize) -> String {
+    if s.encode_utf16().count() <= max {
+        return s.to_string();
+    }
+    let mut out = String::new();
+    let mut used = 0;
+    for c in s.chars() {
+        if used + c.len_utf16() + 1 > max {
+            break;
+        }
+        used += c.len_utf16();
+        out.push(c);
+    }
+    out.truncate(out.trim_end().len());
+    out + "…"
+}
+
+/// Подсказка из строк (по туннелю): строки целиком, сколько поместится, остальные — числом «+N». Даже первая
+/// не поместилась — она с «…». Так подсказка не обрывается на полуслове и ни один туннель не пропадает молча.
+pub fn fit_tip(lines: &[String]) -> String {
+    let units = |s: &str| s.encode_utf16().count();
+    let mut out = String::new();
+    for (i, line) in lines.iter().enumerate() {
+        let candidate = if out.is_empty() { line.clone() } else { format!("{out}\n{line}") };
+        let left = lines.len() - i - 1;
+        let more = if left > 0 { format!("\n+{left}") } else { String::new() };
+        if units(&candidate) + units(&more) <= TIP_UNITS {
+            out = candidate;
+            continue;
+        }
+        if out.is_empty() {
+            return ellipsize(line, TIP_UNITS - units(&more)) + &more;
+        }
+        // Прошлая строка поместилась вместе с «+N» для всех, что после неё, — это оно и есть.
+        return format!("{out}\n+{}", lines.len() - i);
+    }
+    out
+}
+
+/// Строка в буфер Windows с нулём в конце; не помещается — укорачивается с «…», а не обрывается на полуслове.
 fn copy(dst: &mut [u16], s: &str) {
-    let units: Vec<u16> = s.encode_utf16().take(dst.len() - 1).collect();
+    let units: Vec<u16> = ellipsize(s, dst.len() - 1).encode_utf16().collect();
     dst[..units.len()].copy_from_slice(&units);
     dst[units.len()] = 0;
 }
@@ -709,9 +753,31 @@ mod tests {
     }
 
     #[test]
-    fn copy_truncates_with_nul() {
+    fn copy_cuts_with_an_ellipsis_and_nul() {
         let mut buf = [1u16; 4];
         super::copy(&mut buf, "abcdef");
-        assert_eq!(buf, [b'a' as u16, b'b' as u16, b'c' as u16, 0]);
+        assert_eq!(buf, [b'a' as u16, b'b' as u16, '…' as u16, 0], "обрезка видна");
+        let mut buf = [1u16; 4];
+        super::copy(&mut buf, "abc");
+        assert_eq!(buf, [b'a' as u16, b'b' as u16, b'c' as u16, 0], "влезает — без многоточия");
+    }
+
+    #[test]
+    fn tip_keeps_whole_lines_and_counts_the_rest() {
+        let lines: Vec<String> = (1..=5).map(|i| format!("office-{i}: Подключён — пакеты идут")).collect();
+        let tip = fit_tip(&lines);
+        assert!(tip.encode_utf16().count() <= TIP_UNITS, "{tip}");
+        let shown: Vec<&str> = tip.lines().collect();
+        let last = shown.last().unwrap();
+        assert!(last.starts_with('+'), "{tip}");
+        let hidden: usize = last[1..].parse().unwrap();
+        assert_eq!(shown.len() - 1 + hidden, lines.len(), "ни один туннель не потерян молча: {tip}");
+        assert!(shown[..shown.len() - 1].iter().all(|l| lines.iter().any(|x| x == l)), "строки целиком: {tip}");
+        assert_eq!(fit_tip(&lines[..2]), lines[..2].join("
+"), "влезает — как есть");
+        let long = vec!["x".repeat(300), "y".into()];
+        let tip = fit_tip(&long);
+        assert!(tip.encode_utf16().count() <= TIP_UNITS && tip.ends_with("…
++1"), "{tip}");
     }
 }

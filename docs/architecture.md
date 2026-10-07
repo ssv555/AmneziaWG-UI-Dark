@@ -15,6 +15,13 @@ One executable, `awg-ui.exe`, runs in several roles. The command line selects th
 
 Two short-lived helpers also exist: `--native-op <task>` (`src/daemon/helper.rs`), started by the agent in the user's session to drive the original AmneziaWG window, and `--restart-core` (`src/update/ours/fallback.rs`), used by the app self-update.
 
+The native-window helper (`src/daemon/helper.rs`, `src/daemon/session.rs`):
+
+1. Runs with the full token of the user signed in to the caller's session: the linked token under UAC, the session token itself without UAC. An owner who is not an administrator gets "needs an administrator account" and nothing is started: the AmneziaWG window runs elevated.
+2. Job and answer files are in `ProgramData\AmneziaWG UI Dark\ops` (SYSTEM and administrators only) and may hold full configs with keys. The helper deletes its job as soon as it has read it; the agent empties the folder after every action and at its own start (again 135 s later, when a helper of a dead agent has surely ended). The helper ends itself after 120 s.
+3. One action at a time; the next waits at most 60 s for the running one and is then refused, so an action never runs after the window stopped waiting (60 + 120 s fit in the window's 300 s).
+4. An exit without an answer is reported with the exit code. Both `--native-op` and `--restart-core` take the core's language from `core.ini`.
+
 ## Processes and pipes
 
 ```mermaid
@@ -79,7 +86,7 @@ The core calls the agent only for the watchdog `Hello`. Calls from the agent to 
 
 ### Updates that touch tunnels
 
-1. Original AmneziaWG: the MSI removes tunnel services. The agent sends `HoldNative {lease_s}` (15 min lease, the core caps it at 1 h); the core picks the mode 1 tunnels itself (running and desired; the agent has no tunnel state), stops supervising them, marks them busy and answers `Held` with the list. After the MSI the agent sends `Release` for that list, and the core reconnects the desired tunnels that are not running. If the agent dies, the lease expires and supervision resumes by itself. If the core is unreachable or refuses the lease, the MSI is not started.
+1. Original AmneziaWG: the MSI removes tunnel services. The agent sends `HoldNative {lease_s}` (15 min lease, the core caps it at 1 h); the core picks the mode 1 tunnels itself (running and desired; the agent has no tunnel state), stops supervising them, marks them busy and answers `Held` with the list. After the MSI the agent sends `Release` for that list, and the core reconnects the desired tunnels that are not running. If the agent dies, the lease expires and supervision resumes by itself. If the core is unreachable or refuses the lease, the MSI is not started. An AmneziaWG MSI run outside this program (no lease) is recognised by the Windows Installer mutex: the tunnels whose services it removed are held implicitly until 15 s after it finishes, then reconnected ([Supervisor](supervisor.md#an-installer-not-started-by-this-program)).
 2. Built-in engine: the agent replaces the DLLs and sends `ReconnectEngine`; the core reconnects mode 2 tunnels in its supervisor thread. The request is persisted before the files are replaced (`updates\after_change.json`) and cleared only when the core accepted it: if the agent dies before sending it or the core does not answer, the agent re-sends it on its next scheduler tick. A repeated request before the supervisor tick reconnects once.
 3. The app itself: the agent installs the new file set and starts `awg-ui.exe --restart-core` outside the core's job (`CREATE_BREAKAWAY_FROM_JOB`, which the job allows). The helper restarts the core service; if the new core does not come up, it rolls the whole set back (`src/update/ours/fallback.rs`). The agent dies with the old core, and the new core starts a new one.
 
@@ -104,12 +111,13 @@ The mode 2 cue colour depends on the theme (`mode2_frame` in `src/app/theme.rs`)
 
 | Event | VPN | Effect | Recovery |
 |---|---|---|---|
-| Agent exits or crashes | untouched | the running update job, ping history (in memory), up to one minute of speed history and an in-flight helper action are lost; an interrupted native (MSI) rollback is marked "interrupted" in the history at the next agent start; the window shows "secondary service unavailable" for agent actions and ping | the watchdog restarts it after 1, 2, 4 ... 60 s; a run longer than 5 min resets the series; retries never stop. The core state shows `agent: Down` |
+| Agent exits or crashes | untouched | the running update job, ping history (in memory), up to one minute of speed history and an in-flight helper action are lost (its job files are removed at the next agent start); an interrupted native (MSI) rollback is marked "interrupted" in the history at the next agent start; the window shows "helper service unavailable" for agent actions and ping | the watchdog restarts it after 1, 2, 4 ... 60 s; a run longer than 5 min resets the series; retries never stop. The core state shows `agent: Down` |
 | Agent hangs | untouched | same, and window calls to the agent time out (2 s send, 5 s reply) | `Hello` every 5 s with a 5 s timeout; after the agent has answered once, 3 misses in a row (about 30 s) make the watchdog terminate and restart it; a new agent has a 60 s start grace (no miss while its pipe is not open yet), and one that never answers within it is terminated and logged as "did not start" |
 | Agent leaks memory | untouched | none outside the agent | the Job object caps the process at 512 MiB; the leak becomes a crash and a restart |
 | Agent crash-loops after an update | untouched | updates, ping and statistics unavailable | restarts every 60 s without end; the first 5 exits and every 60th after are logged; there is no automatic rollback (it would restart the core). The owner reinstalls or rolls back |
 | Agent dies in the middle of an MSI | tunnels under `HoldNative` are not supervised | `msiexec` is not killed | the lease expires (15 min) and supervision reconnects the desired set |
 | Agent dies after replacing the engine DLLs, before `ReconnectEngine` | mode 2 tunnels keep running on the old DLL | `updates\after_change.json` keeps the owed request | the new agent re-sends `ReconnectEngine` on its first scheduler tick |
+| Power loss or agent kill in the middle of a file set swap (engine or app) | running tunnels untouched; after a reboot the set may be half old, half new | `updates\swap.json` holds the plan; new files were flushed to disk before it | the core at start (before tunnels and the `.old-` cleanup), the agent at start and `--install-core` replay the plan: forward if every new file is intact, otherwise back; see [Updates](updates.md#installing-the-engine-and-the-app) |
 | Core stops or crashes | tunnel services keep passing traffic; reconnecting dropped tunnels pauses | the agent is killed with the job (`KILL_ON_JOB_CLOSE`); the window shows "no connection to the core" after 2 failed polls | the service manager restarts the core after 5 s (restart on every failure); the first supervisor tick restores the desired set; once the pipe answers, the core starts a new agent |
 | Panic in an essential core thread | as above | the core stops with a failure code | same restart |
 | Panic while handling one request | untouched | that request gets an error reply | none needed |

@@ -24,7 +24,8 @@ When all are updated together, the order is Native, Engine, App (`ORDER`): the a
    for a small request and 30 min for a download. Limits: GitHub API answer 2 MiB, release notes cut to 2000 characters, manifest 64 KiB, MSI 64 MiB,
    a file of our release at most 256 MiB and at most its size in the manifest.
 5. Data in `C:\ProgramData\AmneziaWG UI Dark\updates`: `history.json`, `state.json` (last check result), `backups\`, `downloads\` (temporary, cleaned after
-   every job and at start), `logs\` (`msiexec` logs), `started.json` (a restore of AmneziaWG in progress), `after_change.json` (an engine reconnect not yet accepted by the core), `app\` (the new build for the window).
+   every job and at start), `logs\` (`msiexec` logs), `started.json` (a restore of AmneziaWG in progress), `restore\configs\` (the tunnel files of that
+   restore, kept until they are back in AmneziaWG's folder), `after_change.json` (an engine reconnect not yet accepted by the core), `swap.json` (a file set swap in progress, see [Installing the engine and the app](#installing-the-engine-and-the-app)), `app\` (the new build for the window).
 
 ## What a command does
 
@@ -83,15 +84,18 @@ Nothing is installed before every check below passes.
    2. Engine: both DLLs and the local manifest if there is one;
    3. App: the file set of the build and its version.
 2. The history (`history.json`, written through a temporary file so a cut write does not corrupt it) has rows `Backup`, `Update` and `Restore` with `from`, `to`,
-   success, error text and `prior_backup`. A corrupted file is reported in the event log and the history starts empty; rows with
-   impossible field combinations are repaired and each repair is logged.
+   success, error text and `prior_backup`. A file that cannot be parsed is moved aside as `history.json.unreadable-<date>` (the same for `state.json`),
+   reported in the event log with the new name, and the history starts empty: the rows with the backup names stay in the moved file instead of being
+   overwritten by the next job. Rows with impossible field combinations are repaired and each repair is logged.
 3. Limits, applied after every job and at start: at most 200 rows, at most 5 backups per component (the oldest by row number go first, **except** the backup made
    before the last update or restore of that component, which is never deleted), at most 20 `msiexec` logs. Backup folders of dropped rows are deleted.
 4. The **Restore** button of a row goes to (`src/update/restore_target.rs`; one rule for the window and for the command):
    1. a `Backup` row: its own copy;
    2. an `Update` row: the copy made right before the update (the "was" version);
    3. a `Restore` row: the copy of the version that restore replaced.
-   It is unavailable if the target version is already installed or its copy is no longer on disk.
+   It is unavailable if the target version is already installed or its copy is no longer on disk. An App row older than `0.5.0` (`MIN_APP_RESTORE`, the
+   first build with the agent) is refused with an explanation: such a core has no agent pipe, and this window talks to the agent for updates and tunnel
+   configs - after the restore the owner could neither roll forward nor edit tunnels from the window.
 
 ## Rollback
 
@@ -105,10 +109,18 @@ Nothing is installed before every check below passes.
    tunnel files are merged (the current set wins, files only the old copy has are added); the current version is uninstalled, the old one installed, the tunnels
    put back. If the old version does not install, the pre-restore copy is installed again with its tunnels (the message says "rolled back" or
    "rollback failed" with the copy's path). The history row is written **before** the work with a marker file; if the process stops in the middle, the row becomes an
-   "interrupted" error at the next start.
-4. While an MSI runs, the core takes the mode 1 tunnels off supervision (`HoldNative`, a lease of 15 minutes; the core picks the running and desired
-   tunnels itself) and gives them back afterwards (`Release`) whatever the outcome; if the core is unreachable or the lease cannot be taken, the MSI does
-   not start.
+   "interrupted" error at the next start. The merged tunnel files wait in `updates\restore\configs\` (not in `downloads\`, which every start cleans) until
+   they are back in AmneziaWG's folder; after an interrupted restore the next start of the agent copies them there itself when AmneziaWG is installed, and
+   otherwise keeps them and names the folder in the event log (install AmneziaWG, and the next start puts them back). Without this the supervisor, once the
+   lease ended, would find the tunnels without their files and drop them from the desired set. If a Windows installer is still running when the agent
+   starts (the `msiexec` of the dead agent lives in the core's job object and may still be uninstalling AmneziaWG; its registry row goes last), nothing is
+   copied: the uninstall would wipe the copied files and the staged folder would already be gone. The files wait, the log says so once, and the manager
+   retries on its 30 s tick until the installer has finished.
+4. While an MSI runs, the core takes the mode 1 tunnels off supervision (`HoldNative`, a lease of 15 minutes, renewed by a repeated `HoldNative` every
+   5 minutes while `msiexec` runs; the core picks the running and desired tunnels itself) and gives them back afterwards (`Release`) whatever the outcome;
+   if the core is unreachable or the lease cannot be taken, the MSI does not start. A failed renewal is a warning only (the lease still holds). `msiexec` is
+   waited for at most 60 minutes (the core's `MAX_LEASE`): then the job fails with an error naming the installer's log, the lease is released and the
+   process is left alone (a killed installer leaves a half-done transaction).
 5. The MSI closes the AmneziaWG window (the `amneziawg.exe` process in the user's session) at its very start, and AmneziaWG does not open it
    again. The core and the agent run as SYSTEM in session 0 and start no windows, so **the window of this program** reopens it
    (`src/app/native_reopen.rs`):
@@ -125,11 +137,24 @@ Nothing is installed before every check below passes.
 
 ## Installing the engine and the app
 
-1. **File set swap** (`src/update/ours/fileset.rs`): every file to replace is renamed to `<name>.old-<random>` (a loaded DLL and a running exe can be renamed),
-   the new one is copied in its place. Any error - everything put in place is removed, everything moved aside is returned; a file that cannot be returned is
-   renamed to `<name>.keep-<random>` and named in the error (`.keep-` files are never deleted). Leftover `.old-` files are removed at the next install and
-   service start.
-2. **App update**: the new `awg-ui.exe` is verified and swapped in the program folder; if the installed engine DLLs do not match the new manifest they are
+1. **File set swap** (`src/update/ours/fileset.rs`), in three phases so that a power loss or a killed agent at any point leaves a set that can be made whole:
+   1. every new file is copied next to its target as `<name>.new-<random>` and flushed to disk (`FlushFileBuffers`), its SHA-256 and size are taken from the copy;
+   2. the plan (folder, files, their `.new-` and `.old-` names, sums, files to remove) is written atomically to `updates\swap.json` (`src/update/journal.rs`,
+      a durable step journal shared by multi-step actions of the updates subsystem; `src/update/ours/swap.rs` holds the plan and its replay);
+   3. each file to replace is renamed to `<name>.old-<random>` (a loaded DLL and a running exe can be renamed) and its `.new-` copy is renamed into place; every
+      rename is write-through (`MOVEFILE_WRITE_THROUGH`), so after a power loss the disk holds the steps in order. The journal is removed when the set is in place.
+   Any error - everything put in place is removed, everything moved aside is returned, the journal is removed; a file that cannot be returned is renamed to
+   `<name>.keep-<random>` and named in the error (`.keep-` files are never deleted). A new swap is refused while a journal of an unfinished one exists.
+2. **Replay** (`swap::recover`): the core at its start (before tunnels, the agent and the cleanup of `.old-`), the agent at its start and `--install-core` read
+   `swap.json` and bring the set to a consistent state: **forward** if every new file is intact (in place or in `.new-`), otherwise **back** to the previous files;
+   if neither is possible (a previous file is missing or cannot be put back), the surviving previous files are kept as `.keep-`, the plan is removed and the event
+   log names them - the next update or a restore from a backup installs a full set again. Only when even that fails the plan stays and the next start tries
+   again. Replaying a consistent set changes nothing. The outcome is one event in the log. Leftover `.old-` and `.new-` files are removed at the next install and
+   service start, except the ones a pending plan still names. A `swap.json` that cannot be parsed is moved aside as `swap.json.unreadable-<date>`, the files
+   are left as they are and the `.old-`/`.new-` cleanup of that start is skipped: without the plan nobody knows which copy is the only good one, and the
+   `.old-` files next to the quarantined plan are the way back for a manual fix. The plan carries a `version` field (1) so that a build reading another
+   build's plan can tell it apart; new fields are added with defaults.
+3. **App update**: the new `awg-ui.exe` is verified and swapped in the program folder; if the installed engine DLLs do not match the new manifest they are
    downloaded and swapped in the same set; the manifest and signature are always installed with it. The build is also published for the window
    (`updates\app`, readable by the owner account), then a detached helper `awg-ui.exe --restart-core <replaced set>` is started outside the agent's job object
    (the agent dies with the core it restarts). If publishing or starting the helper fails, the set is rolled back and the core stays on the previous build.
@@ -138,11 +163,17 @@ Nothing is installed before every check below passes.
 
 `src/update/ours/fallback.rs`. The helper runs only as SYSTEM (otherwise exit code 2).
 
-1. After 2 s it stops the core service (waits up to 30 s) and starts it again: up to 4 attempts, 5 s apart, each waiting up to 30 s for the "running"
-   state, which the core reports only after its own pipe answers `Hello` with the same version.
+1. First it turns the service manager's restart-on-failure actions of the core service off and turns them back on at every exit (the core also re-applies them
+   when it reaches "running", `install::reapply_failure_actions`, in case the helper was killed): otherwise, after the first failed start of the new build, the
+   service manager would start it again on its own 5 s later - concurrently with the helper's retries, in the middle of the file rollback or the previous build
+   before the history is written. Then, after 2 s, it stops the core service (waits up to 30 s) and starts it again: up to 4 attempts, 5 s apart, each waiting
+   up to 30 s for the "running" state, which the core reports only after its own pipe answers `Hello` with the same version.
 2. If the pipe name is held by another program, the new build is not blamed (otherwise any program of the owner could roll an update back without UAC): up to
-   8 rounds of starts, about 10 minutes, are made; if the name does not free up, the core stays stopped on the new build and the service manager's failure
-   action or a reboot brings it up (code 10).
+   8 rounds of starts, about 10 minutes, are made; if the name does not free up, the core stays on the new build (code 10).
+   Whenever the helper would leave the core stopped (codes 7-10), it makes one more start after the failure actions are back on: every start before ran
+   with them paused, so a transient failure (an antivirus holding the just-renamed exe, a busy service manager) would otherwise leave the service stopped
+   until a reboot; now the failure lands under the service manager, which restarts the core every 5 s. The log says so. If that start succeeds the exit
+   code is 0 (new build) or 6 (previous build); a mixed set (8) keeps its code, since the set is not the one the history describes.
 3. If the new core does not start: stop it, **put the whole replaced set back** and start the previous build. Order: the new signed manifest moves aside
    first, then DLLs and exe one by one, then the previous manifest returns, so a mixed set never counts as trusted at any step, even if interrupted. The history
    gets the `Update` row as an error and a `Restore` row from the new version to the previous one, and the core's log gets the outcome. Exit codes: 0 new core

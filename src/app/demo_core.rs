@@ -36,7 +36,7 @@ impl CoreApi for DemoCore {
             // Родного окна и настроек ядра в демо нет: действия в окне, запись конфига и настройки ничего не делают.
             Request::Write { .. } | Request::Native(_) | Request::SetLanguage(_) | Request::SetPing { .. } => Ok(Response::Ok),
             // Хранилища режима 2, обновлений и смены режима в демо нет — как и без ядра.
-            other => Err(format!("demo: no core for {other:?}")),
+            other => Err(format!("demo: no core for {}", crate::explain::variant_name(&other))),
         }
     }
 }

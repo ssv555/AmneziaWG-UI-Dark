@@ -13,7 +13,7 @@ flowchart TB
   W["Window / app<br/>app/, tray, taskbar, shortcut, icon, groups, settings, elevated"]
   C["Core daemon<br/>daemon/ (server, retry, deadwatch, restore, netwatch, agent_watch, pipe, proto, install, service),<br/>backend, engine"]
   A["Agent<br/>daemon/agent/, update/, ping, stats, native"]
-  S["Shared libs<br/>monitor, events, health, store, archive, conf, uapi, win, scm,<br/>i18n, ini, fmt, fsutil, crash"]
+  S["Shared libs<br/>monitor, events, health, store, archive, conf, uapi, win, scm,<br/>i18n, ini, fmt, fsutil, explain, crash"]
 
   W --> C
   W --> A
@@ -30,7 +30,7 @@ flowchart TB
 
 ## Modules
 
-Edges to `i18n`, `ini`, `fmt`, `fsutil` and `crash` (used almost everywhere) are omitted. From `app` only the main edges are drawn; it also mentions `engine`, `events`, `stats`, `ping`, `tray`, `health`, `conf`, `uapi`, `win` and others directly.
+Edges to `i18n`, `ini`, `fmt`, `fsutil`, `explain` and `crash` (used almost everywhere) are omitted. From `app` only the main edges are drawn; it also mentions `engine`, `events`, `stats`, `ping`, `tray`, `health`, `conf`, `uapi`, `win` and others directly.
 
 ```mermaid
 flowchart LR

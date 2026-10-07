@@ -8,7 +8,7 @@
 //! Здесь только решения: что делать на очередном такте и что писать в журнал. Время — параметром, хост — снаружи
 //! (`server::Core::supervise_tick`): расписание проверяется тестами без часов и служб.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant};
 
 use super::deadwatch::{DeadTick, DeadWatch, Verdict};
@@ -38,6 +38,10 @@ pub(super) const MAX_LEASE: Duration = Duration::from_secs(60 * 60);
 /// пропал или завис, и установщик мог убрать службу уже после конца аренды. Туннель, который так и не заработал,
 /// остаётся «вернуть» и дольше — пока не подключится (`Retries::after_lease`).
 pub(super) const AFTER_LEASE: Duration = Duration::from_secs(30 * 60);
+/// Неявная аренда на время чужого установщика Windows (режим 1, служба желаемого туннеля пропала, пока идёт MSI не
+/// из наших обновлений — тот берёт аренду сам): продлевается каждый такт, пока установщик работает, и истекает через
+/// столько после его конца — тогда туннель возвращается, как после обычной истёкшей аренды.
+pub(super) const INSTALLER_GRACE: Duration = Duration::from_secs(15);
 
 /// Один туннель под надзором.
 #[derive(Debug, Clone)]
@@ -110,8 +114,17 @@ pub(super) struct Seen<'a> {
     pub stop_reason: &'a dyn Fn(&str) -> Option<String>,
     /// Службы туннелей принадлежат AmneziaWG (режим 1): их может удалить его родное окно.
     pub native_services: bool,
+    /// Идёт установщик Windows (чужой MSI может убирать службы туннелей режима 1); спрашивается только в режиме 1.
+    pub installer_running: &'a dyn Fn() -> bool,
     /// С прошлого такта менялась сеть.
     pub network_changed: bool,
+}
+
+/// Аренда: до какого момента и чья — держателя (`HoldNative`) или неявная, на время чужого установщика.
+#[derive(Debug, Clone, Copy)]
+struct Hold {
+    until: Instant,
+    installer: bool,
 }
 
 /// Итог такта.
@@ -127,6 +140,10 @@ pub(super) struct Tick {
     pub expired: Vec<String>,
     /// Аренда истекла, а у AmneziaWG туннеля больше нет (конфиг удалён): вернуть нечего, выходят из желаемого набора.
     pub gone: Vec<String>,
+    /// Служба пропала, пока идёт чужой установщик: взяты в неявную аренду до его конца (на этом такте — впервые).
+    pub installer_held: Vec<String>,
+    /// Чужой установщик закончил (неявная аренда истекла): надзор над ними снова идёт, попытка сразу.
+    pub installer_done: Vec<String>,
 }
 
 /// Что записать в журнал после попытки.
@@ -145,7 +162,11 @@ pub(super) enum Note {
 pub(super) struct Retries {
     tracks: BTreeMap<String, Track>,
     /// Туннели, снятые с надзора на время чужой работы над ними (установщик AmneziaWG), и когда аренда истекает.
-    holds: BTreeMap<String, Instant>,
+    holds: BTreeMap<String, Hold>,
+    /// Работавшие на прошлом такте (список работающих читался). Пропажа службы значит «отключён в окне AmneziaWG»
+    /// только для того, кого ядро само видело работающим: туннель, который не поднялся по команде или при перезапуске
+    /// мёртвого, службы не имеет по нашей вине, а не по воле пользователя.
+    up: BTreeSet<String>,
     /// Желаемые туннели, чья аренда истекла сама, и когда: их надо вернуть, а не считать отключёнными в окне AmneziaWG.
     /// Пометка снимается, когда туннель работает спустя `AFTER_LEASE`, выходит из набора или его берёт пользователь.
     after_lease: BTreeMap<String, Instant>,
@@ -159,7 +180,8 @@ pub(super) struct Retries {
 impl Retries {
     /// Очередной такт: кого взять под надзор, кого отпустить и кого подключать сейчас.
     pub(super) fn tick(&mut self, now: Instant, seen: &Seen) -> Tick {
-        let mut tick = Tick { expired: self.expire(now, seen), ..Tick::default() };
+        let (expired, installer_done) = self.expire(now, seen);
+        let mut tick = Tick { expired, installer_done, ..Tick::default() };
         if let Some(running) = seen.running {
             // Вышел из набора (отключён пользователем, удалён) — надзор не нужен; заработавший снимается с надзора,
             // только проработав `CONFIRM_FOR` (`watch`).
@@ -167,6 +189,7 @@ impl Retries {
             self.after_lease.retain(|t, at| seen.desired.contains(t) && (now < *at + AFTER_LEASE || !running.contains(t)));
             tick.gone = self.gone_after_lease(running, seen);
             tick.notes = self.watch(now, running, seen.stop_reason);
+            tick.installer_held = self.hold_for_installer(now, running, seen);
             let fresh: Vec<String> = seen
                 .desired
                 .iter()
@@ -181,9 +204,10 @@ impl Retries {
                     continue;
                 }
                 let exists = (seen.service_exists)(&t);
-                if self.started && seen.native_services && !exists {
+                if self.started && seen.native_services && !exists && self.up.contains(&t) {
                     // Работал и пропал вместе со службой — его отключили в окне AmneziaWG: поднимать обратно значило
-                    // бы спорить с пользователем.
+                    // бы спорить с пользователем. Только о том, кого ядро само видело работающим: не поднявшийся по
+                    // команде или при перезапуске мёртвого (`supervise_failed`) без службы по нашей вине.
                     tick.outside.push(t);
                     continue;
                 }
@@ -192,10 +216,16 @@ impl Retries {
                 let first_in = if !self.started && !exists { Duration::ZERO } else { FAST_EVERY };
                 self.tracks.insert(t, Track::new(now, first_in));
             }
+            self.up = running.iter().cloned().collect();
         }
         self.started = true;
         if seen.network_changed {
-            for track in self.tracks.values_mut() {
+            // Чужой установщик между «служба остановлена» и «служба удалена»: туннель без попыток, чья служба ещё
+            // есть, в аренду не взят (`hold_for_installer`), а смена сети от пропавшего адаптера подключала бы его
+            // прямо внутри транзакции MSI — та самая гонка. Ему остаётся обычный первый шаг; попытка уже была —
+            // установщик не при чём.
+            let installer = seen.native_services && self.tracks.values().any(|t| t.attempt == 0) && (seen.installer_running)();
+            for track in self.tracks.values_mut().filter(|t| !(installer && t.attempt == 0)) {
                 let earliest = track.last_try.map_or(now, |at| at + NETWORK_MIN_GAP);
                 track.next_at = track.next_at.min(earliest.max(now));
             }
@@ -212,9 +242,10 @@ impl Retries {
     /// Истёкшие аренды снимаются. Желаемый неработающий туннель сразу получает попытку, а все желаемые из истёкших
     /// помечаются «вернуть» (`after_lease`): иначе в режиме 1 туннель, чью службу убрал установщик (до конца аренды
     /// или, зависнув, после), такт счёл бы отключённым в окне AmneziaWG и вывел бы из набора — VPN не вернулся бы.
-    fn expire(&mut self, now: Instant, seen: &Seen) -> Vec<String> {
-        let expired: Vec<String> = self.holds.iter().filter(|(_, until)| **until <= now).map(|(t, _)| t.clone()).collect();
-        for t in &expired {
+    /// Возвращает истёкшие аренды держателей и истёкшие неявные (чужой установщик закончил) — отдельно, для журнала.
+    fn expire(&mut self, now: Instant, seen: &Seen) -> (Vec<String>, Vec<String>) {
+        let expired: Vec<(String, bool)> = self.holds.iter().filter(|(_, h)| h.until <= now).map(|(t, h)| (t.clone(), h.installer)).collect();
+        for (t, _) in &expired {
             self.holds.remove(t);
             if !seen.desired.contains(t) {
                 continue;
@@ -224,7 +255,36 @@ impl Retries {
                 self.restart(t, now);
             }
         }
-        expired
+        let (installer, holder): (Vec<_>, Vec<_>) = expired.into_iter().partition(|(_, installer)| *installer);
+        (holder.into_iter().map(|(t, _)| t).collect(), installer.into_iter().map(|(t, _)| t).collect())
+    }
+
+    /// Идёт чужой установщик Windows (наш берёт аренду сам — `hold`), а служба желаемого туннеля режима 1 пропала:
+    /// это не воля пользователя, но и ставить службу заново посреди установки нельзя — та же гонка с MSI, ради которой
+    /// есть аренда. Такой туннель берётся в неявную аренду на `INSTALLER_GRACE`; она продлевается каждый такт, пока
+    /// установщик работает, и истекает после его конца — тогда туннель возвращается (`expire`: пометка «вернуть»,
+    /// попытка сразу). Туннель, упавший сам при живой службе, идёт по обычному расписанию: чужая установка не повод
+    /// задерживать его подъём. Возвращает взятых впервые.
+    fn hold_for_installer(&mut self, now: Instant, running: &[String], seen: &Seen) -> Vec<String> {
+        if !seen.native_services || !(seen.installer_running)() {
+            return Vec::new();
+        }
+        let until = now + INSTALLER_GRACE;
+        for hold in self.holds.values_mut().filter(|h| h.installer) {
+            hold.until = until;
+        }
+        let mut taken = Vec::new();
+        for t in seen.desired {
+            if running.contains(t) || self.is_held(t) || (seen.pending)(t) || (seen.service_exists)(t) {
+                continue;
+            }
+            self.tracks.remove(t);
+            self.after_lease.remove(t);
+            self.dead.forget(t);
+            self.holds.insert(t.clone(), Hold { until, installer: true });
+            taken.push(t.clone());
+        }
+        taken
     }
 
     /// Помеченные «вернуть», которых у AmneziaWG больше нет (режим 1, туннель не работает, конфига нет): подключать
@@ -251,7 +311,8 @@ impl Retries {
             self.tracks.remove(t);
             self.after_lease.remove(t);
             self.dead.forget(t);
-            self.holds.insert(t.clone(), until);
+            // Поверх неявной аренды установщика: держатель объявился — срок и журнал теперь его.
+            self.holds.insert(t.clone(), Hold { until, installer: false });
         }
     }
 
@@ -335,6 +396,16 @@ impl Retries {
         self.tracks.insert(name.to_string(), Track::new(now, Duration::ZERO));
     }
 
+    /// Наше переключение желаемого туннеля не удалось (команда пользователя или перезапуск мёртвого): дальше его
+    /// поднимает надзор по обычному расписанию, первая попытка через `FAST_EVERY`. Без записи в журнал — ошибку уже
+    /// записал вызвавший. Иначе в режиме 1 туннель, оставшийся без службы по нашей вине (`/uninstalltunnelservice`
+    /// прошёл, `/installtunnelservice` — нет), следующий такт счёл бы отключённым в окне AmneziaWG и вывел из набора.
+    pub(super) fn supervise_failed(&mut self, name: &str, now: Instant, error: String) {
+        let mut track = Track::new(now, FAST_EVERY);
+        track.last_error = error;
+        self.tracks.insert(name.to_string(), track);
+    }
+
     /// Состояние для окна.
     pub(super) fn view(&self, now: Instant) -> BTreeMap<String, RetryState> {
         self.tracks
@@ -372,6 +443,8 @@ mod tests {
         /// Конфиги туннелей у AmneziaWG (режим 1); без конфига подключить нечем.
         configs: Vec<String>,
         native: bool,
+        /// Идёт чужой установщик Windows.
+        installer: bool,
         /// Подключение не проходит, пока не наступит этот момент.
         fails_until: Option<Instant>,
         /// Столько удачных запусков туннель встанет сразу (`tunnel.dll`: «работает», затем 1168 на настройке адресов).
@@ -380,6 +453,8 @@ mod tests {
         notes: Vec<(String, Note)>,
         outside: Vec<String>,
         gone: Vec<String>,
+        installer_held: Vec<String>,
+        installer_done: Vec<String>,
     }
 
     impl World {
@@ -390,12 +465,15 @@ mod tests {
                 services: vec![],
                 configs: desired.iter().map(|s| s.to_string()).collect(),
                 native: false,
+                installer: false,
                 fails_until: None,
                 dies_after_start: 0,
                 attempts: vec![],
                 notes: vec![],
                 outside: vec![],
                 gone: vec![],
+                installer_held: vec![],
+                installer_done: vec![],
             }
         }
 
@@ -403,6 +481,7 @@ mod tests {
         fn step(&mut self, r: &mut Retries, t0: Instant, now: Instant, network_changed: bool) {
             let services = self.services.clone();
             let configs = self.configs.clone();
+            let installer = self.installer;
             let seen = Seen {
                 desired: &self.desired,
                 running: Some(&self.running),
@@ -411,10 +490,13 @@ mod tests {
                 config_exists: &|t| configs.iter().any(|s| s.as_str() == t),
                 stop_reason: &|_| Some("код 1168".to_string()),
                 native_services: self.native,
+                installer_running: &|| installer,
                 network_changed,
             };
             let tick = r.tick(now, &seen);
             self.notes.extend(tick.notes);
+            self.installer_held.extend(tick.installer_held);
+            self.installer_done.extend(tick.installer_done);
             for t in tick.gone {
                 self.desired.retain(|d| *d != t);
                 self.gone.push(t);
@@ -657,6 +739,7 @@ mod tests {
             config_exists: &|_| panic!("вслепую не решаем"),
             stop_reason: &|_| panic!("вслепую не решаем"),
             native_services: true,
+            installer_running: &|| false,
             network_changed: false,
         };
         assert_eq!(r.tick(t0, &seen), Tick::default());
@@ -668,7 +751,7 @@ mod tests {
         let t0 = Instant::now();
         let mut r = Retries::default();
         let desired = vec!["a".to_string()];
-        let seen = Seen { desired: &desired, running: Some(&[]), pending: &|_| true, service_exists: &|_| false, config_exists: &|_| true, stop_reason: &|_| None, native_services: false, network_changed: false };
+        let seen = Seen { desired: &desired, running: Some(&[]), pending: &|_| true, service_exists: &|_| false, config_exists: &|_| true, stop_reason: &|_| None, native_services: false, installer_running: &|| false, network_changed: false };
         assert!(r.tick(t0, &seen).due.is_empty());
         assert!(r.view(t0).is_empty());
         // Снятый пользователем надзор: исход попытки, начатой до его команды, ничего не записывает.
@@ -706,6 +789,7 @@ mod tests {
             config_exists: &|_| true,
             stop_reason: &|_| None,
             native_services: true,
+            installer_running: &|| false,
             network_changed: false,
         };
         let tick = r.tick(t0 + Duration::from_secs(910), &seen);
@@ -724,7 +808,7 @@ mod tests {
         assert_eq!(r.release(&["a".to_string(), "c".to_string()]), ["a"], "не взятый в аренду не возвращается");
         assert!(r.release(&["a".to_string()]).is_empty(), "вторая отдача той же аренды — пусто");
         let desired = vec!["b".to_string()];
-        let seen = Seen { desired: &desired, running: Some(&[]), pending: &|_| false, service_exists: &|_| true, config_exists: &|_| true, stop_reason: &|_| None, native_services: false, network_changed: false };
+        let seen = Seen { desired: &desired, running: Some(&[]), pending: &|_| false, service_exists: &|_| true, config_exists: &|_| true, stop_reason: &|_| None, native_services: false, installer_running: &|| false, network_changed: false };
         assert!(r.tick(t0 + MAX_LEASE - TICK, &seen).due.is_empty(), "аренда ещё идёт");
         let tick = r.tick(t0 + MAX_LEASE, &seen);
         assert_eq!((tick.expired, tick.due), (vec!["b".to_string()], vec!["b".to_string()]), "аренда не длиннее MAX_LEASE");
@@ -738,7 +822,7 @@ mod tests {
         r.hold(&["a".to_string()], t0, Duration::from_secs(60));
         r.restart("a", t0);
         let desired = vec!["a".to_string()];
-        let seen = Seen { desired: &desired, running: Some(&[]), pending: &|_| false, service_exists: &|_| true, config_exists: &|_| true, stop_reason: &|_| None, native_services: false, network_changed: false };
+        let seen = Seen { desired: &desired, running: Some(&[]), pending: &|_| false, service_exists: &|_| true, config_exists: &|_| true, stop_reason: &|_| None, native_services: false, installer_running: &|| false, network_changed: false };
         assert!(r.tick(t0, &seen).due.is_empty());
     }
 
@@ -844,5 +928,160 @@ mod tests {
         w.run(&mut r, t0, 80, 82);
         assert_eq!(w.outside, ["office"]);
         assert!(w.attempts.is_empty());
+    }
+
+    /// Режим 1: наше переключение сорвалось и оставило туннель без службы (`/uninstalltunnelservice` прошёл,
+    /// `/installtunnelservice` — нет) — перезапуск мёртвого или команда пользователя. Это не отключение в окне
+    /// AmneziaWG: туннель остаётся желаемым и поднимается по расписанию, а не выходит из набора.
+    #[test]
+    fn failed_switch_of_our_own_keeps_the_tunnel_desired_and_supervised() {
+        let t0 = Instant::now();
+        let mut r = Retries::default();
+        let mut w = World::new(&["office"]);
+        w.native = true;
+        w.running = vec!["office".into()];
+        w.services = vec!["office".into()];
+        w.run(&mut r, t0, 0, 5);
+        // Перезапуск мёртвого на 5-й секунде: служба снята, новая не встала; AmneziaWG не даёт поставить её до 20 с.
+        w.running.clear();
+        w.services.clear();
+        r.supervise_failed("office", t0 + Duration::from_secs(5), "install failed".into());
+        w.fails_until = Some(t0 + Duration::from_secs(20));
+        w.run(&mut r, t0, 5, 40);
+        assert!(w.outside.is_empty(), "не отключение в окне AmneziaWG: {:?}", w.outside);
+        assert_eq!(w.desired, ["office"]);
+        assert_eq!(w.attempt_secs(), [15, 25], "первая попытка через 10 с после срыва, дальше по расписанию");
+        assert_eq!(w.notes[0], ("office".to_string(), Note::Failed { attempt: 1, error: "Element not found".into() }), "сам срыв в журнал не пишется — его записал вызвавший");
+        assert_eq!(w.running, ["office"]);
+        assert!(matches!(w.notes.last(), Some((_, Note::Connected { attempts: 2 }))), "{:?}", w.notes);
+
+        // Команда пользователя: подключить новый туннель; `/installtunnelservice` не прошёл, службы нет.
+        let mut r = Retries::default();
+        let mut w = World::new(&[]);
+        w.native = true;
+        w.run(&mut r, t0, 0, 3);
+        w.desired.push("lab".into());
+        w.configs.push("lab".into());
+        r.forget("lab");
+        r.supervise_failed("lab", t0 + Duration::from_secs(3), "no config".into());
+        w.run(&mut r, t0, 3, 14);
+        assert!(w.outside.is_empty(), "{:?}", w.outside);
+        assert_eq!(w.attempt_secs(), [13]);
+        assert_eq!(w.running, ["lab"]);
+    }
+
+    /// Пропажа службы значит «отключён в окне AmneziaWG» только для туннеля, который ядро само видело работающим:
+    /// желаемый без службы, которого оно работающим не видело (команда над ним снялась, а след не оставила), берётся
+    /// под надзор, а не выводится из набора.
+    #[test]
+    fn tunnel_the_core_never_saw_running_is_not_taken_for_removed_in_the_native_window() {
+        let t0 = Instant::now();
+        let mut r = Retries::default();
+        let mut w = World::new(&["office"]);
+        w.native = true;
+        w.fails_until = Some(t0 + Duration::from_secs(1_000_000));
+        w.run(&mut r, t0, 0, 3);
+        assert_eq!(w.attempt_secs(), [0]);
+        r.forget("office");
+        w.run(&mut r, t0, 3, 20);
+        assert!(w.outside.is_empty(), "{:?}", w.outside);
+        assert_eq!(w.attempt_secs(), [0, 13], "снова под надзором: попытка через обычный шаг");
+    }
+
+    /// Чужой установщик Windows (MSI AmneziaWG не из наших обновлений) убирает службы туннелей режима 1. Пока он
+    /// идёт, туннели без службы не выводятся из набора и не ставятся заново (гонка с MSI); упавший сам при живой службе
+    /// поднимается по обычному расписанию. Установщик закончил — спустя `INSTALLER_GRACE` оба возвращаются сразу.
+    #[test]
+    fn services_removed_by_a_foreign_installer_are_held_until_it_finishes_then_reconnected() {
+        let t0 = Instant::now();
+        let mut r = Retries::default();
+        let mut w = World::new(&["office", "home", "lab"]);
+        w.native = true;
+        w.running = vec!["office".into(), "home".into(), "lab".into()];
+        w.services = w.running.clone();
+        w.run(&mut r, t0, 0, 5);
+        // MSI работает 2 минуты и убирает службы «office» и «home»; «lab» упал сам, его служба на месте.
+        w.installer = true;
+        w.running.clear();
+        w.services.retain(|s| s == "lab");
+        w.run(&mut r, t0, 5, 125);
+        assert!(w.outside.is_empty(), "{:?}", w.outside);
+        assert_eq!(w.installer_held, ["office", "home"]);
+        assert_eq!(w.attempts, [("lab".to_string(), Duration::from_secs(15))], "упавший сам при живой службе чужой установки не ждёт");
+        assert_eq!(w.running, ["lab"]);
+        assert!(r.is_held("office") && r.is_held("home") && !r.is_held("lab"));
+        assert_eq!(w.desired, ["office", "home", "lab"]);
+
+        let done_at = 124 + INSTALLER_GRACE.as_secs();
+        w.installer = false;
+        w.run(&mut r, t0, 125, done_at);
+        assert_eq!(w.attempts.len(), 1, "пауза после установщика ещё идёт: {:?}", w.attempts);
+        assert!(w.installer_done.is_empty());
+        w.run(&mut r, t0, done_at, done_at + 1 + CONFIRM_FOR.as_secs());
+        assert_eq!(w.installer_done, ["home", "office"]);
+        assert_eq!(w.attempt_secs()[1..], [done_at, done_at], "оба — сразу по истечении");
+        assert_eq!(w.running, ["lab", "home", "office"]);
+        assert_eq!(w.services, ["lab", "home", "office"], "`connect` ставит службы из конфигов");
+        let connected = w.notes.iter().filter(|(_, n)| matches!(n, Note::Connected { attempts: 1 })).count();
+        assert_eq!(connected, 3, "{:?}", w.notes);
+        assert!(r.view(t0).is_empty());
+    }
+
+    /// Чужой MSI между «служба остановлена» и «служба удалена»: служба ещё есть, в аренду туннель не взят, а пропавший
+    /// адаптер даёт смену сети. Внеочередной попытки нет (она шла бы внутри транзакции установщика) — только обычный
+    /// первый шаг; туннель с попытками за спиной смена сети поднимает как всегда, установщик не при чём.
+    #[test]
+    fn network_change_during_a_foreign_installer_does_not_rush_a_fresh_track() {
+        let t0 = Instant::now();
+        let mut r = Retries::default();
+        let mut w = World::new(&["office", "lab"]);
+        w.native = true;
+        w.running = vec!["office".into(), "lab".into()];
+        w.services = w.running.clone();
+        w.run(&mut r, t0, 0, 5);
+        // «lab» упал сам раньше и уже пробовался; «office» останавливает MSI, его служба пока на месте.
+        w.running.retain(|t| t != "lab");
+        w.run(&mut r, t0, 5, 20);
+        assert_eq!(w.attempts.len(), 1, "{:?}", w.attempts);
+        w.installer = true;
+        w.running.clear();
+        w.step(&mut r, t0, t0 + Duration::from_secs(20), false);
+        w.step(&mut r, t0, t0 + Duration::from_secs(21), true);
+        assert!(w.attempts.iter().all(|(t, _)| t == "lab"), "по смене сети под установщиком — только «lab»: {:?}", w.attempts);
+        assert_eq!(w.attempts.len(), 2, "{:?}", w.attempts);
+        assert!(w.installer_held.is_empty(), "служба есть — в аренду не берётся");
+        // Без установщика та же смена сети подключает свежий туннель сразу.
+        let mut r = Retries::default();
+        let mut w = World::new(&["office"]);
+        w.native = true;
+        w.running = vec!["office".into()];
+        w.services = w.running.clone();
+        w.run(&mut r, t0, 0, 5);
+        w.running.clear();
+        w.step(&mut r, t0, t0 + Duration::from_secs(5), false);
+        w.step(&mut r, t0, t0 + Duration::from_secs(6), true);
+        assert_eq!(w.attempt_secs(), [6]);
+    }
+
+    /// Наш установщик берёт аренду сам (`HoldNative`): неявная аренда поверх неё не ставится, срок — держателя.
+    #[test]
+    fn own_installer_lease_is_not_replaced_by_the_implicit_one() {
+        let t0 = Instant::now();
+        let mut r = Retries::default();
+        let mut w = World::new(&["office"]);
+        w.native = true;
+        w.running = vec!["office".into()];
+        w.services = vec!["office".into()];
+        w.run(&mut r, t0, 0, 5);
+        r.hold(&["office".to_string()], t0 + Duration::from_secs(5), Duration::from_secs(900));
+        w.installer = true;
+        w.running.clear();
+        w.services.clear();
+        w.run(&mut r, t0, 5, 60);
+        assert!(w.installer_held.is_empty());
+        w.installer = false;
+        w.run(&mut r, t0, 60, 200);
+        assert!(w.attempts.is_empty() && w.installer_done.is_empty(), "срок аренды держателя — 900 с, не INSTALLER_GRACE");
+        assert_eq!(r.release(&["office".to_string()]), ["office"]);
     }
 }

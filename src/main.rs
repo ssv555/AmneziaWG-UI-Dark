@@ -9,6 +9,7 @@ mod daemon;
 mod elevated;
 mod engine;
 mod events;
+mod explain;
 mod fmt;
 mod fsutil;
 mod groups;
@@ -77,10 +78,12 @@ fn main() {
     }
     // Перезапуск ядра после обновления сборки (его запускает само ядро, от SYSTEM).
     if has(update::ours::RESTART_FLAG) {
+        daemon::use_core_language();
         std::process::exit(update::ours::restart_core());
     }
     // Помощник ядра в сеансе пользователя: действие в родном окне AmneziaWG.
     if let Some(task) = value(daemon::helper::FLAG) {
+        daemon::use_core_language();
         std::process::exit(daemon::helper::main(std::path::Path::new(&task)));
     }
     let demo = has("--demo");
@@ -287,11 +290,11 @@ fn main() {
     let mut viewport = eframe::egui::ViewportBuilder::default()
         .with_title(window_title())
         .with_inner_size([1280.0, 800.0])
-        .with_min_inner_size([760.0, 480.0])
+        .with_min_inner_size(settings::MIN_WINDOW)
         .with_icon(eframe::egui::IconData { rgba: icon::themed(64, settings.mode() == settings::Mode::Engine), width: 64, height: 64 })
         .with_maximized(settings.maximized);
     if let Some(w) = settings.window {
-        viewport = viewport.with_inner_size([w.width.max(760.0), w.height.max(480.0)]);
+        viewport = viewport.with_inner_size([w.width.max(settings::MIN_WINDOW[0]), w.height.max(settings::MIN_WINDOW[1])]);
         if win::on_screen(w.x, w.y) {
             viewport = viewport.with_position([w.x, w.y]);
         }

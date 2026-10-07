@@ -112,7 +112,7 @@ impl AgentApi for AgentPipe {
 fn unexpected(r: AgentResponse) -> String {
     match r {
         AgentResponse::Err(e) | AgentResponse::Refused(e) => e,
-        other => format!("agent: unexpected answer {other:?}"),
+        other => crate::i18n::trf("err.helper_unexpected", &[&crate::explain::variant_name(&other)]),
     }
 }
 

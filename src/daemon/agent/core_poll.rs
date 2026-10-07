@@ -85,7 +85,7 @@ fn fetch_core_state(events_after: u64) -> Result<CoreState, String> {
     match crate::daemon::pipe::call_to(crate::daemon::pipe::NAME, &Request::State { events_after }, TIMEOUTS)? {
         Response::State(state) => Ok(*state),
         Response::Err(e) | Response::Refused(e) => Err(e),
-        other => Err(format!("core: unexpected answer {other:?}")),
+        other => Err(crate::i18n::trf("err.core_unexpected", &[&crate::explain::variant_name(&other)])),
     }
 }
 

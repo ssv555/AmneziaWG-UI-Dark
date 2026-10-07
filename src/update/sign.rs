@@ -83,25 +83,33 @@ pub fn manifest_with_key(json: &[u8], armored_sig: &str, public_key: &str) -> Re
 /// Размер и SHA-256 файла совпадают с записью манифеста.
 #[cfg_attr(not(test), allow(dead_code))]
 pub fn check_file(path: &Path, entry: &FileEntry) -> Result<(), String> {
-    let mut f = std::fs::File::open(path).map_err(|e| crate::fsutil::io_ctx(&path, e))?;
-    let size = f.metadata().map_err(|e| crate::fsutil::io_ctx(&path, e))?.len();
+    let size = std::fs::metadata(path).map_err(|e| crate::fsutil::io_ctx(&path, e))?.len();
     if size != entry.size {
         return Err(format!("{}: размер {size}, ожидался {}", entry.name, entry.size));
     }
+    let (hash, _) = file_digest(path)?;
+    if hash != entry.sha256 {
+        return Err(format!("{}: SHA-256 {hash}, ожидалась {}", entry.name, entry.sha256));
+    }
+    Ok(())
+}
+
+/// SHA-256 (64 строчных hex-цифр) и размер файла, прочитанного кусками: файлы релиза бывают десятки мегабайт, в
+/// памяти целиком они не нужны. Одна реализация для проверки по манифесту и для журнала замены файлов.
+pub fn file_digest(path: &Path) -> Result<(String, u64), String> {
+    let mut f = std::fs::File::open(path).map_err(|e| crate::fsutil::io_ctx(&path, e))?;
     let mut hasher = Sha256::new();
     let mut buf = vec![0u8; 64 * 1024];
+    let mut size = 0u64;
     loop {
         let n = f.read(&mut buf).map_err(|e| crate::fsutil::io_ctx(&path, e))?;
         if n == 0 {
             break;
         }
+        size += n as u64;
         hasher.update(&buf[..n]);
     }
-    let hash = hex(&hasher.finalize());
-    if hash != entry.sha256 {
-        return Err(format!("{}: SHA-256 {hash}, ожидалась {}", entry.name, entry.sha256));
-    }
-    Ok(())
+    Ok((hex(&hasher.finalize()), size))
 }
 
 /// Проверка подписи SSHSIG (`-----BEGIN SSH SIGNATURE-----`) над `message` ключом `public_key`

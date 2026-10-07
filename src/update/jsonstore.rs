@@ -32,14 +32,26 @@ pub(super) fn load_json<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T
     serde_json::from_slice(&text).map_err(|e| crate::fsutil::io_ctx(&path, e))
 }
 
-/// Нет файла — пусто; испорчен — пусто и событие в журнале (иначе потеря истории прошла бы молча).
+/// Нет файла — пусто; испорчен — файл отодвигается (`set_aside`), пусто и событие в журнале: иначе следующая запись
+/// затёрла бы его молча.
 pub(super) fn load_or_default<T: serde::de::DeserializeOwned + Default>(path: &Path, shared: &Shared) -> T {
     load_json(path).unwrap_or_else(|e| {
         if path.exists() {
-            shared.log("", Severity::Bad, &e);
+            shared.log("", Severity::Bad, &set_aside(path, &e));
         }
         T::default()
     })
+}
+
+/// Нечитаемый файл хранилища `path` (ошибка чтения `error`) отодвигается в `<имя>.unreadable-<дата>` рядом, как
+/// файлы настроек (`ini::quarantine`): его можно разобрать или вернуть, а новый файл начинается пустым. Возвращает
+/// текст для журнала — с новым именем либо с причиной, почему отодвинуть не вышло (тогда следующая запись его затрёт).
+pub(super) fn set_aside(path: &Path, error: &str) -> String {
+    let name = path.display().to_string();
+    match crate::ini::quarantine(path) {
+        Ok(to) => crate::i18n::trf("updm.unreadable", &[&name, error, &to.display().to_string()]),
+        Err(why) => crate::i18n::trf("updm.unreadable_kept", &[&name, error, &why]),
+    }
 }
 
 /// Запись через временный файл: оборванная запись не портит прежний.

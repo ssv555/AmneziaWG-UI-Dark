@@ -20,10 +20,10 @@ use super::component::{ComponentOps, Components, Journal, RestoreJob};
 use super::core_link::CoreLink;
 use super::sources::{GithubSources, OursError, Sources};
 use super::{Action, Component, HistoryEntry, NativeUiMark, UpdateOp, UpdatesState, ORDER};
-use super::jsonstore::{load_json, load_or_default, rotate_logs, safe_name, save_json};
+use super::jsonstore::{load_json, load_or_default, rotate_logs, safe_name, save_json, set_aside};
 use super::backup::{BackupInfo, BACKUP_INFO};
 use super::busy::Busy;
-use super::history::{entry, History};
+use super::history::{entry, History, HISTORY};
 use super::restore_target::{offers as restore_offers, resolve as resolve_restore, RestoreBlock};
 use super::rows::{
     apply_order, available_rows, check_confirmed, deserialize_results, prune_released, remember_found, remember, rows, to_announce,
@@ -138,9 +138,10 @@ impl Manager {
 
     /// Менеджер над хранилищем `dir`, без фоновой проверки.
     fn open(dir: PathBuf, shared: Arc<Shared>, components: Components, sources: Arc<dyn Sources>, clock: Arc<dyn Clock>) -> Manager {
-        // Испорченная история — пусто и событие в журнале (как `load_or_default`): ядро должно запуститься.
+        // Испорченная история — файл отодвигается, история пустая, событие в журнале (как `load_or_default`): ядро
+        // должно запуститься, а строки с именами копий не должны пропасть под следующей записью.
         let mut history = History::open(&dir).unwrap_or_else(|e| {
-            shared.log("", Severity::Bad, &e);
+            shared.log("", Severity::Bad, &set_aside(&dir.join(HISTORY), &e));
             History::empty(&dir)
         });
         for fixed in history.repair() {
@@ -158,9 +159,46 @@ impl Manager {
         // Остаток загрузок после сбоя или после перезапуска ядра при обновлении программы.
         m.clean_downloads();
         m.mark_interrupted();
+        m.recover_components();
         m.tidy();
         m.announce_owed();
         m
+    }
+
+    /// Менеджер над временной папкой `dir` с заданными компонентами (подделками), без сети и без фоновой проверки.
+    #[cfg(test)]
+    pub(super) fn for_tests(dir: &std::path::Path, components: Components) -> Arc<Manager> {
+        let options = crate::monitor::Options { ping: false, ping_host: String::new(), notify: false, tray: false, taskbar: false };
+        let shared = Arc::new(Shared::new(None, options, None));
+        Arc::new(Manager::open(dir.to_path_buf(), shared, components, Arc::new(super::sources::fake::FakeSources::down()), Arc::new(super::clock::fake::FakeClock::new(1_000))))
+    }
+
+    /// Остатки работ, оборванных смертью процесса (у AmneziaWG — туннели возврата, не вернувшиеся в его папку):
+    /// каждый компонент доделывает своё, итог — в журнал. Ошибка доделки — событие, не остановка: менеджер нужен и
+    /// без неё, а остаток лежит до следующего запуска.
+    fn recover_components(&self) {
+        for c in ORDER {
+            self.recover_component(c);
+        }
+    }
+
+    fn recover_component(&self, c: Component) {
+        match self.ops(c).recover(self) {
+            Ok(lines) => lines.iter().for_each(|l| self.shared.log("", Severity::Warn, l)),
+            Err(e) => self.shared.log("", Severity::Bad, &trf("updm.recover_failed", &[&self.name(c), &e])),
+        }
+    }
+
+    /// Доделка, которую компонент отложил при открытии (у AmneziaWG — пока шёл установщик Windows): повтор на такте
+    /// планировщика, пока компонент не доделает или не отложит снова. Идёт работа — пропуск: она сама распорядится
+    /// остатком.
+    fn retry_deferred_recovery(&self) {
+        if lock(&self.busy).is_some() {
+            return;
+        }
+        for c in ORDER.into_iter().filter(|c| self.ops(*c).recover_deferred()) {
+            self.recover_component(c);
+        }
     }
 
     /// Прошлый запуск не довёл шаг после замены: строка в журнал. Сам повтор — на такте планировщика (`settle_owed`),
@@ -395,6 +433,7 @@ impl Manager {
     /// сутки. Занято другой работой — шаг пропускается, `first` не меняется. Возвращает, была ли проверка.
     fn daily_tick(&self, first: &mut bool) -> bool {
         self.settle_owed();
+        self.retry_deferred_recovery();
         let checked = lock(&self.data).saved.checked_at;
         if !check_due(*first, self.clock.uptime(), checked, self.clock.now()) || !self.begin(Busy::Checking) {
             return false;
@@ -403,6 +442,22 @@ impl Manager {
         self.isolated(|| drop(self.check()));
         *first = false;
         true
+    }
+
+    /// Сбой проверки компонента: в таблице окна — фраза (`upd.st_failed`), технический текст — здесь, в журнале.
+    /// Один источник на два компонента (наш релиз: движок и программа) — одна запись с обоими именами.
+    fn log_check_failures(&self, results: &[CheckResult]) {
+        let mut failed: Vec<(&str, Vec<String>)> = Vec::new();
+        for r in results.iter().filter(|r| !r.manual_only) {
+            let Some(e) = r.error.as_deref() else { continue };
+            match failed.iter_mut().find(|(seen, _)| *seen == e) {
+                Some((_, names)) => names.push(self.name(r.component)),
+                None => failed.push((e, vec![self.name(r.component)])),
+            }
+        }
+        for (e, names) in failed {
+            self.shared.log("", Severity::Warn, &crate::explain::log_line(&trf("updm.check_failed", &[&names.join(", ")]), e));
+        }
     }
 
     /// Запрос источников; результат — в `state.json`, о новых версиях — по одному событию в журнал.
@@ -416,6 +471,7 @@ impl Manager {
         }
         let installed = self.installed();
         let results = available_rows(&fetched);
+        self.log_check_failures(&results);
         let released = self.release_dates(&fetched, &results, &installed);
         let news = {
             let mut data = lock(&self.data);
@@ -538,6 +594,7 @@ impl Manager {
         let name = match resolved {
             Some(Ok(target)) => target.backup,
             Some(Err(RestoreBlock::Installed)) => return Err(tr("updm.already_installed")),
+            Some(Err(RestoreBlock::TooOld)) => return Err(trf("upd.restore_too_old", &[super::restore_target::MIN_APP_RESTORE])),
             Some(Err(RestoreBlock::NoCopy)) | None => return Err(tr("updm.no_backup")),
         };
         let info: BackupInfo = load_json(&self.dir.join(BACKUPS).join(&name).join(BACKUP_INFO))
@@ -714,9 +771,7 @@ mod tests {
 
     /// Менеджер с заданными компонентами (обычно подделками `FakeOps`); источники недоступны.
     fn with_ops(dir: &Path, components: Components) -> Arc<Manager> {
-        let options = Options { ping: false, ping_host: String::new(), notify: false, tray: false, taskbar: false };
-        let shared = Arc::new(Shared::new(None, options, None));
-        Arc::new(Manager::open(dir.to_path_buf(), shared, components, Arc::new(FakeSources::down()), Arc::new(FakeClock::new(1_000))))
+        Manager::for_tests(dir, components)
     }
 
     /// Компоненты, у которых версию из проверки находит настоящая реализация, а установлены — `installed`
@@ -847,11 +902,13 @@ mod tests {
             assert_eq!((r.error.as_deref(), r.available.is_none()), (Some("offline"), true), "{c:?}");
         }
         assert_eq!(lock(&m.data).saved.checked_at, Some(1_000), "проверка с ошибками — тоже проверка: повтор не раньше чем через сутки");
-        assert_eq!(
-            logged(&m).iter().filter(|(_, t)| t.contains("offline")).collect::<Vec<_>>(),
-            [&(Severity::Warn, trf("updm.upstream_failed", &["offline"]))],
-            "ошибки AmneziaWG и наших релизов видны в таблице, не в журнале; в журнале — только сбой проверки метки движка"
-        );
+        // В таблице окна — фраза «Не удалось проверить», технический текст — в журнале: одна запись на источник
+        // (все компоненты с той же ошибкой — в одной), плюс сбой проверки метки движка.
+        let offline: Vec<(Severity, String)> = logged(&m).into_iter().filter(|(_, t)| t.contains("offline")).collect();
+        assert_eq!(offline.len(), 2, "{offline:?}");
+        assert!(offline.contains(&(Severity::Warn, trf("updm.upstream_failed", &["offline"]))), "{offline:?}");
+        let prefix = trf("updm.check_failed", &[""]);
+        assert!(offline.iter().any(|(s, t)| *s == Severity::Warn && t.starts_with(&prefix) && t.ends_with("(offline)")), "{offline:?}");
         assert!(lock(&m.busy).is_some(), "check сам занятость не снимает — это делает JobDone");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1451,6 +1508,80 @@ mod tests {
         assert_eq!(m.restore_target(2), Ok(("2-engine-1".to_string(), BackupInfo { component: Component::Engine, version: "1".into() })));
         assert_eq!(m.restore_target(2), m.restore_target(2), "правило одно");
         assert!(lock(&m.busy).is_none(), "отказ не занимает менеджер");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Нечитаемая `history.json` (другой формат после возврата к другой сборке, сбой диска) не затирается следующей
+    /// записью: файл отодвигается в `history.json.unreadable-<дата>` с событием в журнале, история начинается пустой;
+    /// строки с именами копий остаются в отодвинутом файле. То же с `state.json`.
+    #[test]
+    fn unreadable_history_and_state_are_moved_aside_not_overwritten() {
+        let dir = temp("history-corrupt");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(HISTORY), "{broken").unwrap();
+        std::fs::write(dir.join(STATE), "[nope").unwrap();
+        let m = manager(&dir);
+        m.record(hist(1, Component::Engine, Action::Update, Some("2"), None));
+        let aside = |name: &str| -> Vec<PathBuf> {
+            std::fs::read_dir(&dir).unwrap().flatten().map(|e| e.path()).filter(|p| p.file_name().unwrap().to_string_lossy().starts_with(&format!("{name}.unreadable-"))).collect()
+        };
+        let (h, s) = (aside(HISTORY), aside(STATE));
+        assert_eq!((h.len(), s.len()), (1, 1), "{:?}", names_in(&dir));
+        assert_eq!(std::fs::read_to_string(&h[0]).unwrap(), "{broken", "исходное содержимое цело");
+        assert_eq!(std::fs::read_to_string(&s[0]).unwrap(), "[nope");
+        assert_eq!(History::open(&dir).unwrap().entries().len(), 1, "новая история — только новая строка");
+        let logged = logged(&m);
+        for p in [&h[0], &s[0]] {
+            let name = p.display().to_string();
+            assert!(logged.iter().any(|(sev, t)| *sev == Severity::Bad && t.contains(&name)), "{name}: {logged:?}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn names_in(dir: &Path) -> Vec<String> {
+        std::fs::read_dir(dir).unwrap().flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect()
+    }
+
+    /// При открытии каждый компонент доделывает остатки своей оборванной работы (`recover`), после отметки «прервано».
+    #[test]
+    fn open_lets_every_component_recover_its_leftovers() {
+        let dir = temp("recover");
+        let calls = Calls::default();
+        let comps = components(
+            FakeOps::new(Component::Native, Some("1"), "1", &calls).record_recover(),
+            FakeOps::new(Component::Engine, Some("1"), "1", &calls).record_recover(),
+            FakeOps::new(Component::App, Some("1"), "1", &calls).record_recover(),
+        );
+        let _m = with_ops(&dir, comps);
+        assert_eq!(*calls.lock().unwrap(), ["recover Native", "recover Engine", "recover App"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Доделку, отложенную компонентом при открытии (у AmneziaWG — шёл установщик Windows), такт планировщика
+    /// повторяет, пока компонент держит отметку; другие компоненты не трогаются, идущая работа — пропуск.
+    #[test]
+    fn deferred_recovery_is_retried_on_the_tick() {
+        let dir = temp("recover-deferred");
+        let calls = Calls::default();
+        let deferred = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let comps = components(
+            FakeOps::new(Component::Native, Some("1"), "1", &calls).record_recover().deferred_by(deferred.clone()),
+            FakeOps::new(Component::Engine, Some("1"), "1", &calls).record_recover(),
+            FakeOps::new(Component::App, Some("1"), "1", &calls).record_recover(),
+        );
+        let m = with_ops(&dir, comps);
+        let recovers = || calls.lock().unwrap().iter().filter(|c| c.starts_with("recover ")).cloned().collect::<Vec<_>>();
+        assert_eq!(recovers(), ["recover Native", "recover Engine", "recover App"]);
+        let mut first = true;
+        m.daily_tick(&mut first);
+        assert_eq!(recovers(), ["recover Native", "recover Engine", "recover App", "recover Native"], "повтор — только отложенного");
+        assert!(m.begin(Busy::Checking));
+        m.daily_tick(&mut first);
+        assert_eq!(recovers().len(), 4, "идёт работа — повтора нет");
+        lock(&m.busy).take();
+        deferred.store(false, std::sync::atomic::Ordering::SeqCst);
+        m.daily_tick(&mut first);
+        assert_eq!(recovers().len(), 4, "доделано — повторов больше нет");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

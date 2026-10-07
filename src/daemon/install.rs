@@ -8,8 +8,8 @@ use std::time::Duration;
 
 use windows_sys::Win32::System::Services::{
     ChangeServiceConfig2W, ChangeServiceConfigW, CreateServiceW, SC_ACTION, SC_ACTION_RESTART, SERVICE_ALL_ACCESS,
-    SERVICE_AUTO_START, SERVICE_CONFIG_DESCRIPTION, SERVICE_DESCRIPTIONW, SERVICE_ERROR_NORMAL, SERVICE_NO_CHANGE,
-    SERVICE_WIN32_OWN_PROCESS,
+    SERVICE_AUTO_START, SERVICE_CHANGE_CONFIG, SERVICE_CONFIG_DESCRIPTION, SERVICE_DESCRIPTIONW, SERVICE_ERROR_NORMAL,
+    SERVICE_NO_CHANGE, SERVICE_WIN32_OWN_PROCESS,
 };
 
 use super::{data_dir, Config, DATA_SDDL, SERVICE, SERVICE_FLAG};
@@ -36,7 +36,10 @@ pub fn install(owner_sid: &str) -> Result<bool, String> {
     let src = exe.parent().map(Path::to_path_buf).unwrap_or_default();
     let dst = install_dir();
     std::fs::create_dir_all(&dst).map_err(|e| crate::fsutil::io_ctx(&dst, e))?;
-    remove_old_copies(&dst);
+    // Замена файлов, оборванная обновлением, доводится до уборки её `.old-`: иначе уборка снесла бы прежние файлы,
+    // по которым ещё можно вернуться.
+    let recovered = crate::update::ours::recover_swaps(&mut |severity, text| super::log_notice(super::events_file(), severity, text));
+    remove_old_copies_after(&dst, recovered);
     stop()?;
 
     // Файлы: exe всегда, DLL движка — если они есть и совпадают с вшитыми суммами (иначе режим 2 недоступен).
@@ -182,11 +185,49 @@ fn create_service(exe: &Path) -> Result<(), String> {
         let mut text = wide(&tr("core.service_desc"));
         let desc = SERVICE_DESCRIPTIONW { lpDescription: text.as_mut_ptr() };
         ChangeServiceConfig2W(svc.raw(), SERVICE_CONFIG_DESCRIPTION, (&desc as *const SERVICE_DESCRIPTIONW).cast());
-        // Упало — Windows поднимет снова через 5 секунд (сбросом счётчика раз в сутки). И не только при падении
-        // процесса: ядро, которое не поднялось и остановилось с ошибкой (например, новая версия после обновления), тоже.
-        crate::scm::set_failure_actions(&svc, RESET_PERIOD, &mut failure_actions())?;
+        set_core_failure_actions(&svc)?;
         start_core(&svc, WAIT)
     }
+}
+
+/// Действия диспетчера при сбое службы ядра: упало — Windows поднимет снова через 5 секунд (сбросом счётчика раз в
+/// сутки). И не только при падении процесса: ядро, которое не поднялось и остановилось с ошибкой (например, новая
+/// версия после обновления), тоже. Одно определение для установки, перезапуска после обновления (`--restart-core`
+/// снимает действия на время своей работы и ставит обратно) и старта ядра (`reapply_failure_actions`).
+pub(crate) fn set_core_failure_actions(svc: &Service) -> Result<(), String> {
+    crate::scm::set_failure_actions(svc, RESET_PERIOD, &mut failure_actions())
+}
+
+/// Старт службы ядра: довести замену набора файлов, оборванную обрывом (`update::ours::swap`), до туннелей, агента и
+/// уборки `.old-`. Язык — из `core.ini` (его же выберет `server::run`): тексты исхода идут в журнал событий напрямую,
+/// агента ещё нет. Здесь, а не в `server.rs`: ядро само в подсистему обновлений не ходит (ограда `core_does_not_reach_into_agent_work`),
+/// а уборка отодвинутых файлов и так его дело. Возвращает, можно ли убирать `.old-`/`.new-` в этот старт
+/// (`remove_old_copies_after`): план не прочитался — нельзя.
+pub(crate) fn recover_swaps_at_start() -> bool {
+    crate::i18n::set(&super::lang_dir(), &Config::load().language);
+    let recovered = crate::update::ours::recover_swaps(&mut |severity, text| super::log_notice(super::events_file(), severity, text));
+    cleanup_allowed(recovered)
+}
+
+/// Уборка `.old-`/`.new-` после доведения замены с исходом `outcome`: план не прочитался (отодвинут как
+/// `.unreadable-`) — уборки в этот старт нет: без плана неизвестно, какой из файлов — единственная целая копия
+/// (замена могла встать между «прежний отодвинут» и «новый на месте»), и `.old-` рядом с отодвинутым планом — путь
+/// назад для разбора вручную; об этом говорит сама запись `updo.swap_journal_bad`. Иначе — `remove_old_copies`.
+pub(crate) fn remove_old_copies_after(dir: &Path, outcome: crate::update::ours::swap::Recovery) {
+    if cleanup_allowed(outcome) {
+        remove_old_copies(dir);
+    }
+}
+
+fn cleanup_allowed(outcome: crate::update::ours::swap::Recovery) -> bool {
+    outcome != crate::update::ours::swap::Recovery::Unreadable
+}
+
+/// Поднявшееся ядро ставит действия при сбое своей службы заново: помощник `--restart-core`, снятый посреди работы,
+/// оставил бы службу без перезапуска при сбое до следующей установки.
+pub(crate) fn reapply_failure_actions() -> Result<(), String> {
+    let svc = Service::open(&Handle::scm_connect()?, SERVICE, SERVICE_CHANGE_CONFIG)?;
+    set_core_failure_actions(&svc)
 }
 
 /// Запустить службу ядра и дождаться `Running`.
@@ -218,9 +259,16 @@ fn place(path: &Path, data: &[u8]) -> Result<(), String> {
     crate::fsutil::write_atomic(path, data).map_err(|e| crate::fsutil::io_ctx(&path, e))
 }
 
+/// Убрать из `dir` отодвинутые обновлением прежние файлы (`.old-`) и не вставшие на место новые (`.new-`), кроме тех,
+/// что держит незавершённый план замены (`update::ours::swap`): их доводит `recover_swaps`, а до него они — путь назад.
 pub(crate) fn remove_old_copies(dir: &Path) {
+    remove_old_copies_except(dir, &crate::update::ours::swap_protected());
+}
+
+pub(crate) fn remove_old_copies_except(dir: &Path, keep: &[String]) {
     for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
-        if entry.file_name().to_string_lossy().contains(".old-") {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if (name.contains(".old-") || name.contains(".new-")) && !keep.contains(&name) {
             // Отодвинутый файл мог быть занят работающей службой: уберётся при следующей установке или запуске службы.
             let _ = std::fs::remove_file(entry.path());
         }

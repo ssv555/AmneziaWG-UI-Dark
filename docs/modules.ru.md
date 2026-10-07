@@ -13,7 +13,7 @@ flowchart TB
   W["Окно / app<br/>app/, tray, taskbar, shortcut, icon, groups, settings, elevated"]
   C["Ядро (служба)<br/>daemon/ (server, retry, deadwatch, restore, netwatch, agent_watch, pipe, proto, install, service),<br/>backend, engine"]
   A["Агент<br/>daemon/agent/, update/, ping, stats, native"]
-  S["Общие библиотеки<br/>monitor, events, health, store, archive, conf, uapi, win, scm,<br/>i18n, ini, fmt, fsutil, crash"]
+  S["Общие библиотеки<br/>monitor, events, health, store, archive, conf, uapi, win, scm,<br/>i18n, ini, fmt, fsutil, explain, crash"]
 
   W --> C
   W --> A
@@ -30,7 +30,7 @@ flowchart TB
 
 ## Модули
 
-Рёбра к `i18n`, `ini`, `fmt`, `fsutil` и `crash` (их используют почти все) не показаны. От `app` нарисованы только главные рёбра; она также напрямую упоминает `engine`, `events`, `stats`, `ping`, `tray`, `health`, `conf`, `uapi`, `win` и другие.
+Рёбра к `i18n`, `ini`, `fmt`, `fsutil`, `explain` и `crash` (их используют почти все) не показаны. От `app` нарисованы только главные рёбра; она также напрямую упоминает `engine`, `events`, `stats`, `ping`, `tray`, `health`, `conf`, `uapi`, `win` и другие.
 
 ```mermaid
 flowchart LR

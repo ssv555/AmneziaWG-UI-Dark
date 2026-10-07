@@ -8,7 +8,6 @@
 use std::collections::BTreeMap;
 use std::net::{IpAddr, SocketAddr};
 
-use crate::crash::lock;
 use crate::daemon::agent::client::AgentApi;
 use crate::daemon::CoreApi;
 use crate::events::Event;
@@ -261,7 +260,7 @@ impl App {
                 events,
             };
             ctx.copy_text(build(&facts, &Identity::from_env()));
-            *lock(&notice) = Some(tr("diag.copied"));
+            notice.done(tr("diag.copied"));
             ctx.request_repaint();
         });
     }

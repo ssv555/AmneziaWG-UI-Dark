@@ -10,6 +10,9 @@ pub const DEFAULT_LOG_DIR: &str = "logs";
 /// Пределы множителя масштаба интерфейса.
 pub const MIN_SCALE: f32 = 0.5;
 pub const MAX_SCALE: f32 = 3.0;
+/// Наименьший размер главного окна в точках egui: столько места нужно таблице и карточке туннеля рядом. Окно держит
+/// его при любом масштабе интерфейса (`WindowState::min_size_due`), поэтому раскладка проверяется при этом размере.
+pub const MIN_WINDOW: [f32; 2] = [760.0, 480.0];
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub struct WindowRect {
@@ -239,21 +242,6 @@ impl Default for View {
     }
 }
 
-/// Ширина числовых колонок таблицы туннелей; колонка имени занимает остаток.
-#[derive(Clone, PartialEq, Debug)]
-pub struct Columns {
-    pub rx: f32,
-    pub tx: f32,
-    pub peak: f32,
-    pub share: f32,
-}
-
-impl Default for Columns {
-    fn default() -> Self {
-        Columns { rx: 96.0, tx: 96.0, peak: 104.0, share: 64.0 }
-    }
-}
-
 #[derive(Clone, PartialEq, Debug)]
 pub struct Settings {
     pub window: Option<WindowRect>,
@@ -265,7 +253,6 @@ pub struct Settings {
     pub graph_height: f32,
     /// Масштаб графика; выбор в окне пишется сразу, как прочий вид.
     pub graph_range: GraphRange,
-    pub columns: Columns,
     pub view: View,
     pub sort: SortKey,
     pub sort_desc: bool,
@@ -305,7 +292,6 @@ impl Default for Settings {
             ui_scale: 1.0,
             graph_height: 140.0,
             graph_range: GraphRange::default(),
-            columns: Columns::default(),
             view: View::default(),
             sort: SortKey::Name,
             sort_desc: false,
@@ -354,12 +340,6 @@ impl Settings {
             graph_range: match ini.get("layout", "graph_range") {
                 Some(name) => GraphRange::parse(name).unwrap_or(d.graph_range),
                 None => ini.get("layout", "graph_period").and_then(GraphRange::from_period).unwrap_or(d.graph_range),
-            },
-            columns: Columns {
-                rx: ini.get_or("columns", "rx", d.columns.rx),
-                tx: ini.get_or("columns", "tx", d.columns.tx),
-                peak: ini.get_or("columns", "peak", d.columns.peak),
-                share: ini.get_or("columns", "share", d.columns.share),
             },
             view: View {
                 groups: ini.get_bool("view", "groups", v.groups),
@@ -419,10 +399,6 @@ impl Settings {
         ini.set("layout", "ui_scale", (self.ui_scale * 100.0).round() / 100.0);
         ini.set("layout", "graph_height", self.graph_height.round());
         ini.set("layout", "graph_range", self.graph_range.as_str());
-        ini.set("columns", "rx", self.columns.rx.round());
-        ini.set("columns", "tx", self.columns.tx.round());
-        ini.set("columns", "peak", self.columns.peak.round());
-        ini.set("columns", "share", self.columns.share.round());
         let v = &self.view;
         for (key, on) in [
             ("groups", v.groups),

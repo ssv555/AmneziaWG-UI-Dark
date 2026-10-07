@@ -106,7 +106,7 @@ fn core_has_running_tunnels() -> Result<bool, String> {
     match crate::daemon::pipe::call_to(crate::daemon::pipe::NAME, &Request::State { events_after: u64::MAX }, CORE_TIMEOUTS)? {
         Response::State(state) => Ok(!state.running.is_empty()),
         Response::Err(e) | Response::Refused(e) => Err(e),
-        other => Err(format!("core: unexpected answer {other:?}")),
+        other => Err(crate::i18n::trf("err.core_unexpected", &[&crate::explain::variant_name(&other)])),
     }
 }
 

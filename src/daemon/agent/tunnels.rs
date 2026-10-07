@@ -5,12 +5,12 @@
 //! Удаление и переименование туннеля режима 2 остаются в ядре: они трогают службу туннеля и желаемый набор. С записью
 //! агента они разведены замком хранилища (`store`): правка переименованного или удалённого туннеля — ошибка, а не воскрешение.
 
-use std::sync::Mutex;
+use std::sync::Arc;
 use std::time::Duration;
 
 use super::proto::{AgentResponse, TunnelRequest};
 use crate::conf::TunnelInfo;
-use crate::daemon::helper::{Op, Out};
+use crate::daemon::helper::{Jobs, Op, Out};
 use crate::daemon::pipe::{self, Timeouts};
 use crate::daemon::proto::{NativeOp, Request, Response};
 use crate::events::Severity;
@@ -47,20 +47,19 @@ pub(super) struct Caller {
 
 pub(super) struct Tunnels {
     core: Box<dyn CoreSide>,
+    /// Действия в родном окне идут по одному и не ждут друг друга дольше срока (`helper::Jobs`).
     helper: Box<dyn Helper>,
-    /// Действия в родном окне — по одному: два помощника сразу мешали бы друг другу в одном окне.
-    helper_lock: Mutex<()>,
     log: Box<dyn Fn(Severity, &str) + Send + Sync>,
 }
 
 impl Tunnels {
     pub(super) fn new(core: Box<dyn CoreSide>, helper: Box<dyn Helper>, log: Box<dyn Fn(Severity, &str) + Send + Sync>) -> Tunnels {
-        Tunnels { core, helper, helper_lock: Mutex::new(()), log }
+        Tunnels { core, helper, log }
     }
 
-    /// Над каналом ядра и настоящим помощником.
-    pub(super) fn real(log: Box<dyn Fn(Severity, &str) + Send + Sync>) -> Tunnels {
-        Tunnels::new(Box::new(PipeCoreSide), Box::new(SessionHelper), log)
+    /// Над каналом ядра и настоящим помощником (`jobs` — его задания, общие с уборкой при запуске агента).
+    pub(super) fn real(jobs: Arc<Jobs>, log: Box<dyn Fn(Severity, &str) + Send + Sync>) -> Tunnels {
+        Tunnels::new(Box::new(PipeCoreSide), Box::new(SessionHelper(jobs)), log)
     }
 
     pub(super) fn handle(&self, req: TunnelRequest, caller: &Caller) -> AgentResponse {
@@ -161,9 +160,9 @@ impl Tunnels {
     fn export_native(&self, caller: &Caller) -> Result<Vec<crate::archive::Entry>, String> {
         let zip = store::export_temp()?;
         let exported = match self.run_helper(caller, &Op::Export(zip.display().to_string())) {
-            Ok(Out::Ok) => crate::archive::read(&zip, None).map_err(|e| format!("{}: {e:?}", zip.display())),
+            Ok(Out::Ok) => crate::archive::read(&zip, None).map_err(|e| crate::fsutil::io_ctx(&zip, e)),
             Ok(Out::Err(e)) | Err(e) => Err(e),
-            Ok(other) => Err(format!("helper: {other:?}")),
+            Ok(other) => Err(crate::i18n::trf("err.helper_unexpected", &[&crate::explain::variant_name(&other)])),
         };
         let removed = match std::fs::remove_file(&zip) {
             Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(crate::fsutil::io_ctx(&zip, e)),
@@ -190,7 +189,6 @@ impl Tunnels {
 
     fn run_helper(&self, caller: &Caller, op: &Op) -> Result<Out, String> {
         let sid = caller.sid.as_deref().ok_or_else(|| tr("core.other_session"))?;
-        let _one = crate::crash::lock(&self.helper_lock);
         self.helper.run(caller.session, sid, op)
     }
 }
@@ -243,7 +241,7 @@ impl PipeCoreSide {
         match Self::ask(what, request)? {
             Response::Ok => Ok(()),
             Response::Err(e) | Response::Refused(e) => Err(format!("core {what}: {e}")),
-            _ => Err(format!("core {what}: unexpected reply")),
+            other => Err(format!("core {what}: {}", crate::i18n::trf("err.core_unexpected", &[&crate::explain::variant_name(&other)]))),
         }
     }
 }
@@ -253,7 +251,7 @@ impl CoreSide for PipeCoreSide {
         match Self::ask("Hello", Request::Hello)? {
             Response::Hello { mode, .. } => Ok(mode),
             Response::Err(e) | Response::Refused(e) => Err(format!("core Hello: {e}")),
-            _ => Err("core Hello: unexpected reply".into()),
+            other => Err(format!("core Hello: {}", crate::i18n::trf("err.core_unexpected", &[&crate::explain::variant_name(&other)]))),
         }
     }
     fn forget(&self, tunnel: &str) -> Result<(), String> {
@@ -265,18 +263,18 @@ impl CoreSide for PipeCoreSide {
 }
 
 /// Настоящий помощник: `awg-ui.exe --native-op` в сеансе пользователя с его повышенным токеном.
-struct SessionHelper;
+struct SessionHelper(Arc<Jobs>);
 
 impl Helper for SessionHelper {
     fn run(&self, session: u32, caller: &str, op: &Op) -> Result<Out, String> {
-        crate::daemon::helper::run(session, caller, op)
+        self.0.run(session, caller, op)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
 
     /// Подделка ядра: режимы по очереди (последний остаётся), просьбы записываются; `forget_fails` — ядро не ответило.
     #[derive(Default)]

@@ -27,18 +27,35 @@ pub enum Level {
 #[derive(Clone, Debug)]
 pub struct Health {
     pub level: Level,
+    /// Короткая фраза для человека: крупная строка карточки, подсказка строки списка, трей.
     pub text: String,
+    /// Технические подробности (текст ошибки Windows или службы): подсказка и журнал событий, не основной текст.
+    pub detail: Option<String>,
+}
+
+impl Health {
+    pub fn new(level: Level, text: String) -> Health {
+        Health { level, text, detail: None }
+    }
+
+    /// Текст события в журнале: фраза, известная причина и подробности в скобках.
+    pub fn log_text(&self) -> String {
+        match &self.detail {
+            Some(d) => crate::explain::log_line(&self.text, d),
+            None => self.text.clone(),
+        }
+    }
 }
 
 /// `ping` — Some, только если проверка пингом включена.
 pub fn health(live: Option<&Live>, pending: Option<&str>, ping: Option<&PingState>) -> Health {
-    let h = |level, text: &str| Health { level, text: text.to_string() };
+    let h = |level, text: &str| Health::new(level, text.to_string());
     if let Some(p) = pending {
         return h(Level::Busy, &tr(p));
     }
     let Some(live) = live else { return h(Level::Off, &tr("health.off")) };
     let Some(st) = &live.status else {
-        return h(Level::Bad, &trf("health.no_service", &[live.error.as_deref().unwrap_or("?")]));
+        return Health { level: Level::Bad, text: tr("health.service_down"), detail: live.error.clone() };
     };
     let hs = st.last_handshake_sec();
     if hs == 0 {
@@ -67,11 +84,11 @@ pub fn health(live: Option<&Live>, pending: Option<&str>, ping: Option<&PingStat
 pub fn retrying(r: &RetryState) -> Health {
     if r.slow {
         let minutes = r.next_in_s.div_ceil(60).max(1);
-        return Health { level: Level::Bad, text: trf("health.retry_slow", &[&r.last_error, &minutes.to_string()]) };
+        return Health { level: Level::Bad, text: trf("health.retry_failed", &[&minutes.to_string()]), detail: Some(r.last_error.clone()) };
     }
     let next = r.next_in_s.to_string();
     let text = if r.attempt == 0 { trf("health.retry_wait", &[&next]) } else { trf("health.retrying", &[&r.attempt.to_string(), &next]) };
-    Health { level: Level::Warn, text }
+    Health::new(Level::Warn, text)
 }
 
 #[cfg(test)]
@@ -121,7 +138,23 @@ mod tests {
         assert_eq!(retrying(&r(0, 10, false)).text, trf("health.retry_wait", &["10"]));
         let h = retrying(&r(30, 540, true));
         assert_eq!(h.level, Level::Bad);
-        assert_eq!(h.text, trf("health.retry_slow", &["Element not found", "9"]));
-        assert_eq!(retrying(&r(30, 0, true)).text, trf("health.retry_slow", &["Element not found", "1"]), "«через 0 мин» не бывает");
+        // Причина — в подробностях (подсказка, журнал), крупная строка карточки остаётся короткой.
+        assert_eq!(h.text, trf("health.retry_failed", &["9"]));
+        assert_eq!(h.detail.as_deref(), Some("Element not found"));
+        assert!(h.log_text().contains("Element not found"));
+        assert_eq!(retrying(&r(30, 0, true)).text, trf("health.retry_failed", &["1"]), "«через 0 мин» не бывает");
+    }
+
+    #[test]
+    fn service_error_goes_to_the_detail_not_the_headline() {
+        let raw = "OpenService AmneziaWGTunnel$office: The specified service does not exist as an installed service. (os error 1060)";
+        let mut l = live(Some(5), &[0]);
+        l.status = None;
+        l.error = Some(raw.into());
+        let h = health(Some(&l), None, None);
+        assert_eq!((h.level, h.text.as_str()), (Level::Bad, tr("health.service_down").as_str()));
+        assert_eq!(h.detail.as_deref(), Some(raw));
+        let line = h.log_text();
+        assert!(line.starts_with(&h.text) && line.contains(&crate::explain::Cause::ServiceMissing.text()) && line.ends_with("(os error 1060))"), "{line}");
     }
 }

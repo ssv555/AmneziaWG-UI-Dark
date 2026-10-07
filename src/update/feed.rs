@@ -12,7 +12,7 @@ pub const NATIVE_REPO: &str = "amnezia-vpn/amneziawg-windows-client";
 pub const APP_REPO: &str = "ssv555/AmneziaWG-UI-Dark";
 
 /// Предел ответа API, байт.
-const API_MAX: usize = 2 * 1024 * 1024;
+pub(super) const API_MAX: usize = 2 * 1024 * 1024;
 /// Предел текста релиза, символов.
 const NOTES_MAX: usize = 2000;
 

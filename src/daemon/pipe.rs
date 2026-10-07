@@ -313,14 +313,20 @@ unsafe fn token_elevated_admin(token: HANDLE) -> bool {
     {
         return false;
     }
+    token_in_admins(token) == Some(true)
+}
+
+/// Группа «Администраторы» в токене действует (не только для запретов). `token` — токен олицетворения: с первичным
+/// `CheckTokenMembership` отказывает. `None` — узнать не удалось.
+pub(super) unsafe fn token_in_admins(token: HANDLE) -> Option<bool> {
     // SECURITY_MAX_SID_SIZE — 68 байт; u64 — ради выравнивания SID.
     let mut admins = [0u64; 9];
     let mut admins_len = size_of_val(&admins) as u32;
     if CreateWellKnownSid(WinBuiltinAdministratorsSid, null_mut(), admins.as_mut_ptr().cast(), &mut admins_len) == 0 {
-        return false;
+        return None;
     }
     let mut member = 0;
-    CheckTokenMembership(token, admins.as_mut_ptr().cast(), &mut member) != 0 && member != 0
+    (CheckTokenMembership(token, admins.as_mut_ptr().cast(), &mut member) != 0).then_some(member != 0)
 }
 
 /// SID пользователя токена.

@@ -2,7 +2,7 @@
 
 use std::path::{Path, PathBuf};
 
-use super::fileset::{copy, install_set};
+use super::fileset::copy;
 use super::fs::RealFs;
 use super::{InstallTarget, APP_EXE, APP_SET, ENGINE_FILES, MANIFEST, MANIFEST_SIG, VERSION_TXT};
 use crate::i18n::{tr, trf};
@@ -31,7 +31,7 @@ impl InstallTarget {
             .filter(|n| ENGINE_FILES.contains(n) || dir.join(n).exists())
             .map(|n| (n.to_string(), dir.join(n)))
             .collect();
-        install_set(&self.dir, &files, &RealFs)?;
+        self.install_set(&files, &RealFs)?;
         // Копия без манифеста — движок из сборки: снова действуют вшитые суммы.
         if !dir.join(MANIFEST).exists() {
             for name in [MANIFEST, MANIFEST_SIG] {

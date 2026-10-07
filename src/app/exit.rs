@@ -6,11 +6,10 @@ use std::sync::atomic::Ordering;
 
 use eframe::egui;
 
-use super::dialog::{dialog_choice, dialog_window};
+use super::dialog::{dialog_body, dialog_choice};
 
 use super::modals::{Modal, Outcome, Turn};
 use super::App;
-use crate::crash::lock;
 use crate::daemon::CoreApi;
 use crate::daemon::proto::{NativeOp, Plan, Request};
 use crate::i18n::{tr, trf};
@@ -38,7 +37,7 @@ impl App {
         }
     }
 
-    pub(super) fn show_exit_confirm(&mut self, ctx: &egui::Context, native: bool, turn: Turn) -> Outcome {
+    pub(super) fn show_exit_confirm(&mut self, ctx: &egui::Context, native: bool, mut turn: Turn) -> Outcome {
         let running = self.running_tunnels();
         // Туннели успели отключиться сами — спрашивать не о чем.
         if running.is_empty() {
@@ -47,12 +46,13 @@ impl App {
         }
         let (mut disconnect, mut keep, mut cancel) = (false, false, false);
         let mut open = true;
-        dialog_window(ctx, tr("exit.title"), "exit-confirm", &mut open)
+        turn.window(ctx, tr("exit.title"), "exit-confirm", &mut open)
             .show(ctx, |ui| {
-                ui.set_width(520.0);
-                ui.add(egui::Label::new(trf("exit.text", &[&running.join(", ")])).wrap());
-                ui.add_space(10.0);
-                ui.checkbox(turn.remember, tr("dlg.remember_choice"));
+                dialog_body(ui, 520.0, |ui| {
+                    ui.add(egui::Label::new(trf("exit.text", &[&running.join(", ")])).wrap());
+                    ui.add_space(10.0);
+                    ui.checkbox(turn.remember, tr("dlg.remember_choice"));
+                });
                 ui.add_space(6.0);
                 (disconnect, keep, cancel) = dialog_choice(ui, &tr("exit.disconnect"), &tr("exit.keep"), &tr("btn.cancel"));
             });
@@ -82,13 +82,13 @@ impl App {
     /// Отключить туннели через ядро и выйти; не вышло — окно остаётся, ошибка в журнале.
     fn disconnect_and_exit(&mut self, running: Vec<String>, native: bool) {
         self.save_before_exit();
-        *lock(&self.notice) = Some(tr("exit.disconnecting"));
+        self.notice.progress(tr("exit.disconnecting"));
         let (core, error, notice, ctx) = (self.core.clone(), self.action_error.clone(), self.notice.clone(), self.ctx.clone());
         std::thread::spawn(move || {
             match running.iter().try_for_each(|t| core.ok(Request::Switch { tunnel: t.clone(), plan: Plan::Disconnect, multiple: true })) {
                 Ok(()) => finish_exit(core.as_ref(), native, &error),
                 Err(e) => {
-                    *lock(&notice) = None;
+                    notice.clear();
                     error.push(e);
                     ctx.request_repaint();
                 }

@@ -2,7 +2,6 @@
 //! синхронизация с AmneziaWG, удаление туннеля.
 
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use eframe::egui::{self, RichText};
@@ -18,9 +17,10 @@ use crate::monitor::Shared;
 use crate::settings::{DialogId, Mode};
 use crate::{tray, win};
 
-use super::dialog::{dialog_buttons, dialog_window};
+use super::dialog::{dialog_body, dialog_buttons};
 use super::modals::{Modal, Outcome, Turn};
 use super::theme::palette;
+use super::notice::{NoticeKind, Notices};
 use super::{Action, App, ErrorSink};
 
 /// Действия, которые перезаписывают или удаляют данные или рвут VPN, — только после подтверждения.
@@ -50,7 +50,7 @@ impl Confirm {
 impl App {
     /// Родной импорт с выделенным файлом; «Открыть» нажимает пользователь. Напоминание про дубликат.
     pub(super) fn import_source(&self, path: PathBuf) {
-        *lock(&self.notice) = Some(tr("src.import_hint"));
+        self.notice.progress(tr("src.import_hint"));
         let (core, error) = (self.core.clone(), self.action_error.clone());
         std::thread::spawn(move || {
             if let Err(e) = core.import_in_native(Some(&path)) {
@@ -71,29 +71,30 @@ impl App {
     }
 
     /// Подтверждение перезаписи (синхронизация) и удаления (группа, туннель).
-    pub(super) fn show_confirm(&mut self, ctx: &egui::Context, c: &Confirm, turn: Turn) -> Outcome {
+    pub(super) fn show_confirm(&mut self, ctx: &egui::Context, c: &Confirm, mut turn: Turn) -> Outcome {
         let (title, text, primary, warning) = self.confirm_texts(c);
         // Туннель без источника: перед удалением можно сохранить копию конфига в файл.
         let offer_copy = matches!(c, Confirm::DeleteTunnel(t) if self.s.book.source(t).is_none());
         let (mut yes, mut no, mut copy) = (false, false, false);
         let mut open = true;
-        dialog_window(ctx, title, "confirm", &mut open)
+        turn.window(ctx, title, "confirm", &mut open)
             .show(ctx, |ui| {
-                ui.set_width(500.0);
-                ui.add(egui::Label::new(text).wrap());
-                if let Some(w) = &warning {
-                    ui.add_space(6.0);
-                    ui.add(egui::Label::new(RichText::new(w).color(palette().warning)).wrap());
-                }
-                ui.add_space(10.0);
-                if offer_copy {
-                    copy = ui.button(tr("del.save_copy")).on_hover_text(tr("del.save_copy_hint")).clicked();
-                    ui.add_space(4.0);
-                }
-                if c.hideable().is_some() {
-                    ui.checkbox(turn.remember, tr("dlg.dont_ask"));
-                    ui.add_space(6.0);
-                }
+                dialog_body(ui, 500.0, |ui| {
+                    ui.add(egui::Label::new(text).wrap());
+                    if let Some(w) = &warning {
+                        ui.add_space(6.0);
+                        ui.add(egui::Label::new(RichText::new(w).color(palette().warning)).wrap());
+                    }
+                    ui.add_space(10.0);
+                    if offer_copy {
+                        copy = ui.button(tr("del.save_copy")).on_hover_text(tr("del.save_copy_hint")).clicked();
+                        ui.add_space(4.0);
+                    }
+                    if c.hideable().is_some() {
+                        ui.checkbox(turn.remember, tr("dlg.dont_ask"));
+                    }
+                });
+                ui.add_space(6.0);
                 (yes, no) = dialog_buttons(ui, &primary, true, Some(&tr("btn.cancel")));
             });
         let (enter, escape) = turn.keys(ctx);
@@ -169,13 +170,13 @@ impl App {
             Mode::Engine => ("eng.deleting", "eng.deleted", "eng.deleted_copy"),
             Mode::Overlay => ("del.running", "del.done", "del.done_copy"),
         };
-        *lock(&notice) = Some(trf(running_key, &[&tunnel]));
+        notice.progress(trf(running_key, &[&tunnel]));
         std::thread::spawn(move || {
             let result = delete_tunnel(core.as_ref(), &tunnel, copy.as_deref()).map(|()| match &copy {
                 Some(p) => trf(copy_key, &[&tunnel, &p.display().to_string()]),
                 None => trf(done_key, &[&tunnel]),
             });
-            if report_outcome(result, &tunnel, Severity::Warn, &shared, &notice, &error) {
+            if report_outcome(result, &tunnel, Severity::Warn, &notice, &error) {
                 follow_stats(agent.as_deref(), &shared, StatsChange::Forget(tunnel.clone()));
                 lock(&deleted).push(tunnel);
             }
@@ -203,14 +204,14 @@ impl App {
 
     /// Синхронизация в фоне: родное окно управляется автоматически, итог — в строке состояния.
     fn run_sync(&self, c: Confirm) {
-        let (core, shared, error, notice) = (self.core.clone(), self.shared.clone(), self.action_error.clone(), self.notice.clone());
+        let (core, error, notice) = (self.core.clone(), self.action_error.clone(), self.notice.clone());
         let (tunnel, to_source) = match c {
             Confirm::ToSource(t) => (t, true),
             Confirm::ToNative(t) => (t, false),
             Confirm::DeleteGroup(_) | Confirm::DeleteTunnel(_) | Confirm::UninstallCore | Confirm::Disconnect(_) => return,
         };
         let Some(path) = self.s.book.source(&tunnel).map(PathBuf::from) else { return };
-        *lock(&notice) = Some(trf("sync.running", &[&tunnel]));
+        notice.progress(trf("sync.running", &[&tunnel]));
         std::thread::spawn(move || {
             let result = if to_source {
                 save_config_copy(core.as_ref(), &tunnel, &path)
@@ -220,17 +221,18 @@ impl App {
                     .and_then(|text| core.write_config(&tunnel, &text))
             };
             let done = if to_source { "sync.done_to_source" } else { "sync.done_to_native" };
-            report_outcome(result.map(|()| trf(done, &[&path.display().to_string()])), &tunnel, Severity::Info, &shared, &notice, &error);
+            report_outcome(result.map(|()| trf(done, &[&path.display().to_string()])), &tunnel, Severity::Info, &notice, &error);
         });
     }
 
-    pub(super) fn show_ask_import(&mut self, ctx: &egui::Context, tunnel: &str, path: &Path, turn: Turn) -> Outcome {
+    pub(super) fn show_ask_import(&mut self, ctx: &egui::Context, tunnel: &str, path: &Path, mut turn: Turn) -> Outcome {
         let (mut yes, mut no) = (false, false);
         let mut open = true;
-        dialog_window(ctx, tr("src.saved_title"), "ask-import", &mut open)
+        turn.window(ctx, tr("src.saved_title"), "ask-import", &mut open)
             .show(ctx, |ui| {
-                ui.set_width(460.0);
-                ui.add(egui::Label::new(trf("src.ask", &[&path.display().to_string()])).wrap());
+                dialog_body(ui, 460.0, |ui| {
+                    ui.add(egui::Label::new(trf("src.ask", &[&path.display().to_string()])).wrap());
+                });
                 ui.add_space(10.0);
                 (yes, no) = dialog_buttons(ui, &tr("btn.yes"), true, Some(&tr("btn.no")));
             });
@@ -254,18 +256,16 @@ fn report_outcome(
     result: Result<String, String>,
     tunnel: &str,
     done: Severity,
-    shared: &Shared,
-    notice: &Mutex<Option<String>>,
+    notice: &Notices,
     error: &ErrorSink,
 ) -> bool {
     match result {
         Ok(text) => {
-            shared.log(tunnel, done, &text);
-            *lock(&notice) = Some(text);
+            notice.post(tunnel, NoticeKind::Done, done, text);
             true
         }
         Err(e) => {
-            *lock(&notice) = None;
+            notice.clear();
             error.push_for(tunnel, e);
             false
         }
@@ -315,6 +315,7 @@ pub(super) fn follow_stats(agent: Option<&dyn AgentApi>, shared: &Shared, change
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
     use crate::daemon::fake::FakeCore;
     use crate::daemon::proto::{Request, Response};
 
@@ -416,23 +417,24 @@ mod tests {
     #[test]
     fn failed_delete_or_sync_reaches_the_log_exactly_once() {
         let (shared, error) = super::super::testkit::sink();
-        let notice = Mutex::new(Some("deleting".to_string()));
-        assert!(!report_outcome(Err("core unavailable".into()), "office", Severity::Warn, &shared, &notice, &error));
+        let notice = Notices::new(shared.clone());
+        notice.progress("deleting");
+        assert!(!report_outcome(Err("core unavailable".into()), "office", Severity::Warn, &notice, &error));
         assert_eq!(super::super::testkit::errors(&shared), [("office".to_string(), "core unavailable".to_string())]);
         assert_eq!(shared.events_since(0).len(), 1, "одна запись, а не две");
-        assert_eq!(*notice.lock().unwrap(), None);
+        assert_eq!(notice.current(), None);
         assert!(error.take_fresh());
     }
 
     #[test]
     fn successful_delete_is_logged_once_and_shown_in_the_status_bar() {
         let (shared, error) = super::super::testkit::sink();
-        let notice = Mutex::new(None);
-        assert!(report_outcome(Ok("office deleted".into()), "office", Severity::Warn, &shared, &notice, &error));
+        let notice = Notices::new(shared.clone());
+        assert!(report_outcome(Ok("office deleted".into()), "office", Severity::Warn, &notice, &error));
         let log = shared.events_since(0);
         assert_eq!(log.len(), 1);
         assert_eq!((log[0].1.tunnel.as_str(), log[0].1.severity, log[0].1.text.as_str()), ("office", Severity::Warn, "office deleted"));
-        assert_eq!(notice.lock().unwrap().as_deref(), Some("office deleted"));
+        assert_eq!(notice.current().map(|n| (n.kind, n.text)), Some((NoticeKind::Done, "office deleted".to_string())));
         assert!(!error.take_fresh());
     }
 }

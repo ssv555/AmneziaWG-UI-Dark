@@ -215,19 +215,28 @@ pub fn get(url: &str, accept: Option<&str>, max: usize) -> Result<Vec<u8>, Strin
             return Err(format!("response too large: {len} > {max} bytes"));
         }
     }
-    let mut body = Vec::new();
+    collect_body(&mut |buf| resp.read(buf), resp.length, max, &mut || expired(start, Instant::now(), GET_DEADLINE))
+}
+
+/// Тело ответа в память кусками `read` (0 — конец), не больше `max` байт; `expired` — срок вышел. Память под тело
+/// не превышает `max`: ёмкость берётся по Content-Length (в пределах `max`) и дальше растёт ровно на прочитанное, без
+/// удвоений `Vec` — иначе ответ у предела занимал бы вдвое больше. В память так читаются только ответы API и манифест
+/// (единицы мегабайт); файлы релизов и MSI идут на диск (`download`).
+fn collect_body(read: &mut dyn FnMut(&mut [u8]) -> Result<usize, String>, length: Option<u64>, max: usize, expired: &mut dyn FnMut() -> bool) -> Result<Vec<u8>, String> {
+    let mut body = Vec::with_capacity(length.map_or(0, |l| l.min(max as u64) as usize));
     let mut buf = vec![0u8; CHUNK];
     loop {
-        if expired(start, Instant::now(), GET_DEADLINE) {
+        if expired() {
             return Err(timed_out(GET_DEADLINE));
         }
-        let n = resp.read(&mut buf)?;
+        let n = read(&mut buf)?;
         if n == 0 {
             return Ok(body);
         }
         if body.len() + n > max {
             return Err(format!("response too large: more than {max} bytes"));
         }
+        body.reserve_exact(n);
         body.extend_from_slice(&buf[..n]);
     }
 }
@@ -302,6 +311,51 @@ mod tests {
         assert!(get("ftp://example.com/", None, 1024).is_err());
         assert!(get("example.com/x", None, 1024).is_err());
         assert!(get("", None, 1024).is_err());
+    }
+
+    /// Тело в памяти никогда не занимает больше предела: ёмкость по Content-Length в пределах `max`, без удвоений.
+    #[test]
+    fn body_in_memory_stays_within_the_limit() {
+        // Сервер отдаёт кусками по 1000 байт; читатель — поверх `CHUNK`-буфера.
+        let server = |total: usize| {
+            let mut sent = 0;
+            move |buf: &mut [u8]| -> Result<usize, String> {
+                let n = 1000.min(total - sent).min(buf.len());
+                buf[..n].fill(7);
+                sent += n;
+                Ok(n)
+            }
+        };
+        let mut never = || false;
+        for (length, max) in [(Some(4000u64), 4096usize), (None, 4096), (Some(4000), 4000), (None, 4000)] {
+            let body = collect_body(&mut server(4000), length, max, &mut never).unwrap();
+            assert_eq!(body.len(), 4000);
+            assert!(body.capacity() <= max, "length {length:?}, max {max}: capacity {}", body.capacity());
+        }
+        // Content-Length больше предела не выделяет больше предела (а `get` такой ответ отвергает ещё раньше).
+        let body = collect_body(&mut server(100), Some(1 << 40), 4096, &mut never).unwrap();
+        assert!(body.capacity() <= 4096);
+        // Тело больше предела — ошибка на границе, не после.
+        let e = collect_body(&mut server(5000), None, 4500, &mut never).unwrap_err();
+        assert!(e.contains("too large"), "{e}");
+        // Срок вышел — ошибка до чтения.
+        let e = collect_body(&mut server(10), None, 100, &mut || true).unwrap_err();
+        assert!(e.contains("timed out"), "{e}");
+        let e = collect_body(&mut |_| Err("read failed".into()), None, 100, &mut never).unwrap_err();
+        assert_eq!(e, "read failed");
+    }
+
+    /// В памяти агента держатся только ответы API и манифест; файлы релизов (до `FILE_MAX`) и MSI (до `MSI_MAX`)
+    /// идут на диск. Пределы памяти — с большим запасом от предела процесса агента (его задание): иначе загрузка у
+    /// предела валила бы агента посреди обновления.
+    #[test]
+    fn in_memory_limits_are_far_below_the_agent_memory_limit() {
+        use crate::daemon::agent_watch::AGENT_MEMORY_LIMIT;
+        use crate::update::feed::API_MAX;
+        use crate::update::ours::MANIFEST_MAX;
+        let in_memory = API_MAX.max(MANIFEST_MAX);
+        assert!(in_memory * 16 < AGENT_MEMORY_LIMIT, "{in_memory} vs {AGENT_MEMORY_LIMIT}");
+        assert_eq!(CHUNK, 64 * 1024);
     }
 
     #[test]

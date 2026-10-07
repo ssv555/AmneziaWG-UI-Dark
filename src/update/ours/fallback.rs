@@ -23,7 +23,8 @@ const STOP_TIMEOUT: Duration = Duration::from_secs(30);
 /// историю обновлений. Код: 0 — новое ядро работает; 2 — не SYSTEM; 3, 4 — нет доступа к службе; 5 — служба
 /// не остановилась; 6 — возвращена прежняя сборка и работает; 7 — возвращать нечего; 8 — вернуть удалось не
 /// всё (ядро не запускается: набор смешанный); 9 — прежняя возвращена, но не запустилась; 10 — имя канала ядра
-/// так и не освободилось (заняла другая программа): новая сборка остаётся, ядро стоит.
+/// так и не освободилось (заняла другая программа): новая сборка остаётся, ядро стоит. При 7–10 ядро стоит — следует
+/// ещё один запуск уже под действиями диспетчера при сбое (`hand_over`): поднялось — код 0 или 6.
 pub fn restart_core() -> i32 {
     use crate::events::Severity;
     if crate::win::current_user_sid().as_deref() != Ok(crate::win::LOCAL_SYSTEM_SID) {
@@ -67,6 +68,8 @@ trait CoreHost {
     fn stop(&mut self) -> bool;
     /// Запустить и дождаться готовности, с повторами; не вышло — служба остановлена.
     fn start(&mut self) -> Start;
+    /// Действия диспетчера служб при сбое ядра (перезапуск через 5 с): `false` — снять, `true` — поставить обратно.
+    fn failure_actions(&mut self, on: bool) -> Result<(), String>;
     /// Запись в журнал событий ядра.
     fn log(&mut self, severity: crate::events::Severity, text: &str);
 }
@@ -92,15 +95,62 @@ impl CoreHost for CoreService {
         })
     }
 
+    fn failure_actions(&mut self, on: bool) -> Result<(), String> {
+        if on {
+            crate::daemon::install::set_core_failure_actions(&self.0)
+        } else {
+            self.0.clear_failure_actions()
+        }
+    }
+
     fn log(&mut self, severity: crate::events::Severity, text: &str) {
         core_log(severity, text)
     }
 }
 
 /// Шаги `restart_core` после открытия службы: `target` — папка программы и хранилище обновлений (история), `set` —
-/// заменённый набор, `fs` — файловые операции возврата. Журнал и история пишутся, только пока ядро стоит:
-/// запущенное ядро читает их при старте и затёрло бы запись своей копией.
+/// заменённый набор, `fs` — файловые операции возврата. На время работы действия диспетчера при сбое снимаются:
+/// иначе после первого неудачного старта новой сборки диспетчер сам запускал бы её через 5 с — параллельно нашим
+/// повторам, посреди возврата файлов (старт на полупереименованном наборе) или прежнюю сборку до записи истории
+/// (запущенное ядро затёрло бы запись своей копией). На каждом выходе действия ставятся обратно; ядро при старте
+/// ставит их и само (`install::reapply_failure_actions`) — на случай снятого посреди работы помощника.
 fn restart_with_fallback(target: &InstallTarget, set: &[Replaced], core: &mut dyn CoreHost, fs: &dyn Fs) -> i32 {
+    use crate::events::Severity;
+    // Не снялись — работа продолжается: гонка с диспетчером хуже обновления без неё, но не хуже отказа от обновления.
+    if let Err(e) = core.failure_actions(false) {
+        core.log(Severity::Warn, &trf("updo.failure_actions", &[&tr("updo.failure_actions_off"), &e]));
+    }
+    let code = restart_steps(target, set, core, fs);
+    if let Err(e) = core.failure_actions(true) {
+        core.log(Severity::Bad, &trf("updo.failure_actions", &[&tr("updo.failure_actions_on"), &e]));
+    }
+    hand_over(code, core)
+}
+
+/// Ядро стоит после всех шагов (коды 7–10: возвращать нечего или вернулось не всё, прежняя не поднялась, имя канала
+/// занято): ещё один запуск уже с действиями при сбое. Все неудачные старты до этого шли со снятыми действиями, и без
+/// него диспетчер не перезапускал бы службу до перезагрузки — VPN лежал бы и при проходящей причине (антивирус держит
+/// только что переименованный exe, занятый диспетчер); с ним неудача попадает под перезапуск диспетчера каждые 5 с,
+/// как обещает `updo.restart_pipe_gave_up`. Код: поднялась прежняя (9) — 6; поднялась новая (7, 10) — 0; смешанный набор
+/// (8) остаётся 8 — ядро работает, но набор не тот, что в истории и журнале.
+fn hand_over(code: i32, core: &mut dyn CoreHost) -> i32 {
+    if !(7..=10).contains(&code) {
+        return code;
+    }
+    core.log(crate::events::Severity::Warn, &tr("updo.restart_handover"));
+    if core.start() != Start::Running {
+        return code;
+    }
+    match code {
+        9 => 6,
+        8 => 8,
+        _ => 0,
+    }
+}
+
+/// Остановка, запуск новой сборки и возврат прежней, если она не поднялась (см. `restart_with_fallback`). Журнал и
+/// история пишутся, только пока ядро стоит: запущенное ядро читает их при старте и затёрло бы запись своей копией.
+fn restart_steps(target: &InstallTarget, set: &[Replaced], core: &mut dyn CoreHost, fs: &dyn Fs) -> i32 {
     use crate::events::Severity;
     let (dir, store) = (target.dir.as_path(), target.store.as_path());
     if !core.stop() {
@@ -500,19 +550,32 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
-    /// Подменённая служба: исходы запусков по очереди, журнал — в память.
+    /// Подменённая служба: исходы запусков по очереди, журнал — в память, вызовы (`stop`, `start`, `off`, `on`) — по порядку.
     struct FakeCore {
         starts: Vec<Start>,
         stop_ok: bool,
+        /// Смена действий при сбое отказывает.
+        actions_fail: bool,
+        calls: Vec<&'static str>,
         log: Vec<(crate::events::Severity, String)>,
     }
 
     impl CoreHost for FakeCore {
         fn stop(&mut self) -> bool {
+            self.calls.push("stop");
             self.stop_ok
         }
         fn start(&mut self) -> Start {
+            self.calls.push("start");
             self.starts.remove(0)
+        }
+        fn failure_actions(&mut self, on: bool) -> Result<(), String> {
+            self.calls.push(if on { "on" } else { "off" });
+            if self.actions_fail {
+                Err("denied".into())
+            } else {
+                Ok(())
+            }
         }
         fn log(&mut self, severity: crate::events::Severity, text: &str) {
             self.log.push((severity, text.to_string()));
@@ -524,7 +587,52 @@ mod tests {
     }
 
     fn fake_with(starts: &[Start]) -> FakeCore {
-        FakeCore { starts: starts.to_vec(), stop_ok: true, log: Vec::new() }
+        FakeCore { starts: starts.to_vec(), stop_ok: true, actions_fail: false, calls: Vec::new(), log: Vec::new() }
+    }
+
+    /// Действия при сбое сняты первым делом и возвращены последним — на каждом исходе: ни один запуск или шаг возврата
+    /// не идёт при включённом перезапуске диспетчера; отказ снять — предупреждение и работа дальше, отказ вернуть — ошибка.
+    #[test]
+    fn failure_actions_are_paused_for_the_whole_restart_on_every_exit() {
+        use crate::events::Severity;
+        let dir = temp("fb-actions");
+        let (inst, src, store) = (dir.join("inst"), dir.join("src"), dir.join("store"));
+        let set = updated_set(&inst, &src, &OLD_SET);
+        store_with_update(&store);
+        let paused = |core: &FakeCore, code: i32| {
+            assert_eq!(core.calls.first(), Some(&"off"), "code {code}: {:?}", core.calls);
+            let on = core.calls.iter().position(|c| *c == "on").unwrap_or_else(|| panic!("code {code}: {:?}", core.calls));
+            assert!(core.calls[1..on].iter().all(|c| *c == "stop" || *c == "start"), "code {code}: {:?}", core.calls);
+            assert!(core.calls[on + 1..].iter().all(|c| *c == "start"), "code {code}: после возврата действий — только передача диспетчеру: {:?}", core.calls);
+        };
+        // 0: новое ядро поднялось (файлы не тронуты — набор остаётся новым для следующих случаев).
+        let mut core = fake(&[true]);
+        assert_eq!(restart_with_fallback(&target_with_store(&inst, &store), &set, &mut core, &RealFs), 0);
+        paused(&core, 0);
+        assert_eq!(core.calls, ["off", "stop", "start", "on"]);
+        // 5: служба не остановилась.
+        let mut core = FakeCore { stop_ok: false, ..fake(&[]) };
+        assert_eq!(restart_with_fallback(&target_with_store(&inst, &store), &set, &mut core, &RealFs), 5);
+        assert_eq!(core.calls, ["off", "stop", "on"]);
+        // 9: возвращена, не поднялась; 7: повтор — возвращать нечего. Ядро стоит — после возврата действий ещё один
+        // запуск, чтобы неудача попала под перезапуск диспетчера (все предыдущие шли со снятыми действиями).
+        let mut core = fake(&[false, false, false]);
+        assert_eq!(restart_with_fallback(&target_with_store(&inst, &store), &set, &mut core, &RealFs), 9);
+        paused(&core, 9);
+        assert_eq!(core.calls.iter().rev().take(2).collect::<Vec<_>>(), [&"start", &"on"], "{:?}", core.calls);
+        assert_eq!(core.log.last(), Some(&(Severity::Warn, tr("updo.restart_handover"))));
+        let mut core = fake(&[false, false]);
+        assert_eq!(restart_with_fallback(&target_with_store(&inst, &store), &set, &mut core, &RealFs), 7);
+        paused(&core, 7);
+        assert_eq!(core.calls.iter().rev().take(2).collect::<Vec<_>>(), [&"start", &"on"], "{:?}", core.calls);
+        assert!(core.starts.is_empty(), "запуск после возврата действий сделан");
+        // Снять не удалось — предупреждение, перезапуск всё равно идёт; вернуть не удалось — ошибка в журнале.
+        let mut core = FakeCore { actions_fail: true, ..fake(&[true]) };
+        assert_eq!(restart_with_fallback(&target_with_store(&inst, &store), &set, &mut core, &RealFs), 0);
+        assert_eq!(core.calls, ["off", "stop", "start", "on"]);
+        let texts: Vec<(Severity, bool)> = core.log.iter().map(|(s, t)| (*s, t.contains("denied"))).collect();
+        assert_eq!(texts, [(Severity::Warn, true), (Severity::Bad, true)], "{:?}", core.log);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     /// История с одной строкой обновления программы 0.0.1 → текущая версия.
@@ -574,13 +682,19 @@ mod tests {
         assert_eq!((h[0].from.clone(), h[0].to.as_deref()), (Some(app_version()), Some("0.0.1")));
         assert_eq!((h[1].ok, h[1].error.clone()), (false, Some(trf("updo.restart_not_started", &[&app_version()]))));
         assert!(core.log.iter().any(|(_, t)| *t == tr("updo.restart_back")), "{:?}", core.log);
-        // Повторный перезапуск после возврата: возвращать нечего, файлы не тронуты, возврат не дописан.
+        // Повторный перезапуск после возврата: возвращать нечего, файлы не тронуты, возврат не дописан; ядро стоит —
+        // последний запуск передаёт его диспетчеру.
         let before = names(&inst);
-        let mut core = fake(&[false]);
+        let mut core = fake(&[false, false]);
         assert_eq!(restart_with_fallback(&target_with_store(&inst, &store), &set, &mut core, &RealFs), 7);
         assert_eq!(names(&inst), before);
         assert_eq!(history(&store).len(), 2);
-        assert_eq!(core.log.last().map(|(_, t)| t.clone()), Some(tr("updo.restart_no_way_back")));
+        let texts: Vec<String> = core.log.iter().map(|(_, t)| t.clone()).collect();
+        assert_eq!(texts[texts.len() - 2..], [tr("updo.restart_no_way_back"), tr("updo.restart_handover")], "{texts:?}");
+        // Тот же случай, но запуск под диспетчером удался: ядро работает на новой сборке — код 0.
+        let mut core = fake(&[false, true]);
+        assert_eq!(restart_with_fallback(&target_with_store(&inst, &store), &set, &mut core, &RealFs), 0);
+        assert_eq!(history(&store).len(), 2);
         // Служба не останавливается — ничего не трогается.
         let mut core = FakeCore { stop_ok: false, ..fake(&[]) };
         assert_eq!(restart_with_fallback(&target_with_store(&inst, &store), &set, &mut core, &RealFs), 5);
@@ -597,8 +711,11 @@ mod tests {
         store_with_update(&store);
         let lost = set.iter().find(|r| r.name == "tunnel.dll").unwrap().aside.clone().unwrap();
         std::fs::remove_file(inst.join(&lost)).unwrap();
-        let mut core = fake(&[false]); // второй запуск подменённая служба не допустила бы: `starts` кончились
+        // Прежняя не запускается (набор смешанный): второй запуск — только передача диспетчеру; больше подменённая
+        // служба не допустила бы (`starts` кончились). Поднялось бы — код всё равно 8: набор не тот, что в истории.
+        let mut core = fake(&[false, false]);
         assert_eq!(restart_with_fallback(&target_with_store(&inst, &store), &set, &mut core, &RealFs), 8);
+        assert!(core.starts.is_empty());
         let bad = core.log.iter().find(|(s, t)| *s == Severity::Bad && t.contains(&lost)).map(|(_, t)| t.clone());
         assert!(bad.is_some(), "{:?}", core.log);
         let h = history(&store);
@@ -608,10 +725,21 @@ mod tests {
         let (inst, src, store) = (dir.join("inst2"), dir.join("src2"), dir.join("store2"));
         let set = updated_set(&inst, &src, &OLD_SET);
         store_with_update(&store);
-        let mut core = fake(&[false, false]);
+        let mut core = fake(&[false, false, false]);
         assert_eq!(restart_with_fallback(&target_with_store(&inst, &store), &set, &mut core, &RealFs), 9);
         let h = history(&store);
         assert_eq!((h[0].ok, h[0].error.clone()), (false, Some(tr("updo.restart_back_not_started"))));
+        // Прежняя поднялась только запуском под диспетчером — код 6 (ядро работает на прежней); строка возврата в
+        // истории уже записана ошибкой — её объясняют строки журнала (не поднялась, передана диспетчеру).
+        let (inst, src, store) = (dir.join("inst4"), dir.join("src4"), dir.join("store4"));
+        let set = updated_set(&inst, &src, &OLD_SET);
+        store_with_update(&store);
+        let mut core = fake(&[false, false, true]);
+        assert_eq!(restart_with_fallback(&target_with_store(&inst, &store), &set, &mut core, &RealFs), 6);
+        for (n, d) in OLD_SET {
+            assert_eq!(read(&inst, n), d, "{n}");
+        }
+        assert_eq!(core.log.last(), Some(&(Severity::Warn, tr("updo.restart_handover"))));
         // Испорченная история не перезаписывается, ошибка — в журнал.
         let (inst, src, store) = (dir.join("inst3"), dir.join("src3"), dir.join("store3"));
         let set = updated_set(&inst, &src, &OLD_SET);
@@ -753,14 +881,23 @@ mod tests {
         assert_eq!(read(&inst, APP_EXE), "new awg-ui.exe");
         assert_eq!(history(&store).len(), 1, "возврата в истории нет");
         assert_eq!(core.log, vec![(Severity::Warn, tr("updo.restart_pipe_taken"))]);
-        // Имя так и не освободилось — ядро стоит на новой сборке, прежняя не возвращена.
-        let mut core = fake_with(&[Start::PipeTaken; TAKEN_ROUNDS as usize]);
+        // Имя так и не освободилось — ядро стоит на новой сборке, прежняя не возвращена; последний запуск идёт уже с
+        // действиями диспетчера при сбое: дальше ядро поднимает он.
+        let mut core = fake_with(&[Start::PipeTaken; TAKEN_ROUNDS as usize + 1]);
         assert_eq!(restart_with_fallback(&target_with_store(&inst, &store), &set, &mut core, &RealFs), 10);
-        assert!(core.starts.is_empty(), "все круги ожидания использованы");
+        assert!(core.starts.is_empty(), "все круги ожидания использованы, плюс запуск после возврата действий");
+        assert_eq!(core.calls.iter().rev().take(2).collect::<Vec<_>>(), [&"start", &"on"], "{:?}", core.calls);
         assert_eq!(read(&inst, APP_EXE), "new awg-ui.exe");
         assert!(set.iter().filter_map(|r| r.aside.as_ref()).all(|a| inst.join(a).is_file()), "прежние файлы на месте для ручного возврата");
         assert_eq!(history(&store).len(), 1);
-        assert_eq!(core.log.last(), Some(&(Severity::Bad, tr("updo.restart_pipe_gave_up"))));
+        let tail: Vec<&(Severity, String)> = core.log.iter().rev().take(2).collect();
+        assert_eq!(tail, [&(Severity::Warn, tr("updo.restart_handover")), &(Severity::Bad, tr("updo.restart_pipe_gave_up"))]);
+        // Имя освободилось к самому последнему запуску — новое ядро работает.
+        let mut starts = vec![Start::PipeTaken; TAKEN_ROUNDS as usize];
+        starts.push(Start::Running);
+        let mut core = fake_with(&starts);
+        assert_eq!(restart_with_fallback(&target_with_store(&inst, &store), &set, &mut core, &RealFs), 0);
+        assert_eq!(read(&inst, APP_EXE), "new awg-ui.exe");
         // Имя освободилось, но новая сборка всё равно не поднялась — это её сбой: обычный возврат.
         let mut core = fake_with(&[Start::PipeTaken, Start::Failed, Start::Running]);
         assert_eq!(restart_with_fallback(&target_with_store(&inst, &store), &set, &mut core, &RealFs), 6);

@@ -17,6 +17,7 @@ use crate::stats::{self, Stats, TunnelStats};
 mod rows;
 use rows::{drag_preview, drop_target, group_row, triangle, tunnel_row, GroupLine};
 
+use super::theme::NUM_FONT;
 use super::{Action, Confirm, Dialog};
 
 pub(super) const ROW_H: f32 = 24.0;
@@ -30,30 +31,64 @@ enum Drag {
     Group(String),
 }
 
-/// Числовые колонки слева направо: ключ сортировки, заголовок, ширина из настроек.
-fn numeric_columns(s: &Settings) -> Vec<(SortKey, &'static str, f32)> {
+/// Колонка имени не у́же этого: иначе от имён остаются одни многоточия. Числовые колонки, которым не хватает места
+/// рядом с ней, скрываются (`fit_columns`).
+const NAME_MIN: f32 = 120.0;
+/// Поле ячейки с каждой стороны: числа не прилипают к соседней колонке.
+const CELL_PAD: f32 = 8.0;
+/// Место под треугольник сортировки слева от заголовка числовой колонки. Отведено всегда, чтобы ширина колонки
+/// не прыгала при смене сортировки.
+const SORT_MARK: f32 = 12.0;
+const HEADER_FONT: f32 = 13.0;
+/// Самое широкое значение байт и скоростей: `fmt::bytes` держит число меньше 1024 в своей единице с двумя знаками,
+/// а 1048575 B — это «1024.00 KiB» (округление вверх), длиннее не бывает ни в одной единице.
+const WIDEST_BYTES: f64 = 1024.0 * 1024.0 - 1.0;
+
+/// Видимые числовые колонки слева направо (меню «Вид»): ключ сортировки и заголовок.
+fn numeric_columns(s: &Settings) -> Vec<(SortKey, &'static str)> {
     let v = &s.view;
-    let c = &s.columns;
-    [
-        (v.col_rx, SortKey::Rx, "col.rx", c.rx),
-        (v.col_tx, SortKey::Tx, "col.tx", c.tx),
-        (v.col_peak, SortKey::Peak, "col.peak", c.peak),
-        (v.col_share, SortKey::Share, "col.share", c.share),
-    ]
-    .into_iter()
-    .filter(|(on, ..)| *on)
-    .map(|(_, k, t, w)| (k, t, w))
-    .collect()
+    [(v.col_rx, SortKey::Rx, "col.rx"), (v.col_tx, SortKey::Tx, "col.tx"), (v.col_peak, SortKey::Peak, "col.peak"), (v.col_share, SortKey::Share, "col.share")]
+        .into_iter()
+        .filter(|(on, ..)| *on)
+        .map(|(_, k, t)| (k, t))
+        .collect()
 }
 
-fn column_width(s: &mut Settings, key: SortKey) -> Option<&mut f32> {
+/// Самое широкое значение, какое колонка может показать, — тем же форматированием, что ячейки (`cell_value`).
+fn widest_value(key: SortKey) -> String {
     match key {
-        SortKey::Rx => Some(&mut s.columns.rx),
-        SortKey::Tx => Some(&mut s.columns.tx),
-        SortKey::Peak => Some(&mut s.columns.peak),
-        SortKey::Share => Some(&mut s.columns.share),
-        SortKey::Name => None,
+        SortKey::Rx | SortKey::Tx => fmt::bytes(WIDEST_BYTES),
+        SortKey::Peak => fmt::rate(WIDEST_BYTES),
+        SortKey::Share => fmt::percent(1.0),
+        SortKey::Name => String::new(),
     }
+}
+
+fn text_width(ui: &Ui, text: String, font: FontId) -> f32 {
+    ui.painter().layout_no_wrap(text, font, ui.visuals().text_color()).size().x
+}
+
+/// Ширина числовой колонки по содержимому: самое широкое её значение или заголовок с треугольником сортировки,
+/// оба измерены шрифтом, которым рисуются. Числа не наезжают на соседей при любом значении и языке.
+fn natural_width(ui: &Ui, key: SortKey, title: &str) -> f32 {
+    let value = text_width(ui, widest_value(key), FontId::monospace(NUM_FONT));
+    let header = text_width(ui, tr(title), FontId::proportional(HEADER_FONT)) + SORT_MARK;
+    value.max(header) + 2.0 * CELL_PAD
+}
+
+/// Какие колонки помещаются в строку шириной `row`: имя не у́же `NAME_MIN`, числовые колонки, которым не хватает
+/// места, скрываются справа налево (порядок меню «Вид» — от важной к наименее важной). Наложения нет никогда.
+fn fit_columns(row: f32, mut cols: Vec<(SortKey, &'static str, f32)>) -> Vec<(SortKey, &'static str, f32)> {
+    while !cols.is_empty() && row - cols.iter().map(|c| c.2).sum::<f32>() < NAME_MIN {
+        cols.pop();
+    }
+    cols
+}
+
+/// Колонки таблицы на этот кадр: ширины по содержимому, лишние для ширины `row` скрыты.
+fn layout_columns(ui: &Ui, s: &Settings, row: f32) -> Vec<(SortKey, &'static str, f32)> {
+    let natural = numeric_columns(s).into_iter().map(|(k, t)| (k, t, natural_width(ui, k, t))).collect();
+    fit_columns(row, natural)
 }
 
 /// Границы ячеек строки: имя занимает остаток ширины.
@@ -186,8 +221,8 @@ pub(super) fn tunnel_list(ui: &mut Ui, s: &mut Settings, search: &mut String, l:
         list_keys(ui, &rows, s, l, actions);
     }
 
-    header(ui, s, actions);
-    let cols = numeric_columns(s);
+    let cols = layout_columns(ui, s, ui.available_width());
+    header(ui, &cols, s, actions);
     egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
         for row in &rows {
             match row {
@@ -370,14 +405,14 @@ fn list_keys(ui: &Ui, rows: &[Row], s: &Settings, l: &List, actions: &mut Vec<Ac
     }
 }
 
-/// Заголовок таблицы: клик — сортировка, перетаскивание левой границы числовой колонки — её ширина.
-fn header(ui: &mut Ui, s: &mut Settings, actions: &mut Vec<Action>) {
+/// Заголовок таблицы: клик — сортировка. Ширины колонок — по содержимому (`layout_columns`), каждый заголовок
+/// рисуется только в своей ячейке.
+fn header(ui: &mut Ui, cols: &[(SortKey, &str, f32)], s: &Settings, actions: &mut Vec<Action>) {
     let (row, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), ROW_H), Sense::hover());
     let painter = ui.painter_at(row);
     let weak = ui.visuals().weak_text_color();
     painter.line_segment([row.left_bottom(), row.right_bottom()], Stroke::new(1.0_f32, ui.visuals().widgets.noninteractive.bg_stroke.color));
-    let cols = numeric_columns(s);
-    let c = cells(row, &cols);
+    let c = cells(row, cols);
     let mut titled: Vec<(SortKey, &str, Rect)> = vec![(SortKey::Name, "col.tunnel", c.name)];
     titled.extend(cols.iter().zip(&c.nums).map(|((k, t, _), (_, r))| (*k, *t, *r)));
     for (key, title, rect) in titled {
@@ -390,23 +425,13 @@ fn header(ui: &mut Ui, s: &mut Settings, actions: &mut Vec<Action>) {
         let (align, pos) = if key == SortKey::Name {
             (Align2::LEFT_CENTER, rect.left_center() + Vec2::new(22.0, 0.0))
         } else {
-            (Align2::RIGHT_CENTER, rect.right_center() - Vec2::new(8.0, 0.0))
+            (Align2::RIGHT_CENTER, rect.right_center() - Vec2::new(CELL_PAD, 0.0))
         };
-        let text_rect = painter.text(pos, align, tr(title), FontId::proportional(13.0), color);
+        let cell = painter.with_clip_rect(rect);
+        let text_rect = cell.text(pos, align, tr(title), FontId::proportional(HEADER_FONT), color);
         if s.sort == key {
             let x = if key == SortKey::Name { text_rect.right() + 8.0 } else { text_rect.left() - 8.0 };
-            triangle(&painter, Pos2::new(x, row.center().y), 4.0, !s.sort_desc, color);
-        }
-        if key != SortKey::Name {
-            let handle = Rect::from_x_y_ranges(rect.left() - 3.0..=rect.left() + 3.0, row.y_range());
-            let drag = ui.interact(handle, id.with("resize"), Sense::drag());
-            if drag.hovered() || drag.dragged() {
-                ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
-                painter.vline(rect.left(), row.y_range(), Stroke::new(1.0_f32, weak));
-            }
-            if let Some(w) = column_width(s, key) {
-                *w = (*w - drag.drag_delta().x).clamp(50.0, 320.0);
-            }
+            triangle(&cell, Pos2::new(x, row.center().y), 4.0, !s.sort_desc, color);
         }
     }
 }
@@ -501,5 +526,81 @@ mod tests {
         assert_eq!(c.name.width(), 340.0);
         assert_eq!(c.nums[0].1.left(), 340.0);
         assert_eq!(c.nums[1].1.right(), 500.0);
+    }
+
+    fn all_columns() -> Settings {
+        let mut s = Settings::default();
+        (s.view.col_rx, s.view.col_tx, s.view.col_peak, s.view.col_share) = (true, true, true, true);
+        s
+    }
+
+    /// Узкая панель: числовые колонки скрываются справа налево, имя не у́же минимума; было — колонки складывались
+    /// с конца строки и при всех четырёх (360 pt) на панели 260 pt левая граница имени уходила правее правой.
+    #[test]
+    fn columns_that_do_not_fit_hide_from_the_right() {
+        let natural = vec![(SortKey::Rx, "col.rx", 100.0), (SortKey::Tx, "col.tx", 100.0), (SortKey::Peak, "col.peak", 120.0), (SortKey::Share, "col.share", 70.0)];
+        let keys = |row: f32| fit_columns(row, natural.clone()).iter().map(|c| c.0).collect::<Vec<_>>();
+        // Широкая панель: всё на месте, имени остаток.
+        assert_eq!(keys(600.0), vec![SortKey::Rx, SortKey::Tx, SortKey::Peak, SortKey::Share]);
+        assert_eq!(keys(390.0 + NAME_MIN), vec![SortKey::Rx, SortKey::Tx, SortKey::Peak, SortKey::Share], "ровно впритык");
+        // Чуть уже — первой уходит последняя (доля), потом пик.
+        assert_eq!(keys(389.0 + NAME_MIN), vec![SortKey::Rx, SortKey::Tx, SortKey::Peak]);
+        assert_eq!(keys(320.0 + NAME_MIN), vec![SortKey::Rx, SortKey::Tx, SortKey::Peak], "без доли — впритык");
+        assert_eq!(keys(319.0 + NAME_MIN), vec![SortKey::Rx, SortKey::Tx]);
+        assert_eq!(keys(260.0), vec![SortKey::Rx]);
+        // Уже имени с одной колонкой: только имя.
+        assert_eq!(keys(NAME_MIN + 99.0), Vec::<SortKey>::new());
+        assert_eq!(keys(50.0), Vec::<SortKey>::new());
+        for row in [50.0, 200.0, 260.0, 300.0, 400.0, 520.0, 900.0] {
+            let cols = fit_columns(row, natural.clone());
+            let c = cells(Rect::from_min_size(Pos2::ZERO, Vec2::new(row, ROW_H)), &cols);
+            assert!(c.name.width() >= NAME_MIN.min(row), "{row}: имя {}", c.name.width());
+            assert!(c.name.left() <= c.name.right(), "{row}");
+        }
+    }
+
+    /// `widest_value` и правда самое длинное, что показывает колонка: цифры моноширинные, так что длина в символах —
+    /// это ширина. Перебор границ всех единиц, включая округление вверх до «1024.00».
+    #[test]
+    fn widest_value_is_the_longest_cell() {
+        let mut bytes = vec![0.0, 1.0, 999.0, 1023.0, 1024.0, 1_000_000.0];
+        for k in 1..=4 {
+            let unit = 1024.0_f64.powi(k);
+            bytes.extend([unit - 1.0, unit, unit * 999.99, unit * 1023.994, unit * 1023.996]);
+        }
+        // Выше «1024.00 TiB» (петабайт за сеанс) число растёт без новой единицы — такое значение обрезает ячейка.
+        bytes.push(1024.0_f64.powi(5) - 1.0);
+        let len = |s: String| s.chars().count();
+        for b in bytes {
+            assert!(len(fmt::bytes(b)) <= len(widest_value(SortKey::Rx)), "{}", fmt::bytes(b));
+            assert!(len(fmt::rate(b)) <= len(widest_value(SortKey::Peak)), "{}", fmt::rate(b));
+        }
+        for share in [0.0, 0.05, 0.999, 1.0] {
+            assert!(len(fmt::percent(share)) <= len(widest_value(SortKey::Share)), "{share}");
+        }
+    }
+
+    /// Ширины измерены шрифтом в настоящем контексте egui: самое широкое значение и заголовок с треугольником влезают
+    /// в ячейку с полями; при всех четырёх колонках на панели минимальной ширины (260 pt) имя остаётся не у́же минимума,
+    /// на широкой — видны все колонки. Было: пик 104 pt при «1023.99 KiB/s» шире 110 pt — наезд на «Отдано».
+    #[test]
+    fn measured_columns_hold_their_widest_value() {
+        let ctx = egui::Context::default();
+        let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+            let s = all_columns();
+            for (key, title) in numeric_columns(&s) {
+                let w = natural_width(ui, key, title);
+                let value = text_width(ui, widest_value(key), FontId::monospace(NUM_FONT));
+                let header = text_width(ui, tr(title), FontId::proportional(HEADER_FONT));
+                assert!(value > 40.0, "{key:?}: {value}");
+                assert!(w >= value + 2.0 * CELL_PAD && w >= header + SORT_MARK + 2.0 * CELL_PAD, "{key:?}: {w}");
+            }
+            let wide = layout_columns(ui, &s, 900.0);
+            assert_eq!(wide.len(), 4);
+            let narrow = layout_columns(ui, &s, 260.0);
+            assert!(narrow.len() < 4, "{narrow:?}");
+            assert!(260.0 - narrow.iter().map(|c| c.2).sum::<f32>() >= NAME_MIN);
+            assert!(layout_columns(ui, &Settings::default(), 900.0).len() == numeric_columns(&Settings::default()).len());
+        });
     }
 }

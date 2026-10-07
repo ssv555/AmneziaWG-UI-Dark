@@ -38,8 +38,10 @@ pub fn names(dir: &Path) -> Vec<String> {
     v
 }
 
+/// Цель с хранилищем и папкой окна рядом с папкой программы (не внутри: тесты сравнивают её содержимое по именам).
 pub fn target(dir: &Path) -> InstallTarget {
-    InstallTarget { dir: dir.to_path_buf(), store: dir.join("store"), window_dir: dir.join("window") }
+    let beside = dir.parent().unwrap_or(dir);
+    InstallTarget { dir: dir.to_path_buf(), store: beside.join("store"), window_dir: beside.join("window") }
 }
 
 /// Файловая система, где переименование задаёт тест (прочее — настоящее).

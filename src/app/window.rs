@@ -38,6 +38,8 @@ pub(super) struct WindowState {
     hide_on_frame: Option<u64>,
     /// Масштаб, который окно уже получило (сравнение ловит Ctrl+Plus/Minus).
     zoom: f32,
+    /// Масштаб, при котором окну в последний раз задали наименьший размер (`min_size_due`); `None` — ещё не задавали.
+    min_size_zoom: Option<f32>,
     settings_path: PathBuf,
     /// Текст Settings.ini, как он лежит на диске.
     saved_text: String,
@@ -52,6 +54,7 @@ impl WindowState {
             frame: 0,
             hide_on_frame: start_hidden.then_some(HIDE_AT_FRAME),
             zoom: 1.0,
+            min_size_zoom: None,
             settings_path,
             saved_text,
             changed_at: None,
@@ -91,6 +94,18 @@ impl WindowState {
         // Новый масштаб вступает в силу со следующего кадра.
         self.zoom = setting;
         (setting, apply)
+    }
+
+    /// Пора ли задать окну наименьший размер (`MIN_WINDOW`, в точках) заново: при первом кадре и после каждой смены
+    /// масштаба. eframe задаёт его один раз при запуске в точках масштаба Windows; масштаб интерфейса его не менял, и
+    /// при 200 % в окне 760 px оставалось 380 pt — карточка туннеля и диалоги не умещались. Команда уходит, когда
+    /// `zoom` уже действует (кадр после `set_zoom_factor`): egui-winit переводит точки в пиксели текущим масштабом.
+    pub(super) fn min_size_due(&mut self, zoom: f32) -> bool {
+        if self.min_size_zoom.is_some_and(|z| (z - zoom).abs() < 0.001) {
+            return false;
+        }
+        self.min_size_zoom = Some(zoom);
+        true
     }
 
     /// Писать ли настройки: `text` — их нынешний вид. Запись откладывается, пока изменения не затихли на `SAVE_DELAY`.
@@ -199,6 +214,10 @@ impl App {
         self.s.ui_scale = scale;
         if let Some(zoom) = apply {
             ctx.set_zoom_factor(zoom);
+        }
+        // Наименьший размер окна — в точках нынешнего масштаба: окно 760x480 pt при 100 % и при 200 %.
+        if self.window.min_size_due(ctx.zoom_factor()) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::MinInnerSize(crate::settings::MIN_WINDOW.into()));
         }
     }
 
@@ -310,5 +329,17 @@ mod tests {
         // Ctrl+Plus за пределы допустимого: настройка зажата, окну выставляется зажатое значение.
         let (scale, apply) = w.sync_zoom(MAX_SCALE + 1.0, 1.25);
         assert_eq!((scale, apply), (MAX_SCALE, Some(MAX_SCALE)));
+    }
+
+    /// Наименьший размер окна задаётся при первом кадре и после каждой смены масштаба, а не каждый кадр.
+    #[test]
+    fn min_size_is_reapplied_once_per_zoom() {
+        let mut w = state(false, "");
+        assert!(w.min_size_due(1.0), "first frame");
+        assert!(!w.min_size_due(1.0));
+        assert!(!w.min_size_due(1.0));
+        assert!(w.min_size_due(2.0), "zoom changed");
+        assert!(!w.min_size_due(2.0));
+        assert!(w.min_size_due(1.0), "and back");
     }
 }

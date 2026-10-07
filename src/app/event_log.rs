@@ -1,16 +1,15 @@
 //! Панель журнала событий: фильтр по важности и туннелю, поиск, копирование строк и сохранение в файл.
 //! Отбор строк — чистая функция `visible` над событиями: панель только рисует то, что она вернула.
 
-use eframe::egui::{self, Ui};
+use eframe::egui::{self, Color32, RichText, Ui};
 
-use crate::crash::lock;
 use crate::events::{Event, Severity};
 use crate::fmt;
 use crate::i18n::{tr, trf};
 use crate::monitor::Shared;
 
 use super::menu::context_menu;
-use super::theme::{dot, mono, palette, severity_color};
+use super::theme::{dot, mono, palette, severity_color, Palette};
 use super::Action;
 
 /// Какие события показывать по важности.
@@ -82,7 +81,7 @@ impl super::App {
             return;
         };
         match crate::fsutil::write_atomic(&file, text.as_bytes()) {
-            Ok(()) => *lock(&self.notice) = Some(trf("log.saved", &[&file.display().to_string()])),
+            Ok(()) => self.notice.done(trf("log.saved", &[&file.display().to_string()])),
             Err(e) => self.action_error.push(crate::fsutil::io_ctx(&file, e)),
         }
     }
@@ -106,8 +105,13 @@ pub(super) fn event_log(ui: &mut Ui, shared: &Shared, filter: &mut LogFilter, se
     });
 }
 
-fn toolbar(ui: &mut Ui, filter: &mut LogFilter, selected: Option<&str>, shown: &[&Event], actions: &mut Vec<Action>) {
-    ui.horizontal(|ui| {
+/// Предел ширины списка туннелей в панели: длинное имя обрезается (целиком — в раскрытом списке).
+const TUNNEL_COMBO_W: f32 = 180.0;
+
+/// Панель инструментов журнала. Строка переносится: заголовок, два списка, поиск и две кнопки по-русски шире
+/// окна 760 pt, и прижатые к правому краю кнопки ложились поверх поля поиска. Тест `fit::event_log_toolbar_fits_the_minimum_window`.
+pub(super) fn toolbar(ui: &mut Ui, filter: &mut LogFilter, selected: Option<&str>, shown: &[&Event], actions: &mut Vec<Action>) {
+    ui.horizontal_wrapped(|ui| {
         ui.strong(tr("log.title"));
         ui.separator();
         egui::ComboBox::from_id_salt("log-severity").selected_text(filter.severity.label()).show_ui(ui, |ui| {
@@ -119,22 +123,33 @@ fn toolbar(ui: &mut Ui, filter: &mut LogFilter, selected: Option<&str>, shown: &
             Some(t) if only => t.to_string(),
             _ => tr("log.tunnel_all"),
         };
-        egui::ComboBox::from_id_salt("log-tunnel").selected_text(tunnel_label(filter.selected_only)).show_ui(ui, |ui| {
-            ui.selectable_value(&mut filter.selected_only, false, tr("log.tunnel_all"));
-            if selected.is_some() {
-                ui.selectable_value(&mut filter.selected_only, true, tunnel_label(true));
-            }
-        });
+        egui::ComboBox::from_id_salt("log-tunnel")
+            .width(TUNNEL_COMBO_W)
+            .truncate()
+            .selected_text(tunnel_label(filter.selected_only))
+            .show_ui(ui, |ui| {
+                ui.selectable_value(&mut filter.selected_only, false, tr("log.tunnel_all"));
+                if selected.is_some() {
+                    ui.selectable_value(&mut filter.selected_only, true, tunnel_label(true));
+                }
+            });
         ui.add(egui::TextEdit::singleline(&mut filter.query).hint_text(tr("log.search")).desired_width(160.0));
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if ui.add_enabled(!shown.is_empty(), egui::Button::new(tr("log.save_as"))).clicked() {
-                actions.push(Action::SaveLog(as_text(shown)));
-            }
-            if ui.add_enabled(!shown.is_empty(), egui::Button::new(tr("log.copy_all"))).clicked() {
-                ui.ctx().copy_text(as_text(shown));
-            }
-        });
+        if ui.add_enabled(!shown.is_empty(), egui::Button::new(tr("log.copy_all"))).clicked() {
+            ui.ctx().copy_text(as_text(shown));
+        }
+        if ui.add_enabled(!shown.is_empty(), egui::Button::new(tr("log.save_as"))).clicked() {
+            actions.push(Action::SaveLog(as_text(shown)));
+        }
     });
+}
+
+/// Цвет текста строки: ошибка и предупреждение видны не только 8-пиксельной точкой. Информация — обычным текстом.
+fn text_color(p: &Palette, severity: Severity) -> Option<Color32> {
+    match severity {
+        Severity::Bad => Some(p.error),
+        Severity::Warn => Some(p.warning),
+        Severity::Info => None,
+    }
 }
 
 fn lines(ui: &mut Ui, shown: &[&Event]) {
@@ -151,7 +166,13 @@ fn lines(ui: &mut Ui, shown: &[&Event]) {
             if !e.tunnel.is_empty() {
                 ui.strong(&e.tunnel);
             }
-            ui.label(&e.text);
+            // Перенос по ширине панели: длинная ошибка видна целиком, а не обрезана правым краем.
+            let text = RichText::new(&e.text);
+            ui.add(egui::Label::new(match text_color(palette(), e.severity) {
+                Some(c) => text.color(c),
+                None => text,
+            })
+            .wrap());
         });
         let id = ui.id().with(("log-line", e.at, e.tunnel.as_str(), e.text.as_str(), nth));
         let resp = ui.interact(row.response.rect, id, egui::Sense::click());
@@ -174,6 +195,16 @@ mod tests {
 
     fn ev(tunnel: &str, severity: Severity, text: &str) -> Event {
         Event::new(1_760_000_000, tunnel, severity, text, false)
+    }
+
+    #[test]
+    fn errors_and_warnings_stand_out_by_text_colour() {
+        use super::super::theme::{DAYLIGHT, GRAPHITE, SLATE};
+        for p in [&GRAPHITE, &SLATE, &DAYLIGHT] {
+            assert_eq!(text_color(p, Severity::Bad), Some(p.error));
+            assert_eq!(text_color(p, Severity::Warn), Some(p.warning));
+            assert_eq!(text_color(p, Severity::Info), None, "информация — обычным текстом");
+        }
     }
 
     fn sample() -> Vec<Event> {

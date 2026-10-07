@@ -337,7 +337,7 @@ pub fn export_all(exe: &Path, zip: &Path) -> Result<Vec<crate::archive::Entry>, 
         match crate::archive::read(zip, None) {
             Ok(entries) => return Ok(entries),
             Err(_) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(300)),
-            Err(e) => return Err(format!("{}: {e:?}", zip.display())),
+            Err(e) => return Err(crate::fsutil::io_ctx(zip, e)),
         }
     }
 }

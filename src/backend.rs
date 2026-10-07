@@ -39,6 +39,12 @@ pub trait TunnelHost: Send + Sync {
         None
     }
 
+    /// Идёт установщик Windows: чужой MSI AmneziaWG убирает службы туннелей режима 1, и надзор не должен ни выводить
+    /// их из набора, ни ставить заново посреди установки. Только у режима 1 (`Real`); остальным не нужно.
+    fn installer_running(&self) -> bool {
+        false
+    }
+
     /// Задержка до узла, мс (пинг «трафик проходит»).
     fn ping_ms(&self, host: &str) -> Result<u32, String> {
         crate::ping::measure(host)
@@ -80,6 +86,10 @@ impl TunnelHost for Real {
 
     fn service_exists(&self, tunnel: &str) -> bool {
         crate::win::service_command(&format!("{NATIVE_TUNNEL_SERVICE}{tunnel}")).is_some()
+    }
+
+    fn installer_running(&self) -> bool {
+        crate::win::installer_running()
     }
 }
 

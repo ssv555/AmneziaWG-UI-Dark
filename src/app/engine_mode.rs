@@ -10,8 +10,9 @@ use eframe::egui::{self, RichText};
 
 use super::modals::{Modal, Outcome, Turn};
 use super::sources::{follow_stats, StatsChange};
-use super::dialog::dialog_window;
+use super::dialog::{dialog_body, error_line};
 use super::theme::palette;
+use super::notice::Notices;
 use super::{dialog_buttons, App, Editor};
 use crate::archive::{self, ReadError};
 use crate::conf::TunnelInfo;
@@ -26,6 +27,8 @@ use crate::{store, win};
 /// Минимальная длина пароля резервной копии: zip AES считает ключ всего 1000 раундами PBKDF2,
 /// поэтому от подбора защищает только длина пароля.
 const MIN_PASSWORD: usize = 12;
+/// Ширина окна смены режима — самого высокого из диалогов со справкой; её же берёт тест умещаемости.
+pub(super) const MODE_SWITCH_WIDTH: f32 = 560.0;
 
 /// Пауза перед повторным запросом сведений после ошибки: ядро может перезапускаться, а запрос на каждом кадре — шторм.
 const INFO_RETRY: Duration = Duration::from_secs(5);
@@ -90,7 +93,7 @@ impl App {
     }
 
     /// Окно смены режима: что это за режим, что даёт, какие туннели будут отключены.
-    pub(super) fn show_mode_switch(&mut self, ctx: &egui::Context, target: Mode, turn: Turn) -> Outcome {
+    pub(super) fn show_mode_switch(&mut self, ctx: &egui::Context, target: Mode, mut turn: Turn) -> Outcome {
         let running = self.shared.running_names();
         // Встроенный режим — только с файлами движка, которые установлены вместе с ядром и чьи суммы вшиты в сборку.
         let problem = if target == Mode::Engine { crate::engine::installed_files_ok().err() } else { None };
@@ -106,26 +109,27 @@ impl App {
         }
         let (mut yes, mut no) = (false, false);
         let mut open = true;
-        dialog_window(ctx, title, "mode-switch", &mut open)
+        turn.window(ctx, title, "mode-switch", &mut open)
             .show(ctx, |ui| {
-                ui.set_width(560.0);
-                if !help_hidden {
-                    ui.add(egui::Label::new(help).wrap());
-                    ui.add_space(8.0);
-                }
-                if !running.is_empty() {
-                    ui.add(egui::Label::new(RichText::new(trf("mode.will_disconnect", &[&running.join(", ")])).color(palette().warning)).wrap());
-                    ui.add_space(8.0);
-                }
-                if let Some(p) = &problem {
-                    ui.add(egui::Label::new(RichText::new(trf("mode.missing", &[p])).color(palette().error)).wrap());
-                    ui.add_space(8.0);
-                }
-                ui.add_space(2.0);
-                if !help_hidden {
-                    ui.checkbox(turn.remember, tr("dlg.dont_show"));
-                    ui.add_space(6.0);
-                }
+                dialog_body(ui, MODE_SWITCH_WIDTH, |ui| {
+                    if !help_hidden {
+                        ui.add(egui::Label::new(help).wrap());
+                        ui.add_space(8.0);
+                    }
+                    if !running.is_empty() {
+                        ui.add(egui::Label::new(RichText::new(trf("mode.will_disconnect", &[&running.join(", ")])).color(palette().warning)).wrap());
+                        ui.add_space(8.0);
+                    }
+                    if let Some(p) = &problem {
+                        ui.add(egui::Label::new(RichText::new(trf("mode.missing", &[p])).color(palette().error)).wrap());
+                        ui.add_space(8.0);
+                    }
+                    ui.add_space(2.0);
+                    if !help_hidden {
+                        ui.checkbox(turn.remember, tr("dlg.dont_show"));
+                    }
+                });
+                ui.add_space(6.0);
                 (yes, no) = dialog_buttons(ui, &tr("mode.switch"), problem.is_none(), Some(&tr("btn.cancel")));
             });
         let (enter, escape) = turn.keys(ctx);
@@ -146,10 +150,10 @@ impl App {
     /// новый список придёт со следующим опросом.
     fn switch_mode(&mut self, target: Mode) {
         let (core, error, notice, ctx) = (self.core.clone(), self.action_error.clone(), self.notice.clone(), self.ctx.clone());
-        *lock(&notice) = Some(tr("mode.switching"));
+        notice.progress(tr("mode.switching"));
         std::thread::spawn(move || {
             let result = core.ok(Request::SetMode(target));
-            *lock(&notice) = None;
+            notice.clear();
             if let Err(e) = result {
                 error.push(e);
             }
@@ -194,7 +198,7 @@ impl App {
             }
         }
         match self.core.report(Request::Import(entries)) {
-            Ok(r) => *lock(&self.notice) = Some(report_text(&r)),
+            Ok(r) => show_report(&self.notice, &r),
             Err(e) => self.fail(e),
         }
     }
@@ -202,12 +206,12 @@ impl App {
     /// «Забрать всё из AmneziaWG»: ядро запускает родной экспорт в вашем сеансе и импортирует туннели.
     pub(super) fn engine_take_native(&self) {
         let (core, error, notice, ctx) = (self.core.clone(), self.action_error.clone(), self.notice.clone(), self.ctx.clone());
-        *lock(&notice) = Some(tr("eng.taking"));
+        notice.progress(tr("eng.taking"));
         std::thread::spawn(move || {
             match core.report(Request::TakeNative) {
-                Ok(r) => *lock(&notice) = Some(report_text(&r)),
+                Ok(r) => show_report(&notice, &r),
                 Err(e) => {
-                    *lock(&notice) = None;
+                    notice.clear();
                     error.push(e);
                 }
             }
@@ -229,7 +233,7 @@ impl App {
         let name = format!("AmneziaWG-UI-Dark-backup-{}.zip", crate::fmt::date(crate::monitor::unix_now()));
         let Some(file) = win::pick_files(win::Files::Zip, true, false, Some(&PathBuf::from(name))).into_iter().next() else { return };
         match self.core.entries(Request::ExportAll).and_then(|entries| archive::write_backup(&file, password, &entries).map(|()| entries.len())) {
-            Ok(n) => *lock(&self.notice) = Some(trf("eng.backup_done", &[&n.to_string(), &file.display().to_string()])),
+            Ok(n) => self.notice.done(trf("eng.backup_done", &[&n.to_string(), &file.display().to_string()])),
             Err(e) => self.fail(e),
         }
     }
@@ -275,12 +279,12 @@ impl App {
     }
 
     fn fail(&self, e: String) {
-        *lock(&self.notice) = None;
+        self.notice.clear();
         self.action_error.push(e);
     }
 
     /// Окна пароля и имени туннеля.
-    pub(super) fn show_engine_dialog(&mut self, ctx: &egui::Context, dialog: &mut EngineDialog, turn: Turn) -> Outcome {
+    pub(super) fn show_engine_dialog(&mut self, ctx: &egui::Context, dialog: &mut EngineDialog, mut turn: Turn) -> Outcome {
         let focus = turn.fresh;
         let existing = self.shared.known_tunnels();
         let (mut ok, mut cancel, mut valid, mut open) = (false, false, false, true);
@@ -288,31 +292,31 @@ impl App {
             EngineDialog::Password { purpose, pass, repeat, error } => {
                 let backup = matches!(purpose, Purpose::Backup);
                 let title = tr(if backup { "eng.backup_title" } else { "eng.restore_title" });
-                dialog_window(ctx, title, "engine-dialog", &mut open).show(ctx, |ui| {
-                    ui.set_width(420.0);
-                    ui.add(egui::Label::new(tr(if backup { "eng.backup_text" } else { "eng.restore_text" })).wrap());
-                    ui.add_space(6.0);
-                    ui.label(tr("eng.password"));
-                    let out = ui.add(egui::TextEdit::singleline(pass).password(true).desired_width(f32::INFINITY));
-                    if focus {
-                        out.request_focus();
-                    }
-                    if backup {
-                        ui.label(tr("eng.password_repeat"));
-                        ui.add(egui::TextEdit::singleline(repeat).password(true).desired_width(f32::INFINITY));
-                    }
-                    let problem = if pass.is_empty() {
-                        None
-                    } else if backup && pass.chars().count() < MIN_PASSWORD {
-                        Some(tr("eng.password_short"))
-                    } else if backup && pass != repeat {
-                        Some(tr("eng.password_mismatch"))
-                    } else {
-                        None
-                    };
-                    valid = !pass.is_empty() && problem.is_none();
-                    let line = problem.or_else(|| error.clone()).unwrap_or_default();
-                    ui.add_sized([ui.available_width(), 18.0], egui::Label::new(RichText::new(line).color(palette().error).small()).truncate());
+                turn.window(ctx, title, "engine-dialog", &mut open).show(ctx, |ui| {
+                    dialog_body(ui, 420.0, |ui| {
+                        ui.add(egui::Label::new(tr(if backup { "eng.backup_text" } else { "eng.restore_text" })).wrap());
+                        ui.add_space(6.0);
+                        ui.label(tr("eng.password"));
+                        let out = ui.add(egui::TextEdit::singleline(pass).password(true).desired_width(f32::INFINITY));
+                        if focus {
+                            out.request_focus();
+                        }
+                        if backup {
+                            ui.label(tr("eng.password_repeat"));
+                            ui.add(egui::TextEdit::singleline(repeat).password(true).desired_width(f32::INFINITY));
+                        }
+                        let problem = if pass.is_empty() {
+                            None
+                        } else if backup && pass.chars().count() < MIN_PASSWORD {
+                            Some(tr("eng.password_short"))
+                        } else if backup && pass != repeat {
+                            Some(tr("eng.password_mismatch"))
+                        } else {
+                            None
+                        };
+                        valid = !pass.is_empty() && problem.is_none();
+                        error_line(ui, &problem.or_else(|| error.clone()).unwrap_or_default());
+                    });
                     (ok, cancel) = dialog_buttons(ui, &tr(if backup { "eng.backup_save" } else { "btn.ok" }), valid, Some(&tr("btn.cancel")));
                 });
             }
@@ -321,26 +325,27 @@ impl App {
                     Some(o) => trf("eng.rename_title", &[o]),
                     None => tr("eng.new_title"),
                 };
-                dialog_window(ctx, title, "engine-dialog", &mut open).show(ctx, |ui| {
-                    ui.set_width(380.0);
-                    ui.label(tr("dlg.name"));
-                    let out = ui.add(egui::TextEdit::singleline(name).desired_width(f32::INFINITY));
-                    if focus {
-                        out.request_focus();
-                    }
-                    let same = old.as_deref() == Some(name.as_str());
-                    let error = if name.is_empty() || same {
-                        String::new()
-                    } else if !crate::engine::valid_name(name) {
-                        trf("eng.bad_name", &[name])
-                    // NTFS не различает регистр: «Office» занят, если есть «office» (кроме самого переименуемого).
-                    } else if store::find(&existing, name).is_some_and(|e| Some(e) != old.as_ref()) {
-                        tr("dlg.err_exists")
-                    } else {
-                        String::new()
-                    };
-                    valid = !name.is_empty() && !same && error.is_empty();
-                    ui.add_sized([ui.available_width(), 34.0], egui::Label::new(RichText::new(error).color(palette().error).small()).wrap());
+                turn.window(ctx, title, "engine-dialog", &mut open).show(ctx, |ui| {
+                    dialog_body(ui, 380.0, |ui| {
+                        ui.label(tr("dlg.name"));
+                        let out = ui.add(egui::TextEdit::singleline(name).desired_width(f32::INFINITY));
+                        if focus {
+                            out.request_focus();
+                        }
+                        let same = old.as_deref() == Some(name.as_str());
+                        let error = if name.is_empty() || same {
+                            String::new()
+                        } else if !crate::engine::valid_name(name) {
+                            trf("eng.bad_name", &[name])
+                        // NTFS не различает регистр: «Office» занят, если есть «office» (кроме самого переименуемого).
+                        } else if store::find(&existing, name).is_some_and(|e| Some(e) != old.as_ref()) {
+                            tr("dlg.err_exists")
+                        } else {
+                            String::new()
+                        };
+                        valid = !name.is_empty() && !same && error.is_empty();
+                        error_line(ui, &error);
+                    });
                     (ok, cancel) = dialog_buttons(ui, &tr("btn.ok"), valid, Some(&tr("btn.cancel")));
                 });
             }
@@ -374,6 +379,16 @@ fn mode_switch_silent(help_hidden: bool, running: bool, problem: bool) -> bool {
     help_hidden && !running && !problem
 }
 
+/// Итог импорта в строку состояния и журнал: отклонённые конфиги (команды PreUp…, неподходящее имя) — предупреждение,
+/// а не зелёный успех: после закрытия подсказки отказ должен остаться в журнале.
+fn show_report(notice: &Notices, r: &store::ImportReport) {
+    if r.scripts.is_empty() && r.bad_name.is_empty() {
+        notice.done(report_text(r));
+    } else {
+        notice.warn(report_text(r));
+    }
+}
+
 /// «Импортировано: N» + какие уже были, какие с неподходящим именем и какие отклонены из-за команд.
 fn report_text(r: &store::ImportReport) -> String {
     let mut text = trf("eng.imported", &[&r.added.len().to_string()]);
@@ -402,6 +417,24 @@ mod tests {
         assert!(!mode_switch_silent(false, false, false), "справка не скрыта");
         assert!(!mode_switch_silent(true, true, false), "туннели будут отключены — спросить");
         assert!(!mode_switch_silent(true, false, true), "нет файлов движка — показать ошибку");
+    }
+
+    /// Импорт, где часть конфигов отклонена, — не зелёный успех: предупреждение, и оно остаётся в журнале.
+    #[test]
+    fn import_with_refused_configs_is_a_warning() {
+        let (shared, _error) = super::super::testkit::sink();
+        let notice = Notices::new(shared.clone());
+        let clean = store::ImportReport { added: vec!["a".into()], existing: vec!["b".into()], ..Default::default() };
+        show_report(&notice, &clean);
+        assert_eq!(notice.current().map(|n| n.kind), Some(super::super::notice::NoticeKind::Done));
+        let refused = store::ImportReport { added: vec!["a".into()], scripts: vec!["x".into(), "y".into()], ..Default::default() };
+        show_report(&notice, &refused);
+        assert_eq!(notice.current().map(|n| n.kind), Some(super::super::notice::NoticeKind::Warning));
+        let log: Vec<_> = shared.events_since(0).into_iter().map(|(_, e)| e.severity).collect();
+        assert_eq!(log, [Severity::Info, Severity::Warn]);
+        let bad = store::ImportReport { bad_name: vec!["?".into()], ..Default::default() };
+        show_report(&notice, &bad);
+        assert_eq!(notice.current().map(|n| n.kind), Some(super::super::notice::NoticeKind::Warning));
     }
 
     #[test]

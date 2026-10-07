@@ -5,19 +5,21 @@ use std::io;
 use std::path::Path;
 
 /// Операции, из которых состоят замена файла и откат. Остальное (чтение, проверка существования) — напрямую.
-pub(super) trait Fs {
+pub(crate) trait Fs {
     fn rename(&self, from: &Path, to: &Path) -> io::Result<()>;
     fn remove_file(&self, path: &Path) -> io::Result<()>;
-    /// Копия `from` в `to`; размер.
+    /// Копия `from` в `to`, записанная на диск (`fsutil::copy_durable`): её сразу переименуют на место рабочего
+    /// файла, и после пропадания питания она должна быть целой; размер.
     fn copy(&self, from: &Path, to: &Path) -> io::Result<u64>;
 }
 
 /// Настоящая файловая система.
-pub(super) struct RealFs;
+pub(crate) struct RealFs;
 
 impl Fs for RealFs {
     fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
-        std::fs::rename(from, to)
+        // С записью на диск: шаги замены набора должны ложиться в том порядке, в каком их ждёт `swap::recover`.
+        crate::fsutil::rename_durably(from, to)
     }
 
     fn remove_file(&self, path: &Path) -> io::Result<()> {
@@ -25,6 +27,6 @@ impl Fs for RealFs {
     }
 
     fn copy(&self, from: &Path, to: &Path) -> io::Result<u64> {
-        std::fs::copy(from, to)
+        crate::fsutil::copy_durable(from, to)
     }
 }

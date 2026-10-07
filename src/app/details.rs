@@ -91,14 +91,23 @@ fn label(text: &str) -> RichText {
     RichText::new(text).weak()
 }
 
-pub(super) fn details(ui: &mut Ui, d: &Detail, s: &mut Settings, view: &mut GraphState, actions: &mut Vec<Action>) {
+/// Правая колонка целиком — карточка, график и сведения — в одной вертикальной прокрутке: в низком окне (760x480 с
+/// открытым журналом) карточке с графиком не хватает ~70 pt, и без прокрутки низ карточки и сведения обрезались
+/// краем панели. Прокрутка сведений отдельно от карточки была бы второй вложенной — egui такое не любит.
+/// Возвращает, пришлось ли прокручивать (колонка выше панели) — для теста `fit::main_window_fits_the_minimum_size`.
+pub(super) fn details(ui: &mut Ui, d: &Detail, s: &mut Settings, view: &mut GraphState, actions: &mut Vec<Action>) -> bool {
+    let out = egui::ScrollArea::vertical().id_salt("card-column").auto_shrink([false, false]).show(ui, |ui| column(ui, d, s, view, actions));
+    out.content_size.y > out.inner_rect.height() + 0.5
+}
+
+fn column(ui: &mut Ui, d: &Detail, s: &mut Settings, view: &mut GraphState, actions: &mut Vec<Action>) {
     let status = d.live.and_then(|l| l.status.as_ref());
     let running = d.live.is_some();
     egui::Frame::group(ui.style()).inner_margin(egui::Margin::same(12)).show(ui, |ui| {
         ui.set_width(ui.available_width());
+        // Кнопки раскладываются первыми (справа налево), имя — в остатке с обрезкой: иначе длинное имя рисовалось
+        // во всю ширину, а кнопки ложились поверх него. Обрезанное имя egui показывает целиком в подсказке.
         ui.horizontal(|ui| {
-            let name = ui.add(egui::Label::new(RichText::new(d.name).size(18.0).strong()).sense(egui::Sense::click()));
-            copy_menu(&name, d.name);
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 // То же решение, что у меню строки и трея: туннель, который ядро переподключает, — «Отключить».
                 let primary = Primary::of(d.health.level, d.core_lost);
@@ -128,13 +137,25 @@ pub(super) fn details(ui: &mut Ui, d: &Detail, s: &mut Settings, view: &mut Grap
                         actions.push(Action::Switch(d.name.to_string(), Plan::Reconnect));
                     }
                 }
+                ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                    let name = ui.add(egui::Label::new(RichText::new(d.name).size(18.0).strong()).truncate().sense(egui::Sense::click()));
+                    copy_menu(&name, d.name);
+                });
             });
         });
         ui.add_space(6.0);
         ui.horizontal(|ui| {
             dot(ui, level_color(d.health.level), 9.0, &a11y::state_word(Primary::of(d.health.level, d.core_lost)));
-            ui.label(RichText::new(&d.health.text).size(22.0).strong().color(level_color(d.health.level)));
+            let headline = ui.add(egui::Label::new(RichText::new(&d.health.text).size(22.0).strong().color(level_color(d.health.level))).wrap());
+            if let Some(detail) = &d.health.detail {
+                headline.on_hover_text(detail);
+            }
         });
+        // Крупная строка — короткое состояние; известная причина — строкой ниже словами, технический текст — в подсказке
+        // и в журнале событий (`Health::log_text`).
+        if let Some(cause) = d.health.detail.as_deref().and_then(crate::explain::cause) {
+            ui.add(egui::Label::new(RichText::new(cause.text()).color(level_color(d.health.level))).wrap());
+        }
         ui.add_space(8.0);
 
         let mut rows: Vec<[RichText; 4]> = Vec::new();
@@ -161,7 +182,7 @@ pub(super) fn details(ui: &mut Ui, d: &Detail, s: &mut Settings, view: &mut Grap
                 let value = match &d.ping.last {
                     _ if d.ping_unavailable => mono(tr("agent.unavailable"), palette().idle),
                     None => mono("…", palette().idle),
-                    Some(Ok(ms)) => mono(trf("unit.ms", &[&ms.to_string()]), palette().graph_ping),
+                    Some(Ok(ms)) => mono(crate::fmt::ms(ms.to_string()), palette().graph_ping),
                     Some(Err(_)) => mono(stale_ping(d.ping), palette().error),
                 };
                 rows.push([label(&trf("st.ping_to", &[&d.ping.host])), value, label(""), label("")]);
@@ -205,7 +226,7 @@ pub(super) fn details(ui: &mut Ui, d: &Detail, s: &mut Settings, view: &mut Grap
         (None, Some((info, origin))) => (Some(info.clone()), Some(origin.as_str())),
         (None, None) => (None, None),
     };
-    egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| match info {
+    match info {
         Some(info) => config_sections(ui, &info, origin),
         None if s.mode() == Mode::Engine => {
             ui.weak(tr("det.not_loaded"));
@@ -223,7 +244,7 @@ pub(super) fn details(ui: &mut Ui, d: &Detail, s: &mut Settings, view: &mut Grap
                 }
             });
         }
-    });
+    }
 }
 
 /// Строка раздела сведений: подпись, значение и можно ли его скопировать (правый щелчок -> «Копировать»).
@@ -249,7 +270,7 @@ fn interface_rows(info: &TunnelInfo) -> Vec<InfoRow> {
         InfoRow::new(tr("det.dns"), info.dns.join(", "), true),
         InfoRow::new(tr("det.port"), info.listen_port.clone(), true),
         InfoRow::new(tr("det.mtu"), info.mtu.clone(), false),
-        InfoRow::new("AWG".to_string(), awg.join("  "), false),
+        InfoRow::new(tr("det.awg"), awg.join("  "), false),
     ]
 }
 

@@ -14,7 +14,7 @@ use crate::i18n::{tr, trf};
 use crate::settings::{Mode, Settings, SortKey};
 use crate::stats::{self, TunnelStats};
 
-use super::{cell_value, cells, scroll_flag, Drag, List, Primary, INDENT, ROW_H};
+use super::{cell_value, cells, scroll_flag, Drag, List, Primary, CELL_PAD, INDENT, ROW_H};
 
 /// Строка — цель Shift+F10 и клавиши меню: в таблице клавиши — у выделенной строки (как стрелки и Enter), если таблица
 /// их сейчас принимает и фокус egui не стоит на другом элементе (значение в карточке, строка журнала).
@@ -102,6 +102,17 @@ fn truncated(ui: &Ui, text: &str, font: FontId, color: Color32, width: f32) -> A
     ui.painter().layout_job(job)
 }
 
+/// Промежуток между именем группы и счётом «активные/всего».
+const COUNT_GAP: f32 = 12.0;
+
+/// Числа строки: прижаты вправо с полем `CELL_PAD`, как заголовок колонки, и рисуются только в своей ячейке.
+fn numbers(painter: &egui::Painter, nums: &[(SortKey, Rect)], st: &TunnelStats, share: f64, color: Color32) {
+    for (key, rect) in nums {
+        let pos = rect.right_center() - Vec2::new(CELL_PAD, 0.0);
+        painter.with_clip_rect(*rect).text(pos, Align2::RIGHT_CENTER, cell_value(*key, st, share), FontId::monospace(NUM_FONT), color);
+    }
+}
+
 /// Строка группы (или «Без группы») в дереве.
 pub(super) struct GroupLine<'a> {
     pub(super) key: &'a str,
@@ -161,21 +172,21 @@ pub(super) fn group_row(ui: &mut Ui, g: &GroupLine, cols: &[(SortKey, &str, f32)
         agg.add(active, st.rx, st.tx, st.peak_rx, stats::share(l.stats, t));
     }
     let shown = if real { groups::leaf(g.key).to_string() } else { tr("app.ungrouped") };
-    let count = format!("{}/{}", agg.active, agg.total);
-    let count_w = 12.0 + 9.0 * count.chars().count() as f32;
+    // Счёт «активные/всего» измерен, имя обрезается по остатку ячейки; обрезанное — целиком в подсказке.
+    let count = painter.layout_no_wrap(format!("{}/{}", agg.active, agg.total), FontId::monospace(12.5), weak);
     let name_left = x0 + 22.0;
-    let galley = truncated(ui, &shown, FontId::proportional(15.0), strong, c.name.right() - name_left - count_w - 8.0);
+    let galley = truncated(ui, &shown, FontId::proportional(15.0), strong, c.name.right() - name_left - count.size().x - COUNT_GAP - CELL_PAD);
+    let elided = galley.elided;
     let name_w = galley.size().x;
-    painter.galley(Pos2::new(name_left, row.center().y - galley.size().y / 2.0), galley, strong);
-    painter.text(Pos2::new(name_left + name_w + 12.0, row.center().y), Align2::LEFT_CENTER, count, FontId::monospace(12.5), weak);
+    let name_cell = painter.with_clip_rect(c.name);
+    name_cell.galley(Pos2::new(name_left, row.center().y - galley.size().y / 2.0), galley, strong);
+    name_cell.galley(Pos2::new(name_left + name_w + COUNT_GAP, row.center().y - count.size().y / 2.0), count, weak);
     let mut sum = TunnelStats::default();
     sum.rx = agg.rx;
     sum.tx = agg.tx;
     sum.peak_rx = agg.peak;
-    for (key, rect) in &c.nums {
-        let text = cell_value(*key, &sum, agg.share);
-        painter.text(rect.right_center() - Vec2::new(8.0, 0.0), Align2::RIGHT_CENTER, text, FontId::monospace(NUM_FONT), strong);
-    }
+    numbers(&painter, &c.nums, &sum, agg.share, strong);
+    let resp = if elided { resp.on_hover_text(shown.as_str()) } else { resp };
 
     if real {
         resp.dnd_set_drag_payload(Drag::Group(g.key.to_string()));
@@ -253,16 +264,26 @@ fn group_menu(ui: &mut Ui, s: &Settings, of: Option<&str>, tunnel: &str, actions
 
 /// Имя активного туннеля — цветом его кружка, чтобы вся строка читалась включённой: подключён — `connected`,
 /// подключается, переподключается или пинг не проходит — `warning`. `None` — обычный текст: отключён, состояние
-/// неизвестно (нет связи с ядром, кружок жёлтый, но туннель не показан включённым) и ошибка (`Level::Bad`): красный
-/// в выбранной строке Графита нечитаем (2.2 на 005C80), о сбое говорят кружок и подсказка.
-fn name_color(p: &Palette, level: Level, primary: Primary) -> Option<Color32> {
-    if !primary.is_on() {
-        return None;
-    }
+/// неизвестно (нет связи с ядром, кружок жёлтый, но туннель не показан включённым). Ошибка (`Level::Bad`) — имя `error`,
+/// чтобы сбой не отличался от «отключён» одним цветом кружка; в выбранной строке красный нечитаем (2.2 на 005C80
+/// Графита) — там имя обычное, а сбой показывает кольцо вместо кружка (`status_mark`).
+fn name_color(p: &Palette, level: Level, primary: Primary, selected: bool) -> Option<Color32> {
     match level {
+        Level::Bad => (!selected).then_some(p.error),
+        _ if !primary.is_on() => None,
         Level::Ok => Some(p.connected),
         Level::Busy | Level::Warn => Some(p.warning),
-        Level::Off | Level::Bad => None,
+        Level::Off => None,
+    }
+}
+
+/// Кружок состояния строки. Ошибка — кольцо: форма, а не только цвет, отличает её от серого «отключён» и для тех,
+/// кто не различает красный и серый.
+fn status_mark(painter: &egui::Painter, center: Pos2, radius: f32, level: Level) {
+    if level == Level::Bad {
+        painter.circle_stroke(center, radius - 1.0, Stroke::new(2.0, level_color(level)));
+    } else {
+        painter.circle_filled(center, radius, level_color(level));
     }
 }
 
@@ -277,7 +298,7 @@ pub(super) fn tunnel_row(
     l: &List,
     actions: &mut Vec<Action>,
 ) {
-    let h = l.healths.get(name).cloned().unwrap_or(Health { level: Level::Off, text: String::new() });
+    let h = l.healths.get(name).cloned().unwrap_or(Health::new(Level::Off, String::new()));
     let sense = if s.view.groups { Sense::click_and_drag() } else { Sense::click() };
     let (row, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), ROW_H), sense);
     let selected = s.book.is_tunnel_highlighted(name);
@@ -292,32 +313,24 @@ pub(super) fn tunnel_row(
     }
     let text_color = if selected { ui.visuals().selection.stroke.color } else { ui.visuals().text_color() };
     let primary = Primary::of(h.level, l.snap.core_lost);
-    let active = name_color(palette(), h.level, primary);
+    let active = name_color(palette(), h.level, primary, selected);
     guides(ui, &painter, row, depth);
     let indent = depth as f32 * INDENT + 6.0;
     let c = cells(row, cols);
     let dot_r = if active.is_some() { 6.0 } else { 5.0 };
-    painter.circle_filled(Pos2::new(c.name.left() + indent + 5.0, row.center().y), dot_r, level_color(h.level));
+    status_mark(&painter, Pos2::new(c.name.left() + indent + 5.0, row.center().y), dot_r, h.level);
     let name_color = active.unwrap_or(text_color);
     let galley = truncated(ui, name, FontId::proportional(15.0), name_color, c.name.width() - indent - 22.0);
-    painter.galley(Pos2::new(c.name.left() + indent + 16.0, row.center().y - galley.size().y / 2.0), galley, name_color);
+    let name_cell = painter.with_clip_rect(c.name);
+    name_cell.galley(Pos2::new(c.name.left() + indent + 16.0, row.center().y - galley.size().y / 2.0), galley, name_color);
     let st = l.stats.get(name).cloned().unwrap_or_default();
-    let share = stats::share(l.stats, name);
-    for (key, rect) in &c.nums {
-        painter.text(
-            rect.right_center() - Vec2::new(8.0, 0.0),
-            Align2::RIGHT_CENTER,
-            cell_value(*key, &st, share),
-            FontId::monospace(NUM_FONT),
-            text_color,
-        );
-    }
+    numbers(&painter, &c.nums, &st, stats::share(l.stats, name), text_color);
     if s.view.groups {
         resp.dnd_set_drag_payload(Drag::Tunnel(name.clone()));
         // Брошенное на туннель попадает в его группу.
         drop_target(ui, &resp, row, group, s, actions);
     }
-    let resp = resp.on_hover_text(format!("{name}\n{}", h.text));
+    let resp = resp.on_hover_text(format!("{name}\n{}", h.log_text()));
     if resp.clicked() {
         actions.push(Action::Select(name.clone()));
     }
@@ -443,18 +456,33 @@ mod tests {
     use super::*;
     use crate::app::theme::{DAYLIGHT, GRAPHITE, SLATE};
 
+    /// Подсказка к имени группы показывается, когда имя обрезано: признак — `elided` того же galley, что рисуется.
+    /// Было: длинное имя группы обрезалось многоточием без подсказки (у строк туннелей она есть).
+    #[test]
+    fn truncated_group_name_is_detected_for_its_tooltip() {
+        let ctx = egui::Context::default();
+        let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+            let font = FontId::proportional(15.0);
+            let long = truncated(ui, "Очень длинное имя группы туннелей", font.clone(), GRAPHITE.text_strong, 60.0);
+            assert!(long.elided && long.size().x <= 60.0 + 1.0, "{}", long.size().x);
+            assert!(!truncated(ui, "Дом", font, GRAPHITE.text_strong, 200.0).elided);
+        });
+    }
+
     #[test]
     fn active_tunnel_name_takes_the_colour_of_its_dot() {
         for p in [&GRAPHITE, &SLATE, &DAYLIGHT] {
-            let of = |level| name_color(p, level, Primary::of(level, false));
+            let of = |level| name_color(p, level, Primary::of(level, false), false);
             assert_eq!(of(Level::Ok), Some(p.connected));
             assert_eq!((of(Level::Busy), of(Level::Warn)), (Some(p.warning), Some(p.warning)), "подключается, переподключается");
             assert_eq!(of(Level::Ok), Some(p.level(Level::Ok)), "имя того же цвета, что кружок");
             assert_eq!(of(Level::Warn), Some(p.level(Level::Warn)));
-            // Отключён и ошибка — обычный текст.
-            assert_eq!((of(Level::Off), of(Level::Bad)), (None, None));
+            // Отключён — обычный текст; ошибка — красное имя, не только кружок (в выбранной строке — кольцо).
+            assert_eq!(of(Level::Off), None);
+            assert_eq!(of(Level::Bad), Some(p.error));
+            assert_eq!(name_color(p, Level::Bad, Primary::of(Level::Bad, false), true), None, "красный на выделении нечитаем");
             // Нет связи с ядром: уровень Warn, кружок жёлтый, но туннель не включён — имя обычное.
-            assert_eq!(name_color(p, Level::Warn, Primary::of(Level::Warn, true)), None);
+            assert_eq!(name_color(p, Level::Warn, Primary::of(Level::Warn, true), false), None);
         }
     }
 }

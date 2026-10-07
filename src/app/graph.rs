@@ -383,7 +383,7 @@ fn live_plot(ui: &Ui, painter: &Painter, hover: &Response, rect: Rect, period: f
 pub(super) fn stale_ping(ping: &PingState) -> String {
     let na = tr("st.na");
     match ping.history.iter().rev().find_map(|(_, ms)| *ms) {
-        Some(ms) => format!("{} ({na})", trf("unit.ms", &[&ms.to_string()])),
+        Some(ms) => format!("{} ({na})", crate::fmt::ms(ms.to_string())),
         None => na,
     }
 }
@@ -415,12 +415,12 @@ fn ping_strip(ui: &mut Ui, ping: &PingState, period: f64, at: Instant, lag_secs:
     painter.text(
         rect.left_top() + Vec2::new(6.0, 3.0),
         Align2::LEFT_TOP,
-        trf("gr.ping_legend", &[&trf("unit.ms", &[&format!("{max:.0}")])]),
+        trf("gr.ping_legend", &[&crate::fmt::ms(format!("{max:.0}"))]),
         FontId::proportional(12.0),
         ui.visuals().weak_text_color(),
     );
     let last = match ping.last {
-        Some(Ok(ms)) => trf("unit.ms", &[&ms.to_string()]),
+        Some(Ok(ms)) => crate::fmt::ms(ms.to_string()),
         _ => stale_ping(ping),
     };
     a11y::describe(&hover, Painted::Ping { host: &ping.host, last: &last });
@@ -434,7 +434,7 @@ fn ping_strip(ui: &mut Ui, ping: &PingState, period: f64, at: Instant, lag_secs:
     let x = rect.right() - (*age / period) as f32 * rect.width();
     painter.vline(x, rect.y_range(), Stroke::new(1.0_f32, ui.visuals().weak_text_color()));
     let (text, color) = match ms {
-        Some(ms) => (trf("unit.ms", &[&ms.to_string()]), palette().graph_ping),
+        Some(ms) => (crate::fmt::ms(ms.to_string()), palette().graph_ping),
         None => (tr("st.no_reply"), palette().error),
     };
     let when = fmt::ago(*age as u64 + lag_secs);

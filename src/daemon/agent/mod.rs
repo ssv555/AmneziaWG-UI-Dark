@@ -107,7 +107,11 @@ impl Agent {
         spawn_core_poll(stats.clone(), history.clone(), journal.clone(), language);
         // Обновления ведёт агент; ядро на `Updates` отвечает окну прежней версии отказом.
         let updates = updates::start(journal.clone());
-        let tunnels = Tunnels::real(log_to(&journal));
+        // Прежний агент мог погибнуть посреди действия в родном окне: его задание и ответ (в них бывают ключи) —
+        // убрать до первого запроса.
+        let jobs = Arc::new(crate::daemon::helper::Jobs::real(log_to(&journal)));
+        jobs.sweep_at_start();
+        let tunnels = Tunnels::real(jobs, log_to(&journal));
         Agent { ping, stats, history, journal, updates: Some(updates), tunnels }
     }
 
@@ -273,7 +277,7 @@ mod tests {
         let config = AgentConfig { ping: true, ping_host: "1.1.1.1".into() };
         let ping = AgentPing::new(config, dir.join("agent.ini"), Box::new(|| Ok(false)), Box::new(|_| Ok(1)), Box::new(|_| {}));
         let traffic = AgentStats::new(dir.join("Stats.ini"), Box::new(crate::stats::save), Box::new(|_, _| {}));
-        let tunnels = Tunnels::real(Box::new(|_, _| {}));
+        let tunnels = Tunnels::real(Arc::new(crate::daemon::helper::Jobs::real(Box::new(|_, _| {}))), Box::new(|_, _| {}));
         let history = AgentHistory::new(dir.join("history.bin"), Box::new(|| HISTORY_NOW), Box::new(|_, _| {}));
         Agent { ping: Arc::new(ping), stats: Arc::new(traffic), history: Arc::new(history), journal: Arc::new(AgentJournal::memory()), updates: None, tunnels }
     }

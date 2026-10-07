@@ -9,11 +9,12 @@ use std::time::{Duration, Instant};
 
 use eframe::egui::{self, Align, Align2, Color32, Layout, RichText, Ui, Vec2};
 
-use super::dialog::{dialog_window, window_escape, window_keys};
+use super::dialog::{dialog_body, dialog_keys, dialog_window, window_escape, window_keys};
 use super::markdown;
 use super::modals::{Modal, Outcome as ModalOutcome, Turn};
 use super::reminder::{self, Due, Presence};
 use super::theme::{palette, Palette};
+use super::notice::Notices;
 use super::{dialog_buttons, mono, ErrorSink};
 use crate::crash::lock;
 use crate::daemon::agent::client::{AgentApi, UpdatesError};
@@ -100,12 +101,12 @@ pub(super) struct Link {
     agent: Option<Arc<dyn AgentApi>>,
     error: ErrorSink,
     /// Строка уведомления в главном окне (отмена UAC).
-    notice: Arc<Mutex<Option<String>>>,
+    notice: Notices,
     ctx: egui::Context,
 }
 
 impl Link {
-    pub(super) fn new(agent: Option<Arc<dyn AgentApi>>, error: ErrorSink, notice: Arc<Mutex<Option<String>>>, ctx: egui::Context) -> Self {
+    pub(super) fn new(agent: Option<Arc<dyn AgentApi>>, error: ErrorSink, notice: Notices, ctx: egui::Context) -> Self {
         Self { agent, error, notice, ctx }
     }
 
@@ -324,7 +325,7 @@ impl UpdatesWindow {
     }
 
     /// Подтверждение установки или возврата — диалог из `Modals` поверх окна обновлений.
-    pub(super) fn show_confirm(&mut self, ctx: &egui::Context, confirm: &Confirm, turn: Turn) -> ModalOutcome {
+    pub(super) fn show_confirm(&mut self, ctx: &egui::Context, confirm: &Confirm, mut turn: Turn) -> ModalOutcome {
         let state = &lock(&self.polled).state.clone();
         let busy = state.busy.is_some() || self.command.any();
         let (title, primary, lines, notes) = match confirm {
@@ -341,19 +342,20 @@ impl UpdatesWindow {
         };
         let (mut yes, mut no) = (false, false);
         let mut open = true;
-        dialog_window(ctx, title, "updates-confirm", &mut open)
+        turn.window(ctx, title, "updates-confirm", &mut open)
             .order(egui::Order::Foreground)
             .show(ctx, |ui| {
-                ui.set_width(480.0);
-                for line in &lines {
-                    ui.add(egui::Label::new(line).wrap());
-                }
-                if !notes.is_empty() {
-                    ui.add_space(8.0);
-                    for note in &notes {
-                        ui.add(egui::Label::new(RichText::new(note).color(palette().warning)).wrap());
+                dialog_body(ui, 480.0, |ui| {
+                    for line in &lines {
+                        ui.add(egui::Label::new(line).wrap());
                     }
-                }
+                    if !notes.is_empty() {
+                        ui.add_space(8.0);
+                        for note in &notes {
+                            ui.add(egui::Label::new(RichText::new(note).color(palette().warning)).wrap());
+                        }
+                    }
+                });
                 ui.add_space(10.0);
                 (yes, no) = dialog_buttons(ui, &primary, !busy, Some(&tr("btn.cancel")));
             });
@@ -391,7 +393,9 @@ impl UpdatesWindow {
         if let Some(at) = ctx.input(|i| i.pointer.press_origin().filter(|_| i.pointer.any_pressed())) {
             self.news_focused = ctx.layer_id_at(at) == Some(egui::LayerId::new(egui::Order::Foreground, egui::Id::new(NEWS_ID)));
         }
-        let escape = self.news_focused && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
+        // Enter («Открыть») и Esc («Позже») — только у активного уведомления, по общим правилам диалога (`dialog_keys`):
+        // Enter на кнопке в фокусе нажимает её саму.
+        let (enter, escape) = if self.news_focused { dialog_keys(ctx) } else { (false, false) };
         // Сначала в правом нижнем углу, но не прибито: перетаскивается за заголовок, крестик и Esc — «Позже».
         dialog_window(ctx, tr("upd.notice_title"), NEWS_ID, &mut shown)
             .order(egui::Order::Foreground)
@@ -401,11 +405,9 @@ impl UpdatesWindow {
                 ui.set_max_width(320.0);
                 ui.add(egui::Label::new(text).wrap());
                 ui.add_space(6.0);
-                ui.horizontal(|ui| {
-                    open = ui.button(tr("upd.notice_open")).clicked();
-                    later = ui.button(tr("upd.notice_later")).clicked();
-                });
+                (open, later) = dialog_buttons(ui, &tr("upd.notice_open"), true, Some(&tr("upd.notice_later")));
             });
+        open |= enter;
         later |= !shown || escape;
         if open || later {
             self.news.clear();
@@ -449,7 +451,7 @@ impl UpdatesWindow {
             match crate::elevated::run(&crate::update::restore_args(id), "upd.restore_failed") {
                 Outcome::Done(_) => {}
                 Outcome::Failed(e) => link.error.push(e),
-                Outcome::Cancelled => *lock(&link.notice) = Some(tr("upd.restore_cancelled")),
+                Outcome::Cancelled => link.notice.warn(tr("upd.restore_cancelled")),
             }
             drop(pending);
             link.ctx.request_repaint();
@@ -968,7 +970,8 @@ fn status_text(s: &Status) -> String {
         Status::Manual(_) => tr("upd.st_manual"),
         Status::UpstreamNewer(tag) => trf("upd.st_upstream_newer", &[tag]),
         Status::UpstreamUnchecked => tr("upd.st_upstream_unchecked"),
-        Status::Error(e) => e.clone(),
+        // Сбой проверки — фраза на языке интерфейса (и известная причина); технический текст — в подсказке и журнале.
+        Status::Error(e) => crate::explain::short(&tr("upd.st_failed"), e),
     }
 }
 
@@ -978,6 +981,7 @@ fn status_tip(s: &Status) -> String {
         Status::OkEngine(tag) => trf("upd.st_ok_engine", &[tag]),
         Status::Manual(full) => full.clone(),
         Status::UpstreamUnchecked => tr("upd.st_upstream_unchecked_tip"),
+        Status::Error(e) => crate::explain::log_line(&tr("upd.st_failed"), e),
         other => status_text(other),
     }
 }
@@ -1158,6 +1162,7 @@ fn restore_button(offer: Option<&RestoreOffer>) -> RestoreButton {
     let label = offer.version.as_deref().map_or_else(|| tr("upd.restore"), |v| trf("upd.restore_to", &[v]));
     let why_not = offer.blocked.map(|block| match (block, offer.version.as_deref()) {
         (RestoreBlock::Installed, Some(v)) => trf("upd.restore_installed", &[v]),
+        (RestoreBlock::TooOld, _) => trf("upd.restore_too_old", &[crate::update::MIN_APP_RESTORE]),
         _ => tr("upd.no_backup"),
     });
     let version = if offer.blocked.is_none() { offer.version.clone() } else { None };
@@ -1317,7 +1322,13 @@ mod tests {
         let mut broken = row(Component::App, Some("1"), Some("2"), true);
         broken.error = Some("timeout".into());
         assert_eq!(status(&broken), Status::Error("timeout".into()));
-        assert_eq!(status_text(&Status::Error("timeout".into())), "timeout");
+        assert_eq!(status_text(&Status::Error("timeout".into())), tr("upd.st_failed"), "неизвестная причина — только фраза");
+        // Нет сети: в ячейке не «WinHttpSendRequest: error 12007», а причина словами; код — в подсказке.
+        let offline = Status::Error("WinHttpSendRequest: error 12007".into());
+        assert_eq!(status_text(&offline), trf("cause.joined", &[&tr("upd.st_failed"), &crate::explain::Cause::NameNotResolved.text()]));
+        assert!(status_tip(&offline).contains("WinHttpSendRequest: error 12007"));
+        let limited = Status::Error("HTTP status 403".into());
+        assert!(status_text(&limited).contains(&crate::explain::Cause::RateLimited.text()), "{}", status_text(&limited));
         assert_eq!(status_color(&GRAPHITE, &Status::Update), GRAPHITE.warning);
         // Цвет берётся из переданной палитры, а не из констант Графита.
         assert_eq!(status_color(&DAYLIGHT, &Status::Update), DAYLIGHT.warning);
@@ -1378,6 +1389,10 @@ mod tests {
         c.manual_only = false;
         c.error = Some("HTTP 503".into());
         assert_eq!(status(&c), Status::Error("HTTP 503".into()));
+        // Ячейка — человеческой фразой, технический текст — только в подсказке.
+        let failed = Status::Error("HTTP 503".into());
+        assert!(!status_text(&failed).contains("503") && status_text(&failed).contains(&crate::explain::Cause::ServerError.text()));
+        assert!(status_tip(&failed).ends_with("(HTTP 503)"));
         // Обновление, найденное в нашем релизе, важнее сверки с Amnezia.
         let mut upd = engine(Some(Up::Newer("v9".into())));
         upd.update = true;
@@ -1472,6 +1487,11 @@ mod tests {
         assert_eq!((gone.version, gone.why_not), (None, Some(tr("upd.no_backup"))));
         let unknown = restore_button(Some(&offer(None, Some(RestoreBlock::NoCopy))));
         assert_eq!((unknown.label.as_str(), unknown.version), ("Restore", None));
+        // Сборка до агента: кнопка выключена, подсказка называет первую сборку с агентом.
+        let old = restore_button(Some(&offer(Some("0.4.0"), Some(RestoreBlock::TooOld))));
+        assert_eq!((old.label.as_str(), old.version), ("Restore 0.4.0", None));
+        assert_eq!(old.why_not, Some(trf("upd.restore_too_old", &[crate::update::MIN_APP_RESTORE])));
+        assert!(old.why_not.as_deref().is_some_and(|t| t.contains("0.5.0")));
         let missing = restore_button(None);
         assert_eq!((missing.version, missing.why_not), (None, Some(tr("upd.no_backup"))));
     }
@@ -1607,7 +1627,7 @@ mod core_tests {
     #[test]
     fn demo_window_without_agent_shows_unavailable() {
         let (shared, error) = sink();
-        let mut w = UpdatesWindow::new(Link::new(None, error, Arc::default(), egui::Context::default()));
+        let mut w = UpdatesWindow::new(Link::new(None, error, Notices::new(shared.clone()), egui::Context::default()));
         w.request(UpdateOp::State, false);
         settle(&w);
         assert_eq!(w.polled.lock().unwrap().error, Some(tr("agent.unavailable")));
@@ -1632,8 +1652,8 @@ mod core_tests {
     }
 
     fn window(agent: &Arc<TestAgent>) -> UpdatesWindow {
-        let (_shared, error) = sink();
-        UpdatesWindow::new(Link::new(Some(agent.clone() as Arc<dyn AgentApi>), error, Arc::default(), egui::Context::default()))
+        let (shared, error) = sink();
+        UpdatesWindow::new(Link::new(Some(agent.clone() as Arc<dyn AgentApi>), error, Notices::new(shared), egui::Context::default()))
     }
 
     fn settle(w: &UpdatesWindow) {
@@ -2031,6 +2051,23 @@ mod core_tests {
         assert_eq!(reminded, Some(later), "сутки считаются от «Позже»");
         assert_eq!(w.collect_news(&mut notified, &mut reminded, later + DAY - 1), None);
         assert!(w.collect_news(&mut notified, &mut reminded, later + DAY).is_some());
+    }
+
+    /// U23: Enter у активного уведомления — «Открыть» (кнопка по умолчанию), у неактивного — ничего.
+    #[test]
+    fn enter_on_the_active_notice_opens_the_updates_window() {
+        // Нажатие и отпускание: без отпускания egui счёл бы второе нажатие автоповтором.
+        let key = |pressed| egui::Event::Key { key: egui::Key::Enter, physical_key: None, pressed, repeat: false, modifiers: egui::Modifiers::NONE };
+        let enter = || vec![key(true), key(false)];
+        let news = vec![(Component::App, "0.5.0".to_string())];
+        let mut w = quiet_window();
+        w.news = news.clone();
+        let ctx = egui::Context::default();
+        let _ = ctx.run_ui(egui::RawInput { events: enter(), ..Default::default() }, |ui| w.show_news(ui.ctx()));
+        assert_eq!((w.news.clone(), w.is_open()), (news, false), "the notice is not active: Enter is not its");
+        w.news_focused = true;
+        let _ = ctx.run_ui(egui::RawInput { events: enter(), ..Default::default() }, |ui| w.show_news(ui.ctx()));
+        assert!(w.news.is_empty() && w.is_open(), "Enter on the active notice = Open");
     }
 
     #[test]

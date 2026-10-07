@@ -97,7 +97,7 @@ impl Snapshot {
     /// Состояние туннеля для окна и трея: при потере связи с ядром — «неизвестно», а не «отключён».
     pub fn health(&self, name: &str, pending: Option<&str>, ping: Option<&PingState>) -> Health {
         if self.core_lost {
-            return Health { level: Level::Warn, text: tr("health.core_lost") };
+            return Health::new(Level::Warn, tr("health.core_lost"));
         }
         let live = self.running.get(name);
         if let (None, None, Some(retry)) = (live, pending, self.retries.get(name)) {
@@ -578,13 +578,13 @@ impl Watch {
                 }
                 Some(false) if self.quiet.remove(n) => silent.push((n.clone(), Level::Off)),
                 Some(false) => {
-                    settled.insert(n.clone(), (Level::Off, h.text.clone()));
+                    settled.insert(n.clone(), (Level::Off, h.log_text()));
                 }
                 None => {
                     self.quiet.remove(n);
                     // «Занят» (переключение, ожидание рукопожатия) — промежуточное состояние, событий не даёт.
                     if h.level != Level::Busy {
-                        settled.insert(n.clone(), (h.level, h.text.clone()));
+                        settled.insert(n.clone(), (h.level, h.log_text()));
                     }
                 }
             }
@@ -627,7 +627,8 @@ fn react(
         } else if active.is_empty() {
             crate::i18n::tr("tray.none")
         } else {
-            active.iter().map(|(n, h)| format!("{n}: {}", h.text)).collect::<Vec<_>>().join("\n")
+            // Короткое состояние без подробностей; лишние туннели — числом (`fit_tip`).
+            tray::fit_tip(&active.iter().map(|(n, h)| format!("{n}: {}", h.text)).collect::<Vec<_>>())
         };
         tray::set_state(worst, &tip);
     }
@@ -654,13 +655,15 @@ pub fn poll(shared: &Shared, backend: &dyn TunnelHost) {
         .map(|name| (name.clone(), backend.query(name).map_err(|e| e.to_string())))
         .collect();
 
-    let now = Instant::now();
-    let mut snap = lock(&shared.snapshot);
-    snap.error = [configs.as_ref().err(), running.as_ref().err()]
+    let error = [configs.as_ref().err(), running.as_ref().err()]
         .into_iter()
         .flatten()
         .map(|e| e.to_string())
         .reduce(|a, b| format!("{a}; {b}"));
+    set_poll_error(shared, error);
+
+    let now = Instant::now();
+    let mut snap = lock(&shared.snapshot);
     if let Ok(configs) = configs {
         snap.tunnels = configs.into_iter().collect();
     }
@@ -685,6 +688,20 @@ pub fn poll(shared: &Shared, backend: &dyn TunnelHost) {
     snap.polls += 1;
 }
 
+/// Ошибка опроса. Строка состояния показывает только ссылку на журнал, поэтому текст — в журнал событий, один раз,
+/// пока он тот же (опрос идёт каждую секунду). Ошибку, пришедшую от ядра в `CoreState`, окно не пишет: её записало ядро.
+fn set_poll_error(shared: &Shared, error: Option<String>) {
+    let fresh = {
+        let mut snap = lock(&shared.snapshot);
+        let fresh = error.is_some() && snap.error != error;
+        snap.error = error.clone();
+        fresh
+    };
+    if let (true, Some(e)) = (fresh, error) {
+        shared.log("", Severity::Warn, &crate::explain::log_line(&tr("ev.poll_failed"), &e));
+    }
+}
+
 /// Окно: забрать состояние у ядра. История для графика копится здесь, по счётчикам из ответа.
 fn mirror_core(shared: &Shared, link: &mut CoreLink) {
     use crate::daemon::proto::{Request, Response};
@@ -694,11 +711,8 @@ fn mirror_core(shared: &Shared, link: &mut CoreLink) {
         Ok(other) => {
             // Ядро ответило, но состояния не дало (занято, отказ): связь есть, показываем причину и ждём следующего опроса.
             let change = link.answered();
-            {
-                let mut snap = lock(&shared.snapshot);
-                snap.core_lost = false;
-                snap.error = Some(format!("core: {other:?}"));
-            }
+            lock(&shared.snapshot).core_lost = false;
+            set_poll_error(shared, Some(trf("err.core_unexpected", &[&crate::explain::variant_name(&other)])));
             report_link(shared, change, "");
             return;
         }
@@ -846,7 +860,7 @@ mod tests {
     /// стояла (жёлтое «переподключение» считалось подключением), и ещё раз — рядом со строкой надзора об успехе.
     #[test]
     fn supervised_reconnect_has_no_connected_line_of_its_own_but_a_real_drop_is_still_logged() {
-        let one = |level| BTreeMap::from([("a".to_string(), Health { level, text: "t".into() })]);
+        let one = |level| BTreeMap::from([("a".to_string(), Health::new(level, "t".into()))]);
         let none = BTreeMap::new();
         let sup = |live| BTreeMap::from([("a".to_string(), live)]);
         let user = BTreeSet::new();
@@ -1219,5 +1233,22 @@ mod tests {
         assert!(state.running.contains_key("t") && state.error.is_some());
         assert!(state.stats.is_empty());
         assert!(shared.update_stats(|s| s.is_empty()));
+    }
+
+    /// Строка состояния показывает только ссылку на журнал: текст ошибки опроса — в журнал, один раз на смену текста.
+    #[test]
+    fn poll_error_is_logged_once_per_change() {
+        let shared = shared();
+        let failures = |s: &Shared| s.events_since(0).into_iter().filter(|(_, e)| e.text.starts_with(&tr("ev.poll_failed"))).count();
+        poll(&shared, &OneTunnel { listed: false });
+        poll(&shared, &OneTunnel { listed: false });
+        assert_eq!(failures(&shared), 1, "та же ошибка каждую секунду — одна запись");
+        assert!(lock(&shared.snapshot).error.is_some(), "ссылка в строке состояния держится, пока ошибка есть");
+        poll(&shared, &OneTunnel { listed: true });
+        assert!(lock(&shared.snapshot).error.is_none());
+        poll(&shared, &OneTunnel { listed: false });
+        assert_eq!(failures(&shared), 2, "ошибка вернулась — новая запись");
+        let line = shared.events_since(0).last().map(|(_, e)| e.text.clone()).unwrap();
+        assert!(line.ends_with("(no list)"), "подробности в конце: {line}");
     }
 }

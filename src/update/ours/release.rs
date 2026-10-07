@@ -4,7 +4,6 @@
 
 use std::path::{Path, PathBuf};
 
-use super::fileset::install_set;
 use super::fs::Fs;
 use super::{manifest_files, InstallTarget, APP_EXE, ENGINE_FILES, FILE_MAX, MANIFEST, MANIFEST_MAX, MANIFEST_SIG};
 use crate::i18n::trf;
@@ -57,7 +56,7 @@ impl InstallTarget {
         }
         files.extend(manifest_set(src, rel, m, work)?);
         busy(Busy::SetInstall(Release::Engine(m.engine.version.clone())));
-        install_set(&self.dir, &files, fs)
+        self.install_set(&files, fs)
     }
 
     /// Скачать exe из релиза, проверить по манифесту, поставить вместо exe ядра, отдать окну и перезапустить ядро.
@@ -292,7 +291,8 @@ mod tests {
         let (base, work, t) = installed("rel-engine-fs", &OLD);
         let inst = base.join("inst");
         let before = snapshot(&inst);
-        let fs = FaultFs::new(|op, _, to| op == Op::Copy && to.file_name().is_some_and(|n| n == "wintun.dll"));
+        // Копия идёт в `wintun.dll.new-<random>` — отказывает она.
+        let fs = FaultFs::new(|op, _, to| op == Op::Copy && to.file_name().is_some_and(|n| n.to_string_lossy().starts_with("wintun.dll.new-")));
         let e = t.update_engine(&p.src, &fs, &p.rel, &p.m, &work, &mut |_| {}).unwrap_err();
         assert!(e.contains("injected"), "{e}");
         assert_eq!(snapshot(&inst), before);

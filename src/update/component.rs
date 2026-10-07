@@ -71,6 +71,15 @@ pub(super) trait ComponentOps: Send + Sync {
     fn owes_after_change(&self) -> bool {
         false
     }
+    /// Остатки работы этого компонента, оборванной смертью процесса, при открытии менеджера: что доделано —
+    /// строки для журнала; не вышло — ошибка. По умолчанию остатков не бывает.
+    fn recover(&self, _m: &Manager) -> Result<Vec<String>, String> {
+        Ok(Vec::new())
+    }
+    /// `recover` отложил доделку (шёл установщик Windows — у AmneziaWG): менеджер повторяет её на своём такте.
+    fn recover_deferred(&self) -> bool {
+        false
+    }
 }
 
 /// Реализации по компонентам; у каждого компонента ровно одна.
@@ -88,7 +97,7 @@ impl Components {
     /// Настоящие компоненты; туннели при замене трогает только ядро (`core`): аренда на время MSI, переподключение
     /// после замены движка.
     pub(super) fn real(core: Arc<dyn CoreLink>) -> Self {
-        Components::new(Box::new(native::NativeOps { core: core.clone(), ui_open: crate::update::native::ui_open }), Box::new(EngineOps { core }), Box::new(AppOps))
+        Components::new(Box::new(native::real(core.clone())), Box::new(EngineOps { core }), Box::new(AppOps))
     }
 
     pub(super) fn get(&self, c: Component) -> &dyn ComponentOps {
@@ -205,6 +214,10 @@ pub(super) mod fake {
         update: Result<(), String>,
         restore: Result<(), String>,
         journal: Journal,
+        /// Писать ли `recover` в `calls`: по умолчанию нет — проверки работ сравнивают список вызовов целиком.
+        record_recover: bool,
+        /// `recover` «отложен» (идёт установщик): менеджер должен повторить его на такте.
+        deferred: Arc<std::sync::atomic::AtomicBool>,
         calls: Calls,
     }
 
@@ -218,6 +231,8 @@ pub(super) mod fake {
                 update: Ok(()),
                 restore: Ok(()),
                 journal: Journal::After,
+                record_recover: false,
+                deferred: Arc::default(),
                 calls: calls.clone(),
             }
         }
@@ -245,6 +260,17 @@ pub(super) mod fake {
 
         pub(in crate::update) fn journal(mut self, journal: Journal) -> FakeOps {
             self.journal = journal;
+            self
+        }
+
+        pub(in crate::update) fn record_recover(mut self) -> FakeOps {
+            self.record_recover = true;
+            self
+        }
+
+        /// Доделка «отложена», пока проверка держит `flag` поднятым: так проверяется повтор на такте менеджера.
+        pub(in crate::update) fn deferred_by(mut self, flag: Arc<std::sync::atomic::AtomicBool>) -> FakeOps {
+            self.deferred = flag;
             self
         }
 
@@ -301,6 +327,17 @@ pub(super) mod fake {
         fn after_change(&self) -> Result<(), String> {
             self.call(format!("changed {:?}", self.c));
             Ok(())
+        }
+
+        fn recover(&self, _m: &Manager) -> Result<Vec<String>, String> {
+            if self.record_recover {
+                self.call(format!("recover {:?}", self.c));
+            }
+            Ok(Vec::new())
+        }
+
+        fn recover_deferred(&self) -> bool {
+            self.deferred.load(std::sync::atomic::Ordering::SeqCst)
         }
     }
 

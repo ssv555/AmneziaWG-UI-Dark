@@ -45,6 +45,18 @@ fn lang_dir() -> PathBuf {
     crate::engine::install_dir().join("lang")
 }
 
+/// Язык процессов без окна, которые запускаются отдельно от ядра и агента (помощник родного окна `--native-op`,
+/// перезапуск ядра `--restart-core`): язык ядра из `core.ini`, как у агента (`agent::language`). Без этого их
+/// тексты (ошибки окна AmneziaWG, записи об откате обновления) были бы на английском при русском окне.
+/// Нечитаемый `core.ini` — язык по умолчанию, как у ядра; файл только читается.
+pub fn use_core_language() {
+    crate::i18n::set(&lang_dir(), &core_language(&Config::path()));
+}
+
+fn core_language(core_ini: &std::path::Path) -> String {
+    Config::load_from(core_ini).language
+}
+
 /// Журнал событий ядра.
 pub fn events_file() -> PathBuf {
     data_dir().join("logs").join("events.log")
@@ -130,7 +142,7 @@ pub fn log_unreadable(problem: &crate::ini::Unreadable) {
 
 /// Запись в файл журнала напрямую, а не через `Shared`: установка и ранний отказ запуска (нет владельца)
 /// заканчиваются раньше, чем он появится. Только дописать строку: файл ведёт и ротирует агент, он и покажет запись.
-fn log_notice(file: PathBuf, severity: Severity, text: &str) {
+pub(crate) fn log_notice(file: PathBuf, severity: Severity, text: &str) {
     let event = Event::new(crate::monitor::unix_now(), "", severity, text, false);
     if let Err(e) = crate::events::append_event(&file, &event) {
         // Служба без консоли: это всё, что остаётся, когда не пишется сам журнал.
@@ -236,7 +248,7 @@ impl CoreApi for PipeClient {
 fn unexpected(r: Response) -> String {
     match r {
         Response::Err(e) | Response::Refused(e) => e,
-        other => format!("core: unexpected answer {other:?}"),
+        other => crate::i18n::trf("err.core_unexpected", &[&crate::explain::variant_name(&other)]),
     }
 }
 
@@ -258,6 +270,23 @@ mod tests {
         assert!(problem.is_none());
         assert_eq!(config.mode, Mode::Overlay);
         assert!(config.owner_sid.is_empty());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Помощник родного окна и `--restart-core` берут язык ядра (раньше — всегда английский).
+    #[test]
+    fn separate_processes_take_the_core_language() {
+        let dir = dir("language");
+        let path = dir.join("core.ini");
+        assert_eq!(core_language(&path), crate::i18n::DEFAULT, "нет файла — язык по умолчанию");
+        std::fs::write(&path, "[core]\r\nmode=overlay\r\nlanguage=rus\r\n").unwrap();
+        assert_eq!(core_language(&path), "rus");
+        let main = include_str!("../main.rs");
+        for entry in ["if has(update::ours::RESTART_FLAG) {", "if let Some(task) = value(daemon::helper::FLAG) {"] {
+            let start = main.find(entry).unwrap_or_else(|| panic!("{entry} not found"));
+            let body = &main[start..start + main[start..].find("std::process::exit").unwrap()];
+            assert!(body.contains("daemon::use_core_language();"), "{entry}: no language before the work");
+        }
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
