@@ -79,6 +79,14 @@ the network and the real machine state. They never install, uninstall or restart
 Logic that needs a live system (service install, update, MSI, tunnels) is checked by hand and described in the pull
 request.
 
+### Flaky test logs
+
+The core-isolation tests (`isolation_*` in `src/daemon/server.rs`) record a timing mark for every phase of each
+Switch: client connect, pipe accept, request thread start, core locks, config write, engine calls
+(`src/daemon/phase_trace.rs`). If a Switch fails or takes 1 s or more, the test writes the trace with machine facts
+(CPU count, CPU load, thread count, process and binary age) to `target/test-logs/<test>-<unix time>.log` and puts
+the path into the failure message. Developers only: the trace exists only in test builds, the release exe has none.
+
 ## CI workflows
 
 All in `.github/workflows/`:

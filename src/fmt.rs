@@ -6,13 +6,29 @@ use crate::i18n::trf;
 
 const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
 
-/// `1.97 MiB`, `512 B`.
-pub fn bytes(b: f64) -> String {
+/// Шаг между единицами `UNITS`.
+const UNIT_STEP: f64 = 1024.0;
+
+/// Единица для `b` байт: наибольшая, в которой число не меньше 1. Одна на `bytes` и шкалу графика — подписи шкалы
+/// в тех же единицах, что значения рядом.
+pub fn unit_of(b: f64) -> usize {
     let (mut v, mut u) = (b.max(0.0), 0);
-    while v >= 1024.0 && u < UNITS.len() - 1 {
-        v /= 1024.0;
+    while v >= UNIT_STEP && u < UNITS.len() - 1 {
+        v /= UNIT_STEP;
         u += 1;
     }
+    u
+}
+
+/// Байт в одной `unit` (`unit_of`).
+pub fn unit_size(unit: usize) -> f64 {
+    UNIT_STEP.powi(unit.min(UNITS.len() - 1) as i32)
+}
+
+/// `1.97 MiB`, `512 B`.
+pub fn bytes(b: f64) -> String {
+    let u = unit_of(b);
+    let v = b.max(0.0) / unit_size(u);
     if u == 0 {
         format!("{v:.0} {}", UNITS[u])
     } else {
@@ -23,6 +39,12 @@ pub fn bytes(b: f64) -> String {
 /// `767 B/s`, `43.67 KiB/s`.
 pub fn rate(b: f64) -> String {
     trf("unit.per_sec", &[&bytes(b)])
+}
+
+/// Скорость `b` байт/с в заданной единице и с заданным числом знаков: `0.5 KiB/s`, `200 MiB/s` (подписи шкалы).
+pub fn rate_in(b: f64, unit: usize, decimals: usize) -> String {
+    let unit = unit.min(UNITS.len() - 1);
+    trf("unit.per_sec", &[&format!("{:.*} {}", decimals, b.max(0.0) / unit_size(unit), UNITS[unit])])
 }
 
 /// Доля 0..=1: `34.5 %`.
@@ -139,6 +161,17 @@ mod tests {
         assert_eq!(rate(44_718.0), "43.67 KiB/s");
         assert_eq!(percent(0.345), "34.5 %");
         assert_eq!(percent(1.0), "100.0 %");
+    }
+
+    #[test]
+    fn rate_in_keeps_the_given_unit() {
+        assert_eq!(unit_of(0.0), 0);
+        assert_eq!(unit_of(1023.0), 0);
+        assert_eq!(unit_of(1024.0), 1);
+        assert_eq!(unit_of(3.0 * 1024.0 * 1024.0), 2);
+        assert_eq!(rate_in(512.0, 1, 1), "0.5 KiB/s");
+        assert_eq!(rate_in(200.0 * 1024.0 * 1024.0, 2, 0), "200 MiB/s");
+        assert_eq!(rate_in(0.0, 2, 0), "0 MiB/s");
     }
 
     /// Форма, а не цифры: часовой пояс машины сдвигает число и час.

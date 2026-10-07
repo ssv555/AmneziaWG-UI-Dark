@@ -17,6 +17,15 @@ Rules for every window, dialog and notice in the app. The goal is a window that 
    they also go to the event log.
 5. Details (release notes, logs, long text) never expand inside tables or lists: a button opens them in their own
    window.
+6. A dialog never extends past the main window: `dialog_window` keeps every window inside the main window's content
+   area with a 12 px margin (`window_bounds`), position and maximum size both, also after the main window is made
+   smaller. The size limit holds a resizable window; an auto-sized window grows with its content, so its content
+   must fit on its own: text wraps, anything long goes into the window's own `ScrollArea` (the updates window scrolls
+   its history; the component table and buttons stay visible). Test `dialogs_stay_inside_the_main_window`.
+7. Tables use auto-sized columns: a column is as wide as its widest content (header or cell), the header is aligned
+   like the column's values (text left, numbers right), spare width stays after the last column, never between
+   columns. Only when the window is narrower than the table does the name column shrink and truncate with a tooltip
+   (`column_widths` in `src/app/updates.rs`, test `columns_take_the_width_of_their_widest_content`).
 
 ## Look
 
@@ -29,6 +38,8 @@ Rules for every window, dialog and notice in the app. The goal is a window that 
 3. Colours come only from the active theme's `Palette` in `src/app/theme.rs` (`palette()`); the test
    `colours_come_only_from_the_palette` forbids colour literals and egui base visuals elsewhere in `src/app`. On
    Daylight the selected row also gets a 3 px accent bar on the left: the light selection fill alone is hard to see.
+   Every text colour, weak text included, has contrast of at least 4.5 (WCAG AA) on the theme's backgrounds; weak text
+   stays dimmer than plain text (test `every_palette_meets_wcag_contrast_targets`).
    Icons on the taskbar and in the tray do not depend on the theme.
 4. DPI: per-monitor scale; nothing is clipped at 100-300 %.
 
@@ -44,11 +55,15 @@ Rules for every window, dialog and notice in the app. The goal is a window that 
    first menu, Alt+letter opens the menu whose title has `&` before that letter (`&File`), Left / Right switch menus,
    Up / Down and Enter work inside, Right on an item with a submenu opens it, Left or Esc in a submenu closes it, Esc
    steps back. A window subclass swallows `SC_KEYMENU` (except Alt+Space), so F10 and Alt never enter the native
-   system-menu mode (`swallows_system_key`). Cyrillic mnemonics are mapped to their key on the ЙЦУКЕН layout,
-   so they work in any keyboard layout. Command shortcuts (Ctrl+N, Ctrl+I, F1, F5) come from one table, `SHORTCUTS`,
-   which also gives the text shown next to the menu item. Tests: `menu_mnemonics_are_unique_per_language` (fails on
-   a letter collision in a built-in language), `shortcuts_map_to_commands`, `menu_bar_keys_walk_like_windows`,
-   `arrows_open_and_close_submenus_like_windows`, `window_filter_takes_only_the_keyboard_menu_command`.
+   system-menu mode (`swallows_system_key`). A lone Alt is detected from `ModifiersChanged`; on Windows winit sends
+   that event before the key itself, and egui-winit delivers Alt as `Key::AltLeft` / `Key::AltRight`, so `AltTap`
+   ignores Alt's own key events (any other key or click while Alt is held cancels the tap). Cyrillic mnemonics are
+   mapped to their key on the ЙЦУКЕН layout, so they work in any keyboard layout. Command shortcuts (Ctrl+N, Ctrl+I,
+   F1, F5) come from one table, `SHORTCUTS`, which also gives the text shown next to the menu item. Tests:
+   `menu_mnemonics_are_unique_per_language` (fails on a letter collision in a built-in language),
+   `shortcuts_map_to_commands`, `menu_bar_keys_walk_like_windows`, `arrows_open_and_close_submenus_like_windows`,
+   `window_filter_takes_only_the_keyboard_menu_command`, `lone_alt_becomes_f10`,
+   `alt_own_key_events_do_not_cancel_the_tap`.
 
 ## Actions that drop the VPN
 
@@ -76,7 +91,8 @@ Rules for every window, dialog and notice in the app. The goal is a window that 
 ## Errors and text
 
 1. Errors of actions go to the event log (and `window-errors.log`); the status bar shows only a link to the log, no
-   error text.
+   error text. The link stays until the log is opened, so an error that arrived while the window was hidden in the
+   tray is visible at the next show (`src/app/errors.rs`).
 2. Dates are always `YYYY.MM.DD`, time `HH:MM`, through the one shared formatter `src/fmt.rs` (`date`, `date_time`,
    `date_time_sec`). Do not format dates in UI code.
 3. All user-visible strings go through `src/i18n.rs`, English and Russian both ([CONTRIBUTING.md](../CONTRIBUTING.md)).

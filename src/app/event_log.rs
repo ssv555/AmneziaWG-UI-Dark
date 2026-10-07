@@ -3,6 +3,7 @@
 
 use eframe::egui::{self, Ui};
 
+use crate::crash::lock;
 use crate::events::{Event, Severity};
 use crate::fmt;
 use crate::i18n::{tr, trf};
@@ -81,7 +82,7 @@ impl super::App {
             return;
         };
         match crate::fsutil::write_atomic(&file, text.as_bytes()) {
-            Ok(()) => *self.notice.lock().unwrap() = Some(trf("log.saved", &[&file.display().to_string()])),
+            Ok(()) => *lock(&self.notice) = Some(trf("log.saved", &[&file.display().to_string()])),
             Err(e) => self.action_error.push(crate::fsutil::io_ctx(&file, e)),
         }
     }

@@ -52,7 +52,7 @@ struct Release(String);
 
 impl Drop for Release {
     fn drop(&mut self) {
-        STUCK.lock().unwrap_or_else(|e| e.into_inner()).remove(&self.0);
+        crate::crash::lock(&STUCK).remove(&self.0);
     }
 }
 
@@ -77,7 +77,7 @@ fn with_deadline_using(
     timeout: Duration,
     work: impl FnOnce() -> io::Result<Status> + Send + 'static,
 ) -> io::Result<Status> {
-    if !STUCK.lock().unwrap_or_else(|e| e.into_inner()).insert(tunnel.to_string()) {
+    if !crate::crash::lock(&STUCK).insert(tunnel.to_string()) {
         return Err(io::Error::new(io::ErrorKind::TimedOut, format!("UAPI {tunnel}: the previous query is still waiting for an answer")));
     }
     let release = Release(tunnel.to_string());

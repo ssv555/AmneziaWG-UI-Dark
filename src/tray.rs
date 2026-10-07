@@ -26,6 +26,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     WM_SETICON,
 };
 
+use crate::crash::lock;
 use crate::health::Level;
 use crate::i18n::tr;
 use crate::icon;
@@ -206,9 +207,9 @@ fn plan_icon(st: &mut State, changed: bool) -> Option<Call> {
 /// уже без неё: Explorer может отвечать долго, а состояние читают поток окна и монитор. Итог вызова записывается
 /// обратно отдельно; порядок шагов держит `Tray::shell`.
 fn step(t: &Tray, plan: impl FnOnce(&mut State) -> Option<Call>) {
-    let _one_at_a_time = t.shell.lock().unwrap();
+    let _one_at_a_time = lock(&t.shell);
     let (call, data) = {
-        let mut st = t.state.lock().unwrap();
+        let mut st = lock(&t.state);
         let Some(call) = plan(&mut st) else { return };
         let mut data = base(t);
         if call != Call::Delete {
@@ -222,7 +223,7 @@ fn step(t: &Tray, plan: impl FnOnce(&mut State) -> Option<Call>) {
         Call::Delete => NIM_DELETE,
     };
     let done = unsafe { Shell_NotifyIconW(message, &data) } != 0;
-    let mut st = t.state.lock().unwrap();
+    let mut st = lock(&t.state);
     match call {
         // NIM_ADD в момент старта Explorer нередко отказывает; `visible` остаётся false, добавление повторится.
         Call::Add => {
@@ -264,7 +265,7 @@ pub fn set_state(level: Level, tip: &str) {
 pub fn set_window_state(level: Option<Level>) {
     let Some(t) = TRAY.get() else { return };
     let index = level.map(dot_index);
-    let mut st = t.state.lock().unwrap();
+    let mut st = lock(&t.state);
     if st.overlay == index {
         return;
     }
@@ -305,7 +306,7 @@ fn post_taskbar(t: &Tray, what: usize) {
 /// вызовов COM не держится: они могут ждать Explorer.
 fn apply_taskbar(t: &Tray, what: usize) {
     let (engine, overlay, tip) = {
-        let st = t.state.lock().unwrap();
+        let st = lock(&t.state);
         (st.engine, st.overlay, st.tip.clone())
     };
     let report = |r: Result<(), String>| {
@@ -344,15 +345,15 @@ pub fn notify_update(title: &str, text: &str) {
 
 /// Щелчок по уведомлению, который окну надо обработать: открыть обновления или выбрать туннель. Читается один раз.
 pub fn take_click() -> Option<Clicked> {
-    TRAY.get().and_then(|t| t.clicked.lock().unwrap().take())
+    TRAY.get().and_then(|t| lock(&t.clicked).take())
 }
 
 fn balloon(title: &str, text: &str, warning: bool, about: Balloon) {
     let Some(t) = TRAY.get() else { return };
     // Тот же порядок вызовов оболочки, что у `step`: уведомление не вклинивается между его решением и вызовом.
     // Состояние — только прочитать; вызывающий не должен держать чужих блокировок (`monitor::record_and_notify`).
-    let _one_at_a_time = t.shell.lock().unwrap();
-    if !t.state.lock().unwrap().visible {
+    let _one_at_a_time = lock(&t.shell);
+    if !lock(&t.state).visible {
         return;
     }
     let mut data = base(t);
@@ -361,7 +362,7 @@ fn balloon(title: &str, text: &str, warning: bool, about: Balloon) {
     copy(&mut data.szInfo, text);
     data.dwInfoFlags = if warning { NIIF_WARNING } else { NIIF_INFO };
     // Признак — до вызова: щелчок по уведомлению может прийти сразу, а окно разберёт его уже по этому признаку.
-    *t.balloon.lock().unwrap() = about;
+    *lock(&t.balloon) = about;
     if unsafe { Shell_NotifyIconW(NIM_MODIFY, &data) } == 0 {
         eprintln!("трей: уведомление не показано: {title}");
     }
@@ -439,9 +440,9 @@ unsafe extern "system" fn subclass_proc(
                 WM_LBUTTONUP | WM_LBUTTONDBLCLK => show_window(),
                 WM_RBUTTONUP => menu(t, hwnd),
                 NIN_BALLOONUSERCLICK => {
-                    let clicked = balloon_click(message, &t.balloon.lock().unwrap());
+                    let clicked = balloon_click(message, &lock(&t.balloon));
                     // Сначала признак, потом показ: первый кадр поднятого окна его уже увидит.
-                    *t.clicked.lock().unwrap() = clicked;
+                    *lock(&t.clicked) = clicked;
                     show_window();
                 }
                 _ => {}

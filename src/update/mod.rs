@@ -51,6 +51,21 @@ pub enum Component {
     App,
 }
 
+impl Component {
+    /// Имя компонента в командной строке (`--core-updates apply <компонент> <версия>`).
+    fn as_str(self) -> &'static str {
+        match self {
+            Component::Native => "native",
+            Component::Engine => "engine",
+            Component::App => "app",
+        }
+    }
+
+    fn parse(s: &str) -> Option<Component> {
+        ORDER.into_iter().find(|c| c.as_str() == s)
+    }
+}
+
 /// Строка компонента в окне.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default)]
 pub struct ComponentState {
@@ -165,6 +180,19 @@ pub struct HistoryEntry {
     pub prior_backup: Option<u64>,
 }
 
+/// Последняя законченная работа с MSI родного AmneziaWG — для окна в `State` агента (`app::native_reopen`). MSI
+/// закрывает окно AmneziaWG пользователя, а открыть его снова может только окно программы в сеансе пользователя.
+/// Было ли окно открыто, смотрит агент сам прямо перед MSI: окну с опросом раз в секунду не успеть — MSI идёт
+/// 1–3 с и закрывает окно в самом начале. Хранится в `state.json`: агент, перезапущенный следом обновлением
+/// программы, отдаёт отметку и тогда, когда окно не успело её увидеть.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct NativeUiMark {
+    /// Номер законченной работы с MSI; только растёт. Новый номер — окно решает один раз.
+    pub seq: u64,
+    /// Перед MSI в сеансе пользователя работало окно AmneziaWG.
+    pub was_open: bool,
+}
+
 /// Всё, что показывает окно «Обновления и откаты».
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default)]
 pub struct UpdatesState {
@@ -196,9 +224,10 @@ pub enum UpdateOp {
     Restore(u64),
 }
 
-/// Ключ проверки и помощника обновлений: `--core-updates state|check|restore <id> [--result <pid>:<описатель>]`.
+/// Ключ проверки и помощника обновлений:
+/// `--core-updates state|check|apply <компонент> <версия>|restore <id> [--result <pid>:<описатель>]`.
 /// `restore` окно запускает с правами администратора (UAC) через `elevated::run`: ядро выполняет возврат только по
-/// такому запросу.
+/// такому запросу. `apply` — тот же запрос, что кнопка «Обновить» окна: сценарий проверки живого обновления.
 pub const CLI_FLAG: &str = "--core-updates";
 
 /// Команда ядру из аргументов после `--core-updates`.
@@ -206,12 +235,27 @@ pub fn parse_cli(rest: &[String]) -> Result<UpdateOp, String> {
     match rest.first().map(String::as_str) {
         Some("state") => Ok(UpdateOp::State),
         Some("check") => Ok(UpdateOp::Check),
+        Some("apply") => match (rest.get(1), rest.get(2)) {
+            (Some(name), Some(version)) => match Component::parse(name) {
+                Some(component) => Ok(UpdateOp::Apply(vec![(component, version.clone())])),
+                None => Err(format!("{CLI_FLAG} apply: unknown component {name:?}, expected native|engine|app")),
+            },
+            _ => Err(format!("{CLI_FLAG} apply: expected <native|engine|app> <version>, got {:?}", &rest[1..])),
+        },
         Some("restore") => match rest.get(1).map(|id| id.parse::<u64>()) {
             Some(Ok(id)) => Ok(UpdateOp::Restore(id)),
             _ => Err(format!("{CLI_FLAG} restore: expected a history entry number, got {:?}", rest.get(1))),
         },
-        other => Err(format!("{CLI_FLAG}: expected state|check|restore <id>, got {other:?}")),
+        other => Err(format!("{CLI_FLAG}: expected state|check|apply <component> <version>|restore <id>, got {other:?}")),
     }
+}
+
+/// Сколько командная строка ждёт, пока ядро занято запросом: установка MSI идёт минутами, проверка — нет.
+pub fn cli_wait(op: &UpdateOp) -> std::time::Duration {
+    std::time::Duration::from_secs(match op {
+        UpdateOp::Apply(_) => 600,
+        _ => 120,
+    })
 }
 
 /// Аргументы помощника, который отправляет ядру возврат `id` (канал итога добавляет `elevated::run`).
@@ -257,8 +301,29 @@ mod tests {
         assert!(parse_cli(&args("restore")).is_err(), "без номера");
         assert!(parse_cli(&args("restore -1")).is_err(), "номер — только неотрицательный");
         assert!(parse_cli(&args("restore 4x")).is_err());
-        assert!(parse_cli(&args("apply")).is_err(), "неизвестная команда — ошибка, а не тихое «state»");
+        assert!(parse_cli(&args("rollback 1")).is_err(), "неизвестная команда — ошибка, а не тихое «state»");
         assert!(parse_cli(&[]).is_err());
+    }
+
+    #[test]
+    fn cli_apply() {
+        for (name, component) in [("native", Component::Native), ("engine", Component::Engine), ("app", Component::App)] {
+            assert_eq!(parse_cli(&args(&format!("apply {name} 1.2.3"))), Ok(UpdateOp::Apply(vec![(component, "1.2.3".into())])));
+        }
+        assert!(parse_cli(&args("apply")).is_err(), "без компонента");
+        assert!(parse_cli(&args("apply native")).is_err(), "без версии — не «последняя найденная»");
+        let unknown = parse_cli(&args("apply amnezia 1.0")).unwrap_err();
+        assert!(unknown.contains("native|engine|app"), "{unknown}");
+        assert!(parse_cli(&args("apply Native 1.0")).is_err(), "имена — как в справке, без угадывания");
+    }
+
+    /// Командная строка шлёт ядру тот же `Apply`, что кнопка окна, и проходит ту же проверку прав.
+    #[test]
+    fn cli_apply_goes_through_the_same_check() {
+        let op = parse_cli(&args("apply native 1.2.3")).unwrap();
+        assert_eq!(updates_allowed(&op, false), Ok(()), "как кнопка «Обновить» окна — без UAC");
+        assert_eq!(cli_wait(&op), std::time::Duration::from_secs(600), "MSI ставится минутами");
+        assert_eq!(cli_wait(&UpdateOp::Check), std::time::Duration::from_secs(120));
     }
 
     #[test]

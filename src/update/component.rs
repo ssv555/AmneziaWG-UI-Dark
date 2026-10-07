@@ -88,7 +88,7 @@ impl Components {
     /// Настоящие компоненты; туннели при замене трогает только ядро (`core`): аренда на время MSI, переподключение
     /// после замены движка.
     pub(super) fn real(core: Arc<dyn CoreLink>) -> Self {
-        Components::new(Box::new(native::NativeOps { core: core.clone() }), Box::new(EngineOps { core }), Box::new(AppOps))
+        Components::new(Box::new(native::NativeOps { core: core.clone(), ui_open: crate::update::native::ui_open }), Box::new(EngineOps { core }), Box::new(AppOps))
     }
 
     pub(super) fn get(&self, c: Component) -> &dyn ComponentOps {

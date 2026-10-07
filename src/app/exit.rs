@@ -10,6 +10,7 @@ use super::dialog::{dialog_choice, dialog_window};
 
 use super::modals::{Modal, Outcome, Turn};
 use super::App;
+use crate::crash::lock;
 use crate::daemon::CoreApi;
 use crate::daemon::proto::{NativeOp, Plan, Request};
 use crate::i18n::{tr, trf};
@@ -81,13 +82,13 @@ impl App {
     /// Отключить туннели через ядро и выйти; не вышло — окно остаётся, ошибка в журнале.
     fn disconnect_and_exit(&mut self, running: Vec<String>, native: bool) {
         self.save_before_exit();
-        *self.notice.lock().unwrap() = Some(tr("exit.disconnecting"));
+        *lock(&self.notice) = Some(tr("exit.disconnecting"));
         let (core, error, notice, ctx) = (self.core.clone(), self.action_error.clone(), self.notice.clone(), self.ctx.clone());
         std::thread::spawn(move || {
             match running.iter().try_for_each(|t| core.ok(Request::Switch { tunnel: t.clone(), plan: Plan::Disconnect, multiple: true })) {
                 Ok(()) => finish_exit(core.as_ref(), native, &error),
                 Err(e) => {
-                    *notice.lock().unwrap() = None;
+                    *lock(&notice) = None;
                     error.push(e);
                     ctx.request_repaint();
                 }

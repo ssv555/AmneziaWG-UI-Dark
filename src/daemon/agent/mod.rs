@@ -1,14 +1,15 @@
 //! Агент — второй процесс (`awg-ui.exe --agent`, SYSTEM): всё, что не должно мешать VPN-ядру (обновления, пинг,
 //! статистика, журнал на диске — по мере переноса, см. план core-split). Сейчас здесь канал агента, `Hello`, пинг
-//! (`agent.ini`), обновления (`updates`), статистика (`stats`), журнал событий (`journal`, единственный писатель
-//! `events.log`) и конфиги туннелей с помощником родного окна (`tunnels`). Запускает и сторожит его ядро
-//! (`daemon::agent_watch`). VPN-кода здесь нет и быть не должно: туннели,
+//! (`agent.ini`), язык ядра (`language`), обновления (`updates`), статистика (`stats`), журнал событий (`journal`,
+//! единственный писатель `events.log`) и конфиги туннелей с помощником родного окна (`tunnels`). Запускает и
+//! сторожит его ядро (`daemon::agent_watch`). VPN-кода здесь нет и быть не должно: туннели,
 //! переключение и переподключение — только в ядре; тест `agent_does_not_reach_into_vpn_code` сторожит это по тексту
 //! модуля.
 
 pub mod client;
 mod core_poll;
 mod journal;
+mod language;
 mod ping;
 pub mod proto;
 mod settings;
@@ -23,6 +24,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use journal::AgentJournal;
+use language::AgentLanguage;
 use ping::AgentPing;
 use tunnels::{Caller, Tunnels};
 use proto::{AgentRequest, AgentResponse, AgentState};
@@ -81,10 +83,12 @@ struct Agent {
 }
 
 impl Agent {
-    /// Журнал событий (файл ведёт агент), настройки (`agent.ini`, при первом запуске — перенос из `core.ini`) и
-    /// фоновые потоки.
+    /// Журнал событий (файл ведёт агент), язык ядра (`language`), настройки (`agent.ini`, при первом запуске —
+    /// перенос из `core.ini`) и фоновые потоки.
     fn start() -> Agent {
         let journal = Arc::new(AgentJournal::open(super::events_file()));
+        // Язык — до первого текста агента: иначе записи ниже и всё, что пишут потоки, были бы на английском.
+        let language = Arc::new(AgentLanguage::real(log_to(&journal)));
         let path = AgentConfig::path();
         let (config, notes) = AgentConfig::load_or_migrate(&path, &super::Config::path());
         for text in &notes {
@@ -93,7 +97,7 @@ impl Agent {
         let ping = Arc::new(AgentPing::real(config, path, note_to(&journal)));
         crate::ping::spawn(ping.clone());
         let stats = Arc::new(AgentStats::real(log_to(&journal)));
-        spawn_core_poll(stats.clone(), journal.clone());
+        spawn_core_poll(stats.clone(), journal.clone(), language);
         // Обновления ведёт агент; ядро на `Updates` отвечает окну прежней версии отказом.
         let updates = updates::start(journal.clone());
         let tunnels = Tunnels::real(log_to(&journal));
@@ -101,15 +105,16 @@ impl Agent {
     }
 
     fn state(&self) -> AgentState {
-        AgentState { ping: self.ping.dto(), stats: self.stats.snapshot() }
+        AgentState { ping: self.ping.dto(), stats: self.stats.snapshot(), native_ui: self.updates.as_ref().map(|m| m.native_ui()) }
     }
 }
 
-/// Опрос ядра раз в секунду (`core_poll`): статистика и журнал событий (события ядра по курсору). Свой поток записи
-/// `Stats.ini` — медленный диск не задерживает опрос (файл журнала пишет его `events-writer`). Все вторичные: паника —
-/// запись в журнал и пауза.
-fn spawn_core_poll(traffic: Arc<AgentStats>, journal: Arc<AgentJournal>) {
-    let feeds: Vec<Arc<dyn core_poll::CoreFeed>> = vec![traffic.clone(), journal.clone()];
+/// Опрос ядра раз в секунду (`core_poll`): язык (смена `core.ini`), статистика и журнал событий (события ядра по
+/// курсору). Свой поток записи `Stats.ini` — медленный диск не задерживает опрос (файл журнала пишет его
+/// `events-writer`). Все вторичные: паника — запись в журнал и пауза.
+fn spawn_core_poll(traffic: Arc<AgentStats>, journal: Arc<AgentJournal>, language: Arc<AgentLanguage>) {
+    // Язык первым: строки журнала с этого же ответа ядра уже на новом языке.
+    let feeds: Vec<Arc<dyn core_poll::CoreFeed>> = vec![language, traffic.clone(), journal.clone()];
     core_poll::spawn(core_poll::CorePoll::real(log_to(&journal)), feeds, Box::new(report_panic(&journal)));
     let report = report_panic(&journal);
     crate::crash::spawn_named("agent-stats-save", move || {
@@ -459,6 +464,7 @@ mod tests {
             ("stats.rs", include_str!("stats.rs")),
             ("updates.rs", include_str!("updates.rs")),
             ("tunnels.rs", include_str!("tunnels.rs")),
+            ("language.rs", include_str!("language.rs")),
         ] {
             let code = source.split("#[cfg(test)]").next().unwrap();
             for word in forbidden {

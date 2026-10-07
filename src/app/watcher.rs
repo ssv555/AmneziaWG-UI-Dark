@@ -7,6 +7,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
 use crate::conf::TunnelInfo;
+use crate::crash::lock;
 use crate::i18n::trf;
 
 /// Как часто смотреть на время изменения файлов, открытых на правку.
@@ -84,20 +85,20 @@ impl SourceWatcher {
         self.seen.insert(tunnel.to_string(), modified);
         let text = std::fs::read_to_string(path)?;
         let origin = trf("det.from_source", &[&path.display().to_string()]);
-        self.infos.lock().unwrap().insert(tunnel.to_string(), (crate::conf::parse(&text), origin));
+        lock(&self.infos).insert(tunnel.to_string(), (crate::conf::parse(&text), origin));
         Ok(())
     }
 
     /// Туннель удалён: сведения, наблюдение и отметка о файле не нужны.
     pub(super) fn forget(&mut self, tunnel: &str) {
-        self.infos.lock().unwrap().remove(tunnel);
+        lock(&self.infos).remove(tunnel);
         self.seen.remove(tunnel);
         self.watched.retain(|w| w.tunnel != tunnel);
     }
 
     /// Туннель переименован: сведения устарели, наблюдение идёт за новым именем.
     pub(super) fn rename(&mut self, old: &str, new: &str) {
-        self.infos.lock().unwrap().remove(old);
+        lock(&self.infos).remove(old);
         self.seen.remove(old);
         for w in self.watched.iter_mut().filter(|w| w.tunnel == old) {
             w.tunnel = new.to_string();
@@ -106,24 +107,24 @@ impl SourceWatcher {
 
     /// Режим сменился — сведения прежнего режима не годятся.
     pub(super) fn clear_infos(&self) {
-        self.infos.lock().unwrap().clear();
+        lock(&self.infos).clear();
     }
 
     pub(super) fn has_info(&self, tunnel: &str) -> bool {
-        self.infos.lock().unwrap().contains_key(tunnel)
+        lock(&self.infos).contains_key(tunnel)
     }
 
     /// Занять запрос сведений: `false` — этот туннель уже запрашивается.
     pub(super) fn begin_load(&self, tunnel: &str) -> bool {
-        self.loading.lock().unwrap().insert(tunnel.to_string())
+        lock(&self.loading).insert(tunnel.to_string())
     }
 
     pub(super) fn infos_snapshot(&self) -> BTreeMap<String, (TunnelInfo, String)> {
-        self.infos.lock().unwrap().clone()
+        lock(&self.infos).clone()
     }
 
     pub(super) fn loading_snapshot(&self) -> BTreeSet<String> {
-        self.loading.lock().unwrap().clone()
+        lock(&self.loading).clone()
     }
 
     /// Ручки для фонового потока: он кладёт сведения и снимает пометку запроса.

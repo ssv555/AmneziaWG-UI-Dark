@@ -206,6 +206,7 @@ fn main() {
         std::process::exit(i32::from(result.is_err()));
     }
     // Проверка менеджера обновлений: `state` — без сети; `check` — проверка источников, ждёт её конца (до 2 мин);
+    // `apply <компонент> <версия>` — тот же запрос, что кнопка «Обновить» окна, ждёт конца установки (до 10 мин);
     // `restore <id>` — помощник окна с правами администратора: отправить возврат агенту и выйти, ход виден в окне.
     if let Some(pos) = args.iter().position(|a| a == update::CLI_FLAG) {
         use daemon::agent::client::{AgentApi, AgentPipe};
@@ -221,8 +222,8 @@ fn main() {
             std::process::exit(restore_helper(id, value(elevated::RESULT_FLAG).as_deref()));
         }
         let what = &args[pos + 1];
+        let deadline = std::time::Instant::now() + update::cli_wait(&op);
         let mut result = AgentPipe.updates(op).map_err(|e| e.to_string());
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
         while matches!(&result, Ok(s) if s.busy.is_some()) && std::time::Instant::now() < deadline {
             std::thread::sleep(std::time::Duration::from_secs(1));
             result = AgentPipe.updates(UpdateOp::State).map_err(|e| e.to_string());

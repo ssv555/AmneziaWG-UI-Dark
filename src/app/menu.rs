@@ -452,6 +452,11 @@ impl MenuKey {
 /// Одиночный Alt по событиям `ModifiersChanged` (egui-winit шлёт их при каждой смене модификаторов). Отменяют его
 /// любая клавиша или кнопка мыши, пока Alt нажат (Alt+F4, Alt+Tab, Alt+буква, Alt+щелчок), другой модификатор
 /// (AltGr — это Ctrl+Alt) и смена фокуса окна.
+///
+/// Порядок событий на Windows: winit шлёт `ModifiersChanged` раньше самого нажатия (`event_loop.rs`, «Send new
+/// modifiers before sending key events»), а egui-winit 0.36 отдаёт сам Alt как `Key::AltLeft` / `Key::AltRight`
+/// (`key_from_key_code`). Поэтому нажатие Alt приходит как «клавиша после смены модификаторов» — своё нажатие
+/// одиночный Alt не отменяет, иначе он не срабатывает никогда (и его автоповтор при удержании тоже).
 #[derive(Default)]
 struct AltTap {
     /// Alt нажат.
@@ -477,6 +482,7 @@ impl AltTap {
                     self.clean = if alt_only { self.clean || !self.held } else { false };
                     self.held = m.alt;
                 }
+                egui::Event::Key { key: egui::Key::AltLeft | egui::Key::AltRight, .. } => {}
                 egui::Event::Key { pressed: true, .. } | egui::Event::PointerButton { pressed: true, .. } => self.clean = false,
                 egui::Event::WindowFocused(_) => *self = Self::default(),
                 _ => {}
@@ -708,9 +714,17 @@ mod tests {
         raw.events.iter().any(|e| matches!(e, egui::Event::Key { key: egui::Key::F10, pressed: true, modifiers, .. } if modifiers.is_none()))
     }
 
+    /// Кадр с нажатием (`alt`) или отпусканием левого Alt, как его отдаёт egui-winit 0.36 на Windows: сначала
+    /// `ModifiersChanged`, затем сам Alt как `Key::AltLeft`; после них `events`.
     fn with_alt(alt: bool, events: Vec<egui::Event>) -> egui::RawInput {
-        let modifiers = if alt { egui::Modifiers::ALT } else { egui::Modifiers::NONE };
-        changed(true, modifiers, events)
+        let events = alt_key(egui::Key::AltLeft, alt).into_iter().chain(events).collect();
+        input(true, events)
+    }
+
+    /// Нажатие или отпускание самой клавиши Alt: `ModifiersChanged` плюс её `Key`, в порядке winit.
+    fn alt_key(key: egui::Key, pressed: bool) -> [egui::Event; 2] {
+        let modifiers = if pressed { egui::Modifiers::ALT } else { egui::Modifiers::NONE };
+        [egui::Event::ModifiersChanged(modifiers), key_event(key, pressed, false, modifiers)]
     }
 
     /// Кадр: смена модификаторов, за ней `events`.
@@ -720,7 +734,11 @@ mod tests {
     }
 
     fn press(key: egui::Key, modifiers: egui::Modifiers) -> egui::Event {
-        egui::Event::Key { key, physical_key: None, pressed: true, repeat: false, modifiers }
+        key_event(key, true, false, modifiers)
+    }
+
+    fn key_event(key: egui::Key, pressed: bool, repeat: bool, modifiers: egui::Modifiers) -> egui::Event {
+        egui::Event::Key { key, physical_key: None, pressed, repeat, modifiers }
     }
 
     /// Мнемоники верхних меню на каждом встроенном языке: есть у всех и не повторяются (по клавише, на которую
@@ -889,9 +907,31 @@ mod tests {
         assert!(!plain_f10(&again), "одно нажатие — один F10");
         // Нажатие и отпускание между двумя кадрами — тоже одиночный Alt.
         let mut t = AltTap::default();
-        let mut both = with_alt(true, vec![egui::Event::ModifiersChanged(egui::Modifiers::NONE)]);
+        let mut both = with_alt(true, alt_key(egui::Key::AltLeft, false).to_vec());
         t.step(&mut both);
-        assert!(plain_f10(&both));
+        assert!(plain_f10(&both), "нажат и отпущен внутри одного кадра");
+    }
+
+    /// Alt приходит в egui как своя клавиша (`Key::AltLeft` / `AltRight`) вслед за `ModifiersChanged`, при удержании —
+    /// с автоповтором. Своё нажатие одиночный Alt не отменяет; любая другая клавиша после него — отменяет.
+    #[test]
+    fn alt_own_key_events_do_not_cancel_the_tap() {
+        for key in [egui::Key::AltLeft, egui::Key::AltRight] {
+            let mut t = AltTap::default();
+            t.step(&mut input(true, alt_key(key, true).to_vec()));
+            let mut held = input(true, vec![key_event(key, true, true, egui::Modifiers::ALT)]);
+            t.step(&mut held);
+            assert!(!plain_f10(&held), "{key:?}: удержание — ещё не отпускание");
+            let mut up = input(true, alt_key(key, false).to_vec());
+            t.step(&mut up);
+            assert!(plain_f10(&up), "{key:?}: отпустили после автоповтора");
+        }
+        // Alt+F в реальном порядке событий: Alt, буква, отпускание Alt — это мнемоника, не одиночный Alt.
+        let mut t = AltTap::default();
+        let mut frame = with_alt(true, vec![press(egui::Key::F, egui::Modifiers::ALT)]);
+        frame.events.extend(alt_key(egui::Key::AltLeft, false));
+        t.step(&mut frame);
+        assert!(!plain_f10(&frame), "Alt+F");
     }
 
     #[test]

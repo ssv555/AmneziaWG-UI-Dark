@@ -6,6 +6,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use super::budget::{Budgets, Limits};
+use super::phase_trace::mark;
 use super::pipe::Server;
 use super::proto::{CoreState, NativeOp, Plan, Request, Response};
 use super::agent_watch::{self, AgentCell};
@@ -104,7 +105,7 @@ pub fn run(stop: &AtomicBool, ready: impl FnOnce(), persist_tail: impl FnOnce(Ve
     let dir = data_dir();
     crate::win::protect_dir(&dir, DATA_SDDL)?;
     let (config, unreadable) = Config::load_guarded();
-    crate::i18n::set(&crate::engine::install_dir().join("lang"), &config.language);
+    crate::i18n::set(&super::lang_dir(), &config.language);
     // После выбора языка (текст на нём) и до проверки владельца: без `core.ini` ядро дальше не пойдёт, и запись
     // в журнале — единственное, что объяснит, почему.
     if let Some(problem) = &unreadable {
@@ -166,13 +167,22 @@ fn serve_until_stopped(core: &Arc<Core>, stop: &AtomicBool, ready: impl FnOnce()
     let net_core = core.clone();
     super::netwatch::spawn(move |severity, text| net_core.shared.log("", severity, text));
     let supervisor = core.clone();
-    crate::crash::spawn_named("retry", move || supervisor.supervise());
+    // Запись хронометража теста (в сборке без тестов — ничего) идёт за потоками, через которые проходит Switch.
+    let carry = super::phase_trace::Carry::here();
+    let supervisor_carry = carry.clone();
+    crate::crash::spawn_named("retry", move || {
+        supervisor_carry.adopt();
+        supervisor.supervise()
+    });
 
     let server_core = core.clone();
     let taken = Arc::new(AtomicBool::new(false));
     let server_taken = taken.clone();
     let pipe = ends.pipe.clone();
-    crate::crash::spawn_named("pipe-accept", move || serve(&server_core, &server_taken, &pipe));
+    crate::crash::spawn_named("pipe-accept", move || {
+        carry.adopt();
+        serve(&server_core, &server_taken, &pipe)
+    });
     if let Err(e) = wait_listening(&ends.pipe) {
         return Err(if taken.load(Ordering::SeqCst) { RunError::PipeTaken(e) } else { RunError::Failed(e) });
     }
@@ -220,21 +230,31 @@ fn serve(core: &Arc<Core>, taken: &AtomicBool, name: &str) {
             core.shared.log("", Severity::Info, &tr("core.pipe_recovered"));
         }
         let Some((slot, hello_only)) = core.connections.admit(conn.from_system()) else {
+            mark("accept: no connection slot, refused");
             // Не дошёл отказ — клиент сам увидит ошибку канала; ядру тут терять нечего.
             drop(conn.reply(&Response::Refused(tr("core.busy"))));
             continue;
         };
+        mark("accept: slot admitted, starting request thread");
         let core = core.clone();
+        let carry = super::phase_trace::Carry::here();
         crate::crash::spawn_named("pipe-request", move || {
+            carry.adopt();
+            mark("request: thread started");
             // Место возвращается при выходе из потока при любом исходе.
             let _slot = slot;
             let response = match conn.read() {
                 Ok(req) if hello_only && !matches!(req, Request::Hello) => Response::Refused(tr("core.busy")),
-                Ok(req) => core.handle_isolated(req, conn.client_sid.as_deref(), conn.from_system()),
+                Ok(req) => {
+                    mark("request: read");
+                    core.handle_isolated(req, conn.client_sid.as_deref(), conn.from_system())
+                }
                 Err(e) => Response::Refused(e),
             };
+            mark("request: handled");
             // Не дошёл ответ (клиент ушёл или не забирает его в срок) — клиент сам увидит ошибку канала.
             drop(conn.reply(&response));
+            mark("request: replied");
         });
     }
 }
@@ -499,12 +519,16 @@ impl Core {
     /// (подключает, только если туннель всё ещё желаемый и не работает). `Ok(false)` — делать было нечего.
     fn switch_from(&self, origin: Origin, name: &str, plan: Plan, multiple: bool) -> Result<bool, String> {
         // Повторное нажатие, пока туннель ещё переключается, — ничего не делать.
+        mark("switch: begin");
         if self.shared.is_pending(name) {
             return Ok(false);
         }
+        mark("switch: pending checked, waiting for the switching lock");
         let _guard = lock(&self.switching);
+        let _held = super::phase_trace::Span::new("switch: switching lock held", "switch: done, releasing the switching lock");
         // Список запущенных — у служб, а не из снимка опроса: только что подключённый туннель в снимок ещё не попал.
         let found = self.host().and_then(|b| b.running().map(|r| (b, r)).map_err(|e| e.to_string()));
+        mark("switch: running tunnels listed");
         let (b, running) = match found {
             Ok(found) => found,
             // Ответ `Err` на `Switch` окно не показывает — оно ждёт эту ошибку в журнале ядра. Ошибку попытки надзора
@@ -529,6 +553,7 @@ impl Core {
             return Ok(false);
         }
         // Перезапуск мёртвого трогает только его: с соседями он ужился, когда подключался.
+        mark("switch: decided, finding conflicting tunnels");
         let others = if origin == Origin::Dead { Vec::new() } else { to_replace(name, plan, multiple, &running, |n| self.footprint(n)) };
         if origin == Origin::User {
             self.update_desired(name, |config| {
@@ -538,6 +563,7 @@ impl Core {
                 }
             });
             let mut retries = lock(&self.retries);
+            mark("switch: desired set updated, retries lock held");
             std::iter::once(name).chain(others.iter().map(String::as_str)).for_each(|t| retries.forget(t));
             drop(retries);
             // Отключение того, что не работает и службы не имеет (переподключался, выход с отключением): снять
@@ -557,8 +583,11 @@ impl Core {
             Plan::Reconnect => "busy.reconnect",
         };
         // Отключаемые попутно — тоже «по команде», а не авария.
+        mark("switch: marking tunnels busy");
         let _busy = self.shared.pending_guard(std::iter::once((name.to_string(), label)).chain(others.iter().map(|o| (o.clone(), "busy.disconnect"))));
+        mark("switch: engine calls begin");
         let result = run_switch(b.as_ref(), name, plan, &others);
+        mark("switch: engine calls done");
         if let (Origin::User, Err(e)) = (origin, &result) {
             self.shared.log(name, Severity::Bad, e);
         }
@@ -568,13 +597,18 @@ impl Core {
     /// Изменить желаемый набор туннелей и сохранить его. Не записался — набор в памяти всё равно новый (до перезапуска
     /// ядра он верен), а в журнале предупреждение: после перезагрузки поднимется прежний набор.
     fn update_desired(&self, tunnel: &str, change: impl FnOnce(&mut Config)) {
+        mark("desired: waiting for the config lock");
         let mut config = lock(&self.config);
+        mark("desired: config lock held");
         let mut next = config.clone();
         change(&mut next);
         if next == *config {
             return;
         }
-        let saved = self.config_file.as_deref().map_or(Ok(()), |path| next.save_to(path));
+        let saved = self.config_file.as_deref().map_or(Ok(()), |path| {
+            let _write = super::phase_trace::Span::new("desired: config write and flush begin", "desired: config write and flush done");
+            next.save_to(path)
+        });
         *config = next;
         drop(config);
         if let Err(e) = saved {
@@ -891,13 +925,12 @@ impl Core {
         }
     }
 
-    /// Язык журнала — как у окна. Файл .lng ядро берёт только из своей папки в Program Files (туда пишут
-    /// администраторы); нет файла — встроенный перевод или английский.
+    /// Язык журнала — как у окна (файл .lng — из `lang_dir`). Агент подхватывает его из `core.ini` (`agent::language`).
     fn set_language(&self, code: String) -> Result<(), String> {
         if !crate::i18n::is_code(&code) {
             return Err(format!("language: {code}"));
         }
-        crate::i18n::set(&crate::engine::install_dir().join("lang"), &code);
+        crate::i18n::set(&super::lang_dir(), &code);
         let mut config = lock(&self.config);
         if config.language != code {
             config.language = code;
@@ -936,13 +969,18 @@ pub(crate) fn run_switch(host: &dyn TunnelHost, name: &str, plan: Plan, others: 
         crate::fsutil::wait_until(SWITCH_TIMEOUT, Duration::from_millis(200), || host.running().map(|r| r.iter().any(|n| n == name) == up).unwrap_or(false));
     };
     others.iter().try_for_each(|o| host.disconnect(o))?;
+    mark("engine: others disconnected");
     if plan != Plan::Connect {
         host.disconnect(name)?;
+        mark("engine: disconnected, waiting for the service to go");
         wait(false);
+        mark("engine: service gone (or wait timed out)");
     }
     if plan != Plan::Disconnect {
         host.connect(name)?;
+        mark("engine: connected, waiting for the service to appear");
         wait(true);
+        mark("engine: service up (or wait timed out)");
     }
     Ok(())
 }
@@ -1626,11 +1664,14 @@ mod tests {
         pipe: String,
         agent_pipe: String,
         stop: Arc<AtomicBool>,
+        /// Хронометраж пути Switch этого ядра; упал Switch — уходит в журнал падения (`phase_trace`).
+        trace: Arc<super::super::phase_trace::Trace>,
     }
 
     impl Drop for Rig {
         fn drop(&mut self) {
             self.stop.store(true, Ordering::SeqCst);
+            RIGS_RUNNING.fetch_sub(1, Ordering::SeqCst);
         }
     }
 
@@ -1642,6 +1683,11 @@ mod tests {
     /// зависание отсчитывается от первого ответа — агент `hang` отвечает раз и замолкает.
     const PROBE_HANG: agent_watch::Probe = agent_watch::Probe { every: Duration::from_millis(300), timeout: Duration::from_millis(300), start_grace: Duration::from_secs(10) };
 
+    /// Ядер под тестом запущено в этом процессе: их потоки живут до выхода процесса — для журнала падения.
+    static CORES_STARTED: AtomicUsize = AtomicUsize::new(0);
+    /// Тестов изоляции идёт сейчас (живых `Rig`) — для журнала падения.
+    static RIGS_RUNNING: AtomicUsize = AtomicUsize::new(0);
+
     /// Поднять ядро на своих канале и хосте: желаемый туннель `a` работает, агент — процесс тестов в роли `behaviour`.
     fn start_core(behaviour: &str, probe: agent_watch::Probe) -> Rig {
         start_core_delayed(behaviour, Duration::ZERO, probe)
@@ -1649,8 +1695,7 @@ mod tests {
 
     /// То же; агент создаёт свой канал через `start_delay` после запуска процесса.
     fn start_core_delayed(behaviour: &str, start_delay: Duration, probe: agent_watch::Probe) -> Rig {
-        static NEXT: AtomicUsize = AtomicUsize::new(0);
-        let tag = format!("{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::SeqCst));
+        let tag = format!("{}-{}", std::process::id(), CORES_STARTED.fetch_add(1, Ordering::SeqCst));
         let pipe = format!(r"\\.\pipe\awg-ui-test-core-{tag}");
         let agent_pipe = format!(r"\\.\pipe\awg-ui-test-agent-{tag}");
         assert!(pipe != super::super::pipe::NAME && agent_pipe != super::super::agent::PIPE_NAME);
@@ -1669,14 +1714,20 @@ mod tests {
         let stop = Arc::new(AtomicBool::new(false));
         let (tx, rx) = std::sync::mpsc::channel();
         let (serving, stopping, ready) = (core.clone(), stop.clone(), tx.clone());
+        // Запись хронометража — у потока теста (клиент канала) и потока ядра; от него — у потоков приёма и запросов.
+        let trace = super::super::phase_trace::Trace::new();
+        trace.install();
+        let core_trace = trace.clone();
         std::thread::spawn(move || {
+            core_trace.install();
             let result = serve_until_stopped(&serving, &stopping, || ready.send(Ok(())).unwrap_or(()), ends);
             tx.send(result.map_err(|e| e.text().to_string())).unwrap_or(());
         });
         let ready_within = READY_TIMEOUT + Duration::from_secs(5);
         let started = rx.recv_timeout(ready_within).unwrap_or_else(|e| panic!("core under test did not start within {ready_within:?}: {e}"));
         started.unwrap_or_else(|e| panic!("core under test failed: {e}"));
-        Rig { core, host, pipe, agent_pipe, stop }
+        RIGS_RUNNING.fetch_add(1, Ordering::SeqCst);
+        Rig { core, host, pipe, agent_pipe, stop, trace }
     }
 
     fn agent_pid(core: &Core) -> Option<u32> {
@@ -1709,7 +1760,9 @@ mod tests {
     }
 
     /// Переключать туннель `b` через канал ядра (подключить, отключить, …), пока `done` не вернёт значение. Каждый
-    /// ответ ядра — быстрее секунды: что бы ни делал агент, команды окна ядро не задерживает.
+    /// ответ ядра — быстрее секунды: что бы ни делал агент, команды окна ядро не задерживает. Не ответил или ответил
+    /// позже — в сообщении путь журнала падения с фазами этого Switch (`phase_trace`): падение редкое и не
+    /// воспроизводится, разбирать его можно только по записи того прогона.
     fn switching_until<T>(rig: &Rig, within: Duration, what: &str, mut done: impl FnMut() -> Option<T>) -> T {
         let deadline = Instant::now() + within;
         let mut answers = 0u32;
@@ -1718,8 +1771,20 @@ mod tests {
             let asked = Instant::now();
             let result = PipeAt(&rig.pipe).ok(Request::Switch { tunnel: "b".into(), plan, multiple: true });
             let took = asked.elapsed();
-            assert!(result.is_ok(), "{what}: Switch {plan:?}: {result:?}");
-            assert!(took < Duration::from_secs(1), "{what}: Switch {plan:?} answered in {took:?}");
+            let failure = match &result {
+                Err(_) => Some(format!("{what}: Switch {plan:?}: {result:?}")),
+                Ok(()) if took >= Duration::from_secs(1) => Some(format!("{what}: Switch {plan:?} answered in {took:?}")),
+                Ok(()) => None,
+            };
+            if let Some(failure) = failure {
+                let facts = [
+                    ("Switch answers before this one", answers.to_string()),
+                    ("isolation tests running now", RIGS_RUNNING.load(Ordering::SeqCst).to_string()),
+                    ("cores under test started in this process (threads never stop)", CORES_STARTED.load(Ordering::SeqCst).to_string()),
+                ];
+                let log = rig.trace.write_failure(&failure, asked, &facts);
+                panic!("{failure}; {log}");
+            }
             answers += 1;
             if let Some(value) = done() {
                 return value;

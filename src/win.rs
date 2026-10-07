@@ -280,21 +280,57 @@ pub fn shell_open(path: &std::path::Path) -> Result<(), String> {
 
 /// Завершить процессы `exe_name` в сессии этого пользователя (не службы в сессии 0). Возвращает их число.
 pub fn close_session_processes(exe_name: &str) -> usize {
+    use windows_sys::Win32::System::Threading::{OpenProcess, TerminateProcess, PROCESS_TERMINATE};
+    let mut closed = 0;
+    for pid in session_processes(exe_name) {
+        unsafe {
+            let h = OpenProcess(PROCESS_TERMINATE, 0, pid);
+            if h != 0 as _ {
+                if TerminateProcess(h, 0) != 0 {
+                    closed += 1;
+                }
+                CloseHandle(h);
+            }
+        }
+    }
+    closed
+}
+
+/// Работает ли `exe_name` в сессии этого пользователя (не службы в сессии 0).
+pub fn session_process_running(exe_name: &str) -> bool {
+    !session_processes(exe_name).is_empty()
+}
+
+/// Работает ли `exe_name` в какой-нибудь сессии пользователя (не 0, где службы). Для агента от SYSTEM: окно
+/// AmneziaWG — процесс в сеансе пользователя, его службы менеджера и туннелей — в сеансе 0.
+pub fn user_session_process_running(exe_name: &str) -> bool {
+    !processes(exe_name, |session| session != 0).is_empty()
+}
+
+/// Номера процессов `exe_name` в сессии этого процесса. Своя сессия не узнана — пусто: оба вызывающих
+/// трактуют это как «процессов нет» (закрывать нечего, открывать окно снова незачем).
+fn session_processes(exe_name: &str) -> Vec<u32> {
+    use windows_sys::Win32::System::RemoteDesktop::ProcessIdToSessionId;
+    let mut own_session = 0u32;
+    if unsafe { ProcessIdToSessionId(std::process::id(), &mut own_session) } == 0 {
+        return Vec::new();
+    }
+    processes(exe_name, |session| session == own_session)
+}
+
+/// Номера процессов `exe_name`, чья сессия подходит под `in_session`. Снимок процессов не получен или сессия
+/// процесса не читается (он уже вышел) — такого процесса в ответе нет.
+fn processes(exe_name: &str, in_session: impl Fn(u32) -> bool) -> Vec<u32> {
     use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
     use windows_sys::Win32::System::Diagnostics::ToolHelp::{
         CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS,
     };
     use windows_sys::Win32::System::RemoteDesktop::ProcessIdToSessionId;
-    use windows_sys::Win32::System::Threading::{OpenProcess, TerminateProcess, PROCESS_TERMINATE};
-    let mut closed = 0;
+    let mut found = Vec::new();
     unsafe {
-        let mut own_session = 0u32;
-        if ProcessIdToSessionId(std::process::id(), &mut own_session) == 0 {
-            return 0;
-        }
         let snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
         if snap == INVALID_HANDLE_VALUE {
-            return 0;
+            return found;
         }
         let mut entry: PROCESSENTRY32W = std::mem::zeroed();
         entry.dwSize = size_of::<PROCESSENTRY32W>() as u32;
@@ -302,22 +338,15 @@ pub fn close_session_processes(exe_name: &str) -> usize {
         while ok != 0 {
             let len = entry.szExeFile.iter().position(|&c| c == 0).unwrap_or(entry.szExeFile.len());
             let name = String::from_utf16_lossy(&entry.szExeFile[..len]);
-            let mut session = u32::MAX;
-            ProcessIdToSessionId(entry.th32ProcessID, &mut session);
-            if name.eq_ignore_ascii_case(exe_name) && session == own_session {
-                let h = OpenProcess(PROCESS_TERMINATE, 0, entry.th32ProcessID);
-                if h != 0 as _ {
-                    if TerminateProcess(h, 0) != 0 {
-                        closed += 1;
-                    }
-                    CloseHandle(h);
-                }
+            let mut session = 0u32;
+            if name.eq_ignore_ascii_case(exe_name) && ProcessIdToSessionId(entry.th32ProcessID, &mut session) != 0 && in_session(session) {
+                found.push(entry.th32ProcessID);
             }
             ok = Process32NextW(snap, &mut entry);
         }
         CloseHandle(snap);
     }
-    closed
+    found
 }
 
 /// Автозапуск окна при входе в Windows: значение в `HKCU\…\Run`. Права администратора окну больше не нужны —
@@ -601,6 +630,15 @@ pub fn notifications_accepted() -> Result<bool, String> {
 
 #[cfg(test)]
 mod tests {
+    /// Сам тестовый процесс — в своей сессии; выдуманного имени там нет.
+    #[test]
+    fn own_process_is_found_in_its_session() {
+        let exe = std::env::current_exe().unwrap();
+        assert!(super::session_process_running(&exe.file_name().unwrap().to_string_lossy()));
+        assert!(!super::session_process_running("no-such-process-awg-ui.exe"));
+        assert!(!super::user_session_process_running("no-such-process-awg-ui.exe"));
+    }
+
     #[test]
     fn idle_time_survives_the_tick_counter_wrapping() {
         assert_eq!(super::idle_ms(10_000, 4_000), 6_000);

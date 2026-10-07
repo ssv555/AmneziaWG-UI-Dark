@@ -5,6 +5,7 @@ use std::path::PathBuf;
 use eframe::egui;
 
 use crate::conf::{self, Issue};
+use crate::crash::lock;
 use crate::i18n::{tr, trf};
 use crate::settings::Mode;
 use crate::win;
@@ -85,7 +86,7 @@ impl Editor {
                 self.saved = self.text.clone();
                 self.note = Some(match &self.tunnel {
                     Some(t) => {
-                        infos.lock().unwrap().remove(t);
+                        lock(&infos).remove(t);
                         (trf("eng.saved", &[t]), false)
                     }
                     None => (trf("ed.saved", &[&self.path.display().to_string()]), false),

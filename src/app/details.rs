@@ -3,7 +3,7 @@
 use eframe::egui::{self, RichText, Ui, Vec2};
 
 use super::a11y;
-use super::graph::{graph, stale_ping};
+use super::graph::{graph, stale_ping, GraphPause};
 use super::theme::{dot, level_color, mono, palette};
 use super::list::Primary;
 use super::{menu, Action, ROW_H};
@@ -91,7 +91,7 @@ fn label(text: &str) -> RichText {
     RichText::new(text).weak()
 }
 
-pub(super) fn details(ui: &mut Ui, d: &Detail, s: &mut Settings, actions: &mut Vec<Action>) {
+pub(super) fn details(ui: &mut Ui, d: &Detail, s: &mut Settings, pause: &mut GraphPause, actions: &mut Vec<Action>) {
     let status = d.live.and_then(|l| l.status.as_ref());
     let running = d.live.is_some();
     egui::Frame::group(ui.style()).inner_margin(egui::Margin::same(12)).show(ui, |ui| {
@@ -189,7 +189,7 @@ pub(super) fn details(ui: &mut Ui, d: &Detail, s: &mut Settings, actions: &mut V
 
         if let (true, Some(live)) = (s.view.graph, d.live) {
             ui.add_space(8.0);
-            graph(ui, live, (s.view.ping && !d.ping_unavailable).then_some(d.ping), s);
+            graph(ui, d.name, live, (s.view.ping && !d.ping_unavailable).then_some(d.ping), s, pause);
         }
     });
 

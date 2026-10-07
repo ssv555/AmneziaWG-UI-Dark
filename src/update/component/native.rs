@@ -21,6 +21,9 @@ const HOLD_LEASE: Duration = Duration::from_secs(15 * 60);
 pub(in crate::update) struct NativeOps {
     /// Туннели трогает только ядро: MSI убирает их службы, ядро на это время снимает их с надзора.
     pub(in crate::update) core: Arc<dyn CoreLink>,
+    /// Работает ли окно AmneziaWG в сеансе пользователя (`native::ui_open`). Смотрится прямо перед MSI: он идёт
+    /// 1–3 с и закрывает окно в самом начале, окно программы со своим опросом раз в секунду этого не застаёт.
+    pub(in crate::update) ui_open: fn() -> bool,
 }
 
 /// Релиз оригинального AmneziaWG, соответствующий установленной версии: метка без `v` и с ней.
@@ -56,6 +59,7 @@ impl ComponentOps for NativeOps {
         let rel = f.native.as_ref().map_err(String::clone)?;
         let msi = m.download_msi(rel, to)?;
         m.set_busy(Busy::Install { what: Component::Native, version: to.to_string() });
+        m.note_native_ui((self.ui_open)());
         self.during_msi(|| native::install(&msi, &m.log_path(id, "install")))
     }
 
@@ -75,6 +79,7 @@ impl ComponentOps for NativeOps {
         let current = job.current_backup.map(|n| m.dir.join(BACKUPS).join(n));
         let staged = m.dir.join(DOWNLOADS).join(CONFIGS);
         let has_configs = merge_configs(current.as_ref().map(|d| d.join(CONFIGS)).as_deref(), &dir.join(CONFIGS), &staged)?;
+        m.note_native_ui((self.ui_open)());
         self.during_msi(|| {
             if let Some(i) = native::installed() {
                 native::uninstall(&i.product_code, &m.log_path(id, "uninstall"))?;
@@ -154,7 +159,7 @@ mod tests {
     fn msi_runs_under_a_core_hold_of_the_tunnels_the_core_names() {
         for outcome in [Ok(()), Err("msiexec 1603".to_string())] {
             let core = native_core();
-            let ops = NativeOps { core: core.clone() };
+            let ops = NativeOps { core: core.clone(), ui_open: || false };
             let during = Mutex::new(Vec::new());
             let r = ops.during_msi(|| {
                 during.lock().unwrap().extend(core.calls());
@@ -171,7 +176,7 @@ mod tests {
     fn msi_is_not_run_without_the_hold() {
         let core = Arc::new(RecordingCore { refuse_hold: true, ..Default::default() });
         let mut ran = false;
-        let r = NativeOps { core: core.clone() }.during_msi(|| {
+        let r = NativeOps { core: core.clone(), ui_open: || false }.during_msi(|| {
             ran = true;
             Ok(())
         });
@@ -184,7 +189,7 @@ mod tests {
     #[test]
     fn nothing_held_needs_no_release() {
         let core = Arc::new(RecordingCore::default());
-        assert_eq!(NativeOps { core: core.clone() }.during_msi(|| Ok(())), Ok(()));
+        assert_eq!(NativeOps { core: core.clone(), ui_open: || false }.during_msi(|| Ok(())), Ok(()));
         assert_eq!(core.calls(), ["hold 900"]);
     }
 }

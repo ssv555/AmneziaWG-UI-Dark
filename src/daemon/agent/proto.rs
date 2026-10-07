@@ -75,6 +75,9 @@ pub struct AgentState {
     pub ping: PingDto,
     /// Накопительная статистика трафика (`Stats.ini` агента).
     pub stats: Stats,
+    /// Последняя законченная работа с MSI родного AmneziaWG и было ли перед ним открыто окно AmneziaWG. По ней окно
+    /// открывает снова окно, закрытое MSI (`app::native_reopen`); `None` — агент прежней версии.
+    pub native_ui: Option<crate::update::NativeUiMark>,
 }
 
 /// Ответ на `Events` — как события в `State` ядра: номера, код отсчёта и сколько подгружено из файла (`events::Cursor`).
@@ -99,7 +102,7 @@ mod tests {
         assert!(!line.contains('\n'), "одна строка на сообщение");
         assert_eq!(serde_json::from_str::<AgentRequest>(&line).unwrap(), AgentRequest::Hello);
         let ping = PingDto { host: "1.1.1.1".into(), last: Some(Ok(30)), fails: 0, history: vec![(1.5, Some(30))] };
-        for reply in [AgentResponse::Hello { version: "1.2.3".into() }, AgentResponse::State(Box::new(AgentState { ping, stats: stats_of("t", 42) }))] {
+        for reply in [AgentResponse::Hello { version: "1.2.3".into() }, AgentResponse::State(Box::new(AgentState { ping, stats: stats_of("t", 42), native_ui: Some(crate::update::NativeUiMark { seq: 3, was_open: true }) }))] {
             let line = serde_json::to_string(&reply).unwrap();
             assert!(!line.contains('\n'));
             assert_eq!(serde_json::from_str::<AgentResponse>(&line).unwrap(), reply);
@@ -121,6 +124,7 @@ mod tests {
         let newer: AgentState = serde_json::from_str(r#"{"ping":{"host":"h","last":null,"fails":2,"history":[]},"events":{"x":1}}"#).unwrap();
         assert_eq!((newer.ping.host.as_str(), newer.ping.fails), ("h", 2));
         assert!(older.stats.is_empty() && newer.stats.is_empty(), "агент без статистики — пустая, а не ошибка");
+        assert_eq!(older.native_ui, None, "агент прежней версии — отметки нет, окно AmneziaWG не открывается");
     }
 
     fn stats_of(name: &str, rx: u64) -> Stats {

@@ -10,6 +10,7 @@ use std::sync::{Arc, Mutex};
 use eframe::egui;
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 
+use crate::crash::lock;
 use crate::daemon::proto::{NativeOp, Plan, Request, Response};
 use crate::daemon::agent::client::{AgentApi, AgentPipe, Routed};
 use crate::daemon::{CoreApi, PipeClient};
@@ -39,6 +40,7 @@ mod list;
 mod markdown;
 mod menu;
 mod modals;
+mod native_reopen;
 mod reminder;
 mod settings_dialog;
 mod sources;
@@ -57,8 +59,10 @@ use group_dialog::Dialog;
 use list::{tunnel_list, Keys, List, ROW_H};
 use menu::menu_bar;
 use modals::{Modal, Modals, Outcome, Turn};
+use native_reopen::{LiveNativeWindow, NativeReopen};
 use sources::Confirm;
 use updates::UpdatesWindow;
+use graph::GraphPause;
 use event_log::{event_log, LogFilter};
 use status::{status_bar, StatusBar};
 use theme::*;
@@ -154,6 +158,8 @@ pub struct App {
     autostart: Option<bool>,
     action_error: ErrorSink,
     search: String,
+    /// Пауза графика скорости: на время работы окна, в настройки не пишется.
+    graph_pause: GraphPause,
     /// Фильтр и поиск панели журнала событий.
     log_filter: LogFilter,
     /// Клавиша меню (Apps) -> Shift+F10 для контекстных меню (`menu::context_menu`).
@@ -262,7 +268,12 @@ impl App {
             Some(agent) => {
                 core_link.check(core.clone(), ctx.clone(), action_error.clone(), Probe::Start);
                 let repaint = ctx.clone();
-                monitor::spawn_agent(shared.clone(), agent.clone(), Box::new(move || repaint.request_repaint()));
+                let mut reopen = NativeReopen::default();
+                let native_window = LiveNativeWindow { core: core.clone(), error: action_error.clone() };
+                let on_native_ui = Box::new(move |mark| {
+                    reopen.observe(mark, &native_window);
+                });
+                monitor::spawn_agent(shared.clone(), agent.clone(), Box::new(move || repaint.request_repaint()), on_native_ui);
             }
         }
         let mut modals = Modals::default();
@@ -286,6 +297,7 @@ impl App {
             notice,
             action_error,
             search: String::new(),
+            graph_pause: GraphPause::default(),
             log_filter: LogFilter::default(),
             menu_key: menu::MenuKey::default(),
             menu_nav: menu::MenuNav::default(),
@@ -381,7 +393,7 @@ impl App {
                 self.unseen_error = false;
             }
             Action::SaveLog(text) => self.save_log(&text),
-            Action::ClearNotice => *self.notice.lock().unwrap() = None,
+            Action::ClearNotice => *lock(&self.notice) = None,
             Action::Confirm(c) => self.modals.open(Modal::Confirm(c)),
             Action::ReadNative(tunnel) => {
                 let (core, infos, loading, error) =
@@ -392,16 +404,16 @@ impl App {
                     match core.details(&tunnel) {
                         Ok(info) => {
                             let origin = trf("det.from_native", &[&fmt::time_sec(monitor::unix_now())]);
-                            infos.lock().unwrap().insert(tunnel.clone(), (info, origin));
+                            lock(&infos).insert(tunnel.clone(), (info, origin));
                         }
                         Err(e) => error.push(e),
                     }
-                    loading.lock().unwrap().remove(&tunnel);
+                    lock(&loading).remove(&tunnel);
                 });
             }
             // Сначала задача запуска без UAC: ярлык ведёт на exe, а тот поднимает себя через неё.
             Action::DesktopShortcut => match crate::shortcut::create_on_desktop(crate::APP_TITLE, &tr("about.text")) {
-                Ok(path) => *self.notice.lock().unwrap() = Some(trf("set.shortcut_done", &[&path.display().to_string()])),
+                Ok(path) => *lock(&self.notice) = Some(trf("set.shortcut_done", &[&path.display().to_string()])),
                 Err(e) => self.action_error.push(e),
             },
             Action::Language(code) => {
@@ -443,7 +455,7 @@ impl App {
                 let Some(path) = self.s.book.source(&tunnel).map(PathBuf::from) else { return };
                 match win::shell_open(&path) {
                     Ok(()) => {
-                        *self.notice.lock().unwrap() = Some(trf("src.watching", &[&path.display().to_string()]));
+                        *lock(&self.notice) = Some(trf("src.watching", &[&path.display().to_string()]));
                         self.sources.watch(tunnel, path);
                     }
                     Err(e) => self.action_error.push(trf("err.open_file", &[&path.display().to_string(), &e])),
@@ -497,12 +509,7 @@ impl App {
 
     /// Ошибки действий окна уже в журнале событий (`ErrorSink`). Журнал скрыт — в строке состояния ссылка на него.
     fn drain_errors(&mut self) {
-        let fresh = self.action_error.take_fresh();
-        if self.s.view.log {
-            self.unseen_error = false;
-        } else if fresh {
-            self.unseen_error = true;
-        }
+        self.unseen_error = self.action_error.unseen_after(self.unseen_error, self.s.view.log);
     }
 
     /// Кадр модальных диалогов. Стек вынут на время кадра: диалог действует через `App` и может открыть
@@ -538,7 +545,7 @@ impl App {
 
     /// Отключение, выбранное в трее, ждёт подтверждения: трей уже поднял окно, вопрос — в этом кадре.
     fn check_disconnect_ask(&mut self) {
-        let asked = self.disconnect_ask.lock().unwrap().take();
+        let asked = lock(&self.disconnect_ask).take();
         if let Some(tunnel) = asked {
             self.modals.open(Modal::Confirm(Confirm::Disconnect(tunnel)));
         }
@@ -595,7 +602,7 @@ impl eframe::App for App {
             self.apply_deleted();
             let infos = self.sources.infos_snapshot();
             let info_loading = self.sources.loading_snapshot();
-            let notice = self.notice.lock().unwrap().clone();
+            let notice = lock(&self.notice).clone();
             let ping_ref = self.s.view.ping.then_some(&ping);
             let healths: BTreeMap<String, Health> = snap
                 .tunnels
@@ -660,7 +667,7 @@ impl eframe::App for App {
                         core_lost: snap.core_lost,
                         snap: &snap,
                     };
-                    details(ui, &ctx, &mut self.s, &mut actions)
+                    details(ui, &ctx, &mut self.s, &mut self.graph_pause, &mut actions)
                 }
                 None => {
                     ui.label(tr("empty.no_tunnels"));

@@ -17,7 +17,7 @@ use std::ops::ControlFlow;
 use std::panic::PanicHookInfo;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Mutex, MutexGuard, OnceLock};
+use std::sync::{Mutex, MutexGuard, OnceLock, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::Duration;
 
 /// Первая паника фонового потока ядра — по ней главный цикл останавливает службу.
@@ -59,6 +59,24 @@ pub fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|poisoned| {
         note_recovered(std::any::type_name::<T>());
         m.clear_poison();
+        poisoned.into_inner()
+    })
+}
+
+/// `lock` для `RwLock` на чтение — с теми же условиями: годится, только если значение меняется одной записью.
+pub fn read<T>(l: &RwLock<T>) -> RwLockReadGuard<'_, T> {
+    l.read().unwrap_or_else(|poisoned| {
+        note_recovered(std::any::type_name::<T>());
+        l.clear_poison();
+        poisoned.into_inner()
+    })
+}
+
+/// `lock` для `RwLock` на запись — с теми же условиями, что у `read`.
+pub fn write<T>(l: &RwLock<T>) -> RwLockWriteGuard<'_, T> {
+    l.write().unwrap_or_else(|poisoned| {
+        note_recovered(std::any::type_name::<T>());
+        l.clear_poison();
         poisoned.into_inner()
     })
 }
@@ -320,5 +338,105 @@ mod tests {
         assert!(m.is_poisoned());
         assert_eq!(*lock(&m), vec![1, 2]);
         assert!(!m.is_poisoned(), "отравление снято — запись о восстановлении одна");
+    }
+
+    #[test]
+    fn rwlock_survives_poisoning() {
+        let l = std::sync::Arc::new(RwLock::new(1));
+        let l2 = l.clone();
+        let _ = std::thread::spawn(move || {
+            let _g = l2.write().unwrap();
+            panic!("poison it");
+        })
+        .join();
+        assert!(l.is_poisoned());
+        assert_eq!(*read(&l), 1);
+        assert!(!l.is_poisoned(), "отравление снято чтением");
+        let _ = std::thread::spawn({
+            let l = l.clone();
+            move || {
+                let _g = l.write().unwrap();
+                panic!("poison it again");
+            }
+        })
+        .join();
+        *write(&l) = 2;
+        assert!(!l.is_poisoned(), "отравление снято записью");
+        assert_eq!(*read(&l), 2);
+    }
+
+    /// Правило блокировок: вне тестового кода замки берутся только через `lock`/`read`/`write` — иначе паника одного
+    /// потока отравляет замок и роняет каждого следующего. Иглы собраны из частей, чтобы тест не находил сам себя.
+    #[test]
+    fn locks_are_taken_only_through_the_recovering_helpers() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut files = Vec::new();
+        collect_rs(&root, &mut files);
+        assert!(files.len() > 10, "src/ not scanned: {}", root.display());
+        let banned = [
+            concat!(".lock()", ".unwrap()"),
+            concat!(".lock()", ".expect("),
+            concat!(".read()", ".unwrap()"),
+            concat!(".read()", ".expect("),
+            concat!(".write()", ".unwrap()"),
+            concat!(".write()", ".expect("),
+        ];
+        let mut bad = Vec::new();
+        for path in &files {
+            let rel = path.strip_prefix(&root).unwrap();
+            let text = std::fs::read_to_string(path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+            for (n, line) in production_lines(&text) {
+                for b in banned.iter().filter(|b| line.contains(*b)) {
+                    bad.push(format!("src/{}:{}: {b}", rel.display(), n + 1));
+                }
+            }
+        }
+        assert!(bad.is_empty(), "lock without crash::lock/read/write:\n{}", bad.join("\n"));
+    }
+
+    #[test]
+    fn test_code_is_skipped() {
+        let text = "fn a() {}\n#[cfg(test)]\nfn one_line() { x }\nfn b() {}\n#[cfg(test)]\n#[path = \"t.rs\"]\nmod t;\n\
+                    fn c() {}\n#[cfg(test)]\nmod tests {\n    fn t() {\n    }\n}\nfn d() {}\nimpl X {\n    #[cfg(test)]\n    \
+                    fn f() {\n        y\n    }\n    fn e() {}\n}\n";
+        let kept: Vec<&str> = production_lines(text).into_iter().map(|(_, l)| l.trim()).collect();
+        assert_eq!(kept, ["fn a() {}", "fn b() {}", "fn c() {}", "fn d() {}", "impl X {", "fn e() {}", "}"]);
+    }
+
+    /// Строки (номер с нуля, текст) вне элементов под `#[cfg(test)]`. Элемент — до строки `;` или со своими скобками,
+    /// иначе до закрывающей `}`, `]` или `)` на его отступе (так их ставит rustfmt).
+    fn production_lines(text: &str) -> Vec<(usize, &str)> {
+        let mut out = Vec::new();
+        let mut lines = text.lines().enumerate();
+        while let Some((n, line)) = lines.next() {
+            if line.trim() != "#[cfg(test)]" {
+                out.push((n, line));
+                continue;
+            }
+            let indent = &line[..line.len() - line.trim_start().len()];
+            let Some((_, item)) = lines.by_ref().find(|(_, l)| !l.trim_start().starts_with("#[")) else {
+                panic!("line {}: #[cfg(test)] without an item", n + 1)
+            };
+            let item = item.trim_end();
+            if item.ends_with(';') || (item.contains('{') && item.matches('{').count() == item.matches('}').count()) {
+                continue;
+            }
+            let closes = |l: &str| l.trim_end().trim_end_matches(';').strip_prefix(indent).is_some_and(|c| matches!(c, "}" | "]" | ")"));
+            if lines.by_ref().all(|(_, l)| !closes(l)) {
+                panic!("line {}: #[cfg(test)] item without a closing brace at its indent", n + 1);
+            }
+        }
+        out
+    }
+
+    fn collect_rs(dir: &Path, out: &mut Vec<PathBuf>) {
+        for entry in std::fs::read_dir(dir).unwrap_or_else(|e| panic!("{}: {e}", dir.display())) {
+            let path = entry.unwrap_or_else(|e| panic!("{}: {e}", dir.display())).path();
+            if path.is_dir() {
+                collect_rs(&path, out);
+            } else if path.extension().is_some_and(|e| e == "rs") {
+                out.push(path);
+            }
+        }
     }
 }

@@ -43,8 +43,8 @@ pub(super) struct Palette {
     /// Текст под указателем.
     pub(super) text_hover: Color32,
     pub(super) text_strong: Color32,
-    /// Слабый текст; `None` — как у egui: `label` на 60 % прозрачности (Графит).
-    pub(super) text_weak: Option<Color32>,
+    /// Слабый текст (подписи, даты, линии графика). Всегда свой цвет: производный egui (`label` на 60 %) давал ≈2.7.
+    pub(super) text_weak: Color32,
     pub(super) link: Color32,
     /// Цель перетаскивания, передача в подробностях.
     pub(super) accent: Color32,
@@ -72,8 +72,8 @@ const fn hex(rgb: u32) -> Color32 {
     Color32::from_rgb((rgb >> 16) as u8, (rgb >> 8) as u8, rgb as u8)
 }
 
-/// Тема по умолчанию — ровно прежний вид: `visuals()` совпадает с `Visuals::dark()` (тест `graphite_is_todays_look`).
-/// Поэтому тут значения egui как есть, даже те, что слабее целей контраста других тем (слабый текст).
+/// Тема по умолчанию — прежний вид egui: `visuals()` = `Visuals::dark()`, кроме слабого текста (тест `graphite_is_todays_look`).
+/// Остальные значения egui — как есть; все роли проходят цели контраста.
 pub(super) const GRAPHITE: Palette = Palette {
     dark: true,
     panel: hex(0x1B1B1B),
@@ -89,7 +89,8 @@ pub(super) const GRAPHITE: Palette = Palette {
     text: hex(0xB4B4B4),
     text_hover: hex(0xF0F0F0),
     text_strong: hex(0xFFFFFF),
-    text_weak: None,
+    // Владелец 2026-10-07: слабый текст ярче (у egui ≈2.7). Самый тёмный серый с AA на 1B1B1B: 4.54 (82 — 4.48); label 8C — 5.12.
+    text_weak: hex(0x838383),
     link: hex(0x5AAAFF),
     accent: hex(0x5AA0F0),
     selection_fill: hex(0x005C80),
@@ -122,7 +123,7 @@ pub(super) const SLATE: Palette = Palette {
     text: hex(0xD8DEE9),
     text_hover: hex(0xECEFF4),
     text_strong: hex(0xECEFF4),
-    text_weak: Some(hex(0x98A2B3)),
+    text_weak: hex(0x98A2B3),
     link: hex(0x88C0D0),
     accent: hex(0x88C0D0),
     selection_fill: hex(0x3B4A63),
@@ -155,7 +156,7 @@ pub(super) const DAYLIGHT: Palette = Palette {
     text: hex(0x1B1B1B),
     text_hover: hex(0x000000),
     text_strong: hex(0x000000),
-    text_weak: Some(hex(0x5C5C5C)),
+    text_weak: hex(0x5C5C5C),
     link: hex(0x005FB8),
     accent: hex(0x005FB8),
     selection_fill: hex(0xCCE4F7),
@@ -200,7 +201,7 @@ impl Palette {
         v.faint_bg_color = self.faint;
         v.code_bg_color = self.code_bg;
         v.hyperlink_color = self.link;
-        v.weak_text_color = self.text_weak;
+        v.weak_text_color = Some(self.text_weak);
         v.selection.bg_fill = self.selection_fill;
         v.selection.stroke.color = self.selection_text;
         v.text_cursor.stroke.color = self.selection_text;
@@ -347,16 +348,6 @@ mod tests {
         assert!(contrast(hex(0x787878), GRAPHITE.panel) < 4.5);
     }
 
-    /// Слабый текст, каким его видно на фоне `bg`: свой цвет темы или производный egui (`label` на 60 %), наложенный на фон.
-    fn weak_on(p: &Palette, bg: Color32) -> Color32 {
-        p.text_weak.unwrap_or_else(|| {
-            let c = p.label.gamma_multiply(egui::Visuals::dark().weak_text_alpha);
-            let keep = 1.0 - f32::from(c.a()) / 255.0;
-            let mix = |src: u8, under: u8| (f32::from(src) + f32::from(under) * keep).round() as u8;
-            Color32::from_rgb(mix(c.r(), bg.r()), mix(c.g(), bg.g()), mix(c.b(), bg.b()))
-        })
-    }
-
     /// Текст и цвета состояний читаемы (AA, 4.5) на всех фонах темы; рамка режима 2 и акцент — 3 (крупные элементы).
     /// Границы не проверяются: они намеренно тихие.
     #[test]
@@ -371,6 +362,7 @@ mod tests {
         for (name, p) in PALETTES {
             let text_roles = [
                 ("label", p.label, 4.5),
+                ("text_weak", p.text_weak, 4.5),
                 ("text", p.text, 4.5),
                 ("text_hover", p.text_hover, 4.5),
                 ("text_strong", p.text_strong, 4.5),
@@ -386,29 +378,35 @@ mod tests {
                 ("accent", p.accent, 3.0),
                 ("mode2_frame", p.mode2_frame, 3.0),
             ];
-            // Производный слабый текст egui есть только у Графита — владелец оставил его прежним (≈2.7); свой — AA.
-            let weak_min = if p.text_weak.is_some() { 4.5 } else { 2.5 };
             for (bg_name, bg) in [("panel", p.panel), ("window", p.window), ("graph_bg", p.graph_bg)] {
                 for (role, fg, min) in text_roles {
                     check(name, role, fg, bg_name, bg, min);
                 }
-                check(name, "text_weak", weak_on(p, bg), bg_name, bg, weak_min);
             }
             check(name, "text", p.text, "control", p.control, 4.5);
             check(name, "text_hover", p.text_hover, "control_hover", p.control_hover, 4.5);
             check(name, "selection_text", p.selection_text, "selection_fill", p.selection_fill, 4.5);
         }
+        // Слабый текст при всей своей читаемости остаётся второстепенным: тусклее обычного.
+        for (name, p) in PALETTES {
+            if contrast(p.text_weak, p.panel) >= contrast(p.label, p.panel) {
+                failures.push(format!("{name}: text_weak is not weaker than label"));
+            }
+        }
         assert!(failures.is_empty(), "{failures:#?}");
-        assert!(PALETTES.iter().all(|(name, p)| p.text_weak.is_some() || *name == "graphite"), "исключение — только Графит");
     }
 
-    /// Тема по умолчанию не меняет вида: режим 1 — ровно `Visuals::dark()`, режим 2 — то, что до тем ставил
+    /// Тема по умолчанию не меняет вида: режим 1 — `Visuals::dark()`, режим 2 — то, что до тем ставил
     /// `apply_mode_look` (core_ui.rs): поверх `dark()` неоновые рамка окна и разделители.
+    /// Единственное отличие от `dark()` — слабый текст 838383 вместо производного egui (≈2.7): решение владельца
+    /// 2026-10-07 «поярче». Любое другое расхождение с `dark()` этот тест ловит.
     #[test]
     fn graphite_is_todays_look() {
-        assert_eq!(GRAPHITE.visuals(false), egui::Visuals::dark());
+        let mut today = egui::Visuals::dark();
+        today.weak_text_color = Some(Color32::from_rgb(0x83, 0x83, 0x83));
+        assert_eq!(GRAPHITE.visuals(false), today);
         let neon = Color32::from_rgb(255, 214, 10);
-        let mut mode2 = egui::Visuals::dark();
+        let mut mode2 = today;
         mode2.widgets.noninteractive.bg_stroke.color = neon;
         mode2.window_stroke.color = neon;
         assert_eq!(GRAPHITE.visuals(true), mode2);
@@ -443,7 +441,7 @@ mod tests {
             let v = p.visuals(false);
             assert_eq!((v.panel_fill, v.window_fill, v.extreme_bg_color), (p.panel, p.window, p.graph_bg), "{name}");
             assert_eq!((v.faint_bg_color, v.code_bg_color, v.hyperlink_color), (p.faint, p.code_bg, p.link), "{name}");
-            assert_eq!((v.text_color(), v.weak_text_color, v.strong_text_color()), (p.label, p.text_weak, p.text_strong), "{name}");
+            assert_eq!((v.text_color(), v.weak_text_color, v.strong_text_color()), (p.label, Some(p.text_weak), p.text_strong), "{name}");
             let w = &v.widgets;
             assert_eq!((w.inactive.fg_stroke.color, w.hovered.fg_stroke.color), (p.text, p.text_hover), "{name}");
             assert_eq!((w.inactive.bg_fill, w.hovered.bg_fill), (p.control, p.control_hover), "{name}");

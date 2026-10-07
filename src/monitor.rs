@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex, MutexGuard, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::backend::TunnelHost;
-use crate::crash::lock;
+use crate::crash::{self, lock};
 use crate::daemon::agent::client::AgentApi;
 use crate::daemon::proto::{CoreState, RetryState};
 use crate::events::{self, Event, EventLog, Severity};
@@ -19,6 +19,7 @@ use crate::stats::Stats;
 use crate::settings::Mode;
 use crate::tray;
 use crate::uapi::Status;
+use crate::update::NativeUiMark;
 
 const PERIOD: Duration = Duration::from_secs(1);
 /// Пауза между попытками достучаться до ядра, пока связи нет: дёргать канал каждую секунду незачем.
@@ -265,16 +266,16 @@ impl Shared {
 
     /// Окно с ядром — зеркало: своих туннелей нет, всё приходит от ядра.
     pub fn mirrors_core(&self) -> bool {
-        self.host.read().unwrap().is_none()
+        crash::read(&self.host).is_none()
     }
 
     pub fn host(&self) -> Option<Arc<dyn TunnelHost>> {
-        self.host.read().unwrap().clone()
+        crash::read(&self.host).clone()
     }
 
     /// Ядро: хост нового режима.
     pub fn set_host(&self, host: Arc<dyn TunnelHost>) {
-        *self.host.write().unwrap() = Some(host);
+        *crash::write(&self.host) = Some(host);
     }
 
     /// Паника шага вторичного потока (`crash::nonfatal_loop`): в журнал — с паузой до следующего шага.
@@ -518,10 +519,17 @@ pub fn spawn(shared: Arc<Shared>, on_update: Box<dyn Fn() + Send>) {
     });
 }
 
-/// Окно: опрос агента раз в секунду, в своём потоке — зависший агент не задерживает состояние ядра.
-pub fn spawn_agent(shared: Arc<Shared>, agent: Arc<dyn AgentApi>, on_update: Box<dyn Fn() + Send>) {
+/// Окно: опрос агента раз в секунду, в своём потоке — зависший агент не задерживает состояние ядра. `on_native_ui`
+/// получает отметку последней работы с MSI AmneziaWG из каждого опроса (`mirror_agent`); по ней окно открывает снова
+/// окно AmneziaWG, закрытое MSI, — и тогда, когда скрыто в трее и кадры не рисуются.
+pub fn spawn_agent(
+    shared: Arc<Shared>,
+    agent: Arc<dyn AgentApi>,
+    on_update: Box<dyn Fn() + Send>,
+    mut on_native_ui: Box<dyn FnMut(Option<NativeUiMark>) + Send>,
+) {
     crate::crash::spawn_named("agent-monitor", move || loop {
-        mirror_agent(&shared, agent.as_ref());
+        on_native_ui(mirror_agent(&shared, agent.as_ref()));
         mirror_agent_events(&shared, agent.as_ref());
         on_update();
         std::thread::sleep(PERIOD);
@@ -532,15 +540,17 @@ pub fn spawn_agent(shared: Arc<Shared>, agent: Arc<dyn AgentApi>, on_update: Box
 /// статистики нет (пустые, а не прежние: устаревшие числа выглядели бы живыми), на месте пинга окно показывает
 /// «вторичная служба недоступна». Ни «нет связи с ядром», ни записи в журнал: туннели
 /// от агента не зависят, а его остановки пишет в журнал сторож ядра.
-fn mirror_agent(shared: &Shared, agent: &dyn AgentApi) {
-    let (ping, stats, down) = match agent.state() {
-        Ok(state) => (crate::ping::PingState::from_dto(state.ping), state.stats, false),
-        Err(_) => (PingState { host: lock(&shared.options).ping_host.clone(), ..Default::default() }, Stats::default(), true),
+/// Возвращает отметку последней работы с MSI AmneziaWG; `None` — агент не ответил или прежней версии.
+fn mirror_agent(shared: &Shared, agent: &dyn AgentApi) -> Option<NativeUiMark> {
+    let (ping, stats, native_ui, down) = match agent.state() {
+        Ok(state) => (crate::ping::PingState::from_dto(state.ping), state.stats, state.native_ui, false),
+        Err(_) => (PingState { host: lock(&shared.options).ping_host.clone(), ..Default::default() }, Stats::default(), None, true),
     };
     *lock(&shared.ping) = ping;
     *lock(&shared.stats) = stats;
     shared.agent_down.store(down, Ordering::SeqCst);
     lock(&shared.agent_seen).observe(down, unix_now());
+    native_ui
 }
 
 /// Уровни туннелей между опросами → события журнала.
@@ -952,7 +962,7 @@ mod tests {
         let mut office = crate::stats::TunnelStats::default();
         office.observe(4_096, 512, 1, None, 1);
         let stats: Stats = [("office".to_string(), office)].into();
-        let agent = FakeAgent(Box::new(move |_| Ok(AgentResponse::State(Box::new(AgentState { ping: ping.clone(), stats: stats.clone() })))));
+        let agent = FakeAgent(Box::new(move |_| Ok(AgentResponse::State(Box::new(AgentState { ping: ping.clone(), stats: stats.clone(), ..Default::default() })))));
         mirror_agent(&shared, &agent);
         let view = shared.frame_view();
         assert!(!view.agent_down);

@@ -8,6 +8,7 @@ use std::sync::{Arc, Mutex};
 
 use eframe::egui;
 
+use crate::crash::lock;
 use crate::groups::{self, Row, TunnelBook};
 use crate::i18n::tr;
 use crate::monitor::Snapshot;
@@ -41,7 +42,7 @@ pub(super) type DisconnectAsk = Arc<Mutex<Option<String>>>;
 
 /// Положить в общую раскладку настройки окна, если они изменились (зовётся каждый кадр — сравнение дешёвое).
 pub(super) fn publish(layout: &SharedLayout, s: &Settings) {
-    let mut l = layout.lock().unwrap();
+    let mut l = lock(&layout);
     if l.groups != s.view.groups || l.multiple != s.multiple || l.book != s.book || l.hidden != s.hidden_dialogs {
         *l = Layout::of(s);
     }
@@ -59,7 +60,7 @@ pub(super) struct TrayHooks {
 
 impl Hooks for TrayHooks {
     fn entries(&self) -> Vec<Entry> {
-        let layout = self.layout.lock().unwrap().clone();
+        let layout = lock(&self.layout).clone();
         let shared = &self.switcher.shared;
         entries(&layout, &shared.snapshot_clone(), &|name| shared.pending_label(name))
     }
@@ -71,12 +72,12 @@ impl Hooks for TrayHooks {
         // Туннель уже переключается — как у окна: второе нажатие ничего не делает (пункт был серым).
         let Some(plan) = primary.plan() else { return };
         let (multiple, ask) = {
-            let layout = self.layout.lock().unwrap();
+            let layout = lock(&self.layout);
             (layout.multiple, asks_first(plan, &layout.hidden))
         };
         if ask {
             // Диалог рисует окно; скрытое окно кадров не рисует — его сначала показываем, как при выходе.
-            *self.disconnect_ask.lock().unwrap() = Some(tunnel.to_string());
+            *lock(&self.disconnect_ask) = Some(tunnel.to_string());
             tray::show_window();
             self.switcher.ctx.request_repaint();
             return;

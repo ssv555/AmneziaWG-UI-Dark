@@ -68,6 +68,14 @@ impl ErrorSink {
     pub(super) fn take_fresh(&self) -> bool {
         self.fresh.swap(false, Ordering::AcqRel)
     }
+
+    /// Ссылка «Ошибка — открыть журнал событий» после кадра. `unseen` — была ли она, `log_shown` — журнал на экране.
+    /// Ссылка держится, пока журнал не откроют: ошибка, пришедшая в скрытое окно (кадров нет или их никто не видит),
+    /// видна при первом показе окна.
+    pub(super) fn unseen_after(&self, unseen: bool, log_shown: bool) -> bool {
+        let fresh = self.take_fresh();
+        !log_shown && (unseen || fresh)
+    }
 }
 
 #[cfg(test)]
@@ -134,6 +142,23 @@ mod tests {
         assert_eq!(log.iter().filter(|t| t.as_str() == "a" || t.as_str() == "b" || t.as_str() == "c").count(), 3);
         assert_eq!(log.len(), 4, "три ошибки и одно сообщение, что файл недоступен: {log:?}");
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn error_pushed_while_hidden_is_flagged_until_the_log_is_opened() {
+        let s = sink();
+        // Окно скрыто: кадров нет, ошибки копятся только в журнале и во флаге.
+        s.push("first");
+        s.push("second");
+        // Первый кадр после показа — ссылка на журнал появляется и держится в следующих кадрах.
+        assert!(s.unseen_after(false, false));
+        assert!(s.unseen_after(true, false));
+        // Журнал открыт — ссылка снята; новая ошибка при открытом журнале её не поднимает (ошибка и так на экране).
+        assert!(!s.unseen_after(true, true));
+        s.push("third");
+        assert!(!s.unseen_after(false, true));
+        assert!(!s.unseen_after(false, false), "ошибку уже видели в открытом журнале");
+        assert_eq!(texts(&s), ["first", "second", "third"]);
     }
 
     #[test]

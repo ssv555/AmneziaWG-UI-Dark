@@ -4,6 +4,7 @@ use std::sync::Mutex;
 
 use super::proto::{Request, Response};
 use super::CoreApi;
+use crate::crash::lock;
 
 type Reply = dyn Fn(&Request) -> Result<Response, String> + Send + Sync;
 
@@ -25,13 +26,13 @@ impl FakeCore {
     }
 
     pub fn requests(&self) -> Vec<String> {
-        self.seen.lock().unwrap().clone()
+        lock(&self.seen).clone()
     }
 }
 
 impl CoreApi for FakeCore {
     fn call(&self, req: Request) -> Result<Response, String> {
-        self.seen.lock().unwrap().push(format!("{req:?}"));
+        lock(&self.seen).push(format!("{req:?}"));
         (self.reply)(&req)
     }
 }

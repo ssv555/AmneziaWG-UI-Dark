@@ -50,7 +50,7 @@ The window picks the pipe per request (`Routed`, `src/daemon/agent/client.rs`): 
 | Owner | Owns |
 |---|---|
 | Core | Tunnel start and stop in both modes (`src/backend.rs`, `src/engine.rs`); tunnel state via UAPI (`src/uapi.rs`); the switching lock and replacement of conflicting tunnels; the working mode; the desired set of tunnels (`core.ini`: `mode`, `tunnels`, `multiple`, `owner_sid`, `language`); the reconnect supervisor (`src/daemon/retry.rs`, `deadwatch.rs`, `restore.rs`, `netwatch.rs`); the one-second poll that builds the state and the transition events (`src/monitor.rs`); an in-memory event ring; the agent watchdog (`src/daemon/agent_watch.rs`); service install, upgrade and removal (`src/daemon/install.rs`) |
-| Agent | Updates and rollbacks of the original AmneziaWG, the built-in engine and the app (`src/update/`, started from `src/daemon/agent/updates.rs`); ping (`agent.ini`); statistics (`Stats.ini`); the event log on disk (`events.log`: the only writer, rotation included); tunnel configs: the mode 2 store (`src/store.rs`: import, backup, new tunnel) and the helper for the original window in mode 1 (`src/native.rs`, `src/daemon/session.rs`) |
+| Agent | Updates and rollbacks of the original AmneziaWG, the built-in engine and the app (`src/update/`, started from `src/daemon/agent/updates.rs`); the language of its texts (the core's `language` from `core.ini`, read only, `src/daemon/agent/language.rs`); ping (`agent.ini`); statistics (`Stats.ini`); the event log on disk (`events.log`: the only writer, rotation included); tunnel configs: the mode 2 store (`src/store.rs`: import, backup, new tunnel) and the helper for the original window in mode 1 (`src/native.rs`, `src/daemon/session.rs`) |
 | Window | Presentation, `Settings.ini` next to the exe, groups and view state. It holds no VPN state: it renders what the two processes report |
 
 Data lives in `%ProgramData%\AmneziaWG UI Dark` (SYSTEM and administrators only) and, for the mode 2 store and engine files, in `%ProgramFiles%\AmneziaWG UI Dark`.
@@ -80,7 +80,7 @@ The core owns the mode (`mode` in `core.ini`). It is switched at runtime without
 | | Mode 1: installed AmneziaWG | Mode 2: built-in engine |
 |---|---|---|
 | Tunnel | service `AmneziaWGTunnel$<name>`, created by the original `amneziawg.exe /installtunnelservice` and removed by `/uninstalltunnelservice` | service named after the tunnel, running `awg-ui.exe --tunnel-service <config>`, which loads `tunnel.dll` and `wintun.dll` |
-| Config storage | the original's own encrypted store; this program never decrypts it and edits configs only through the original window (helper in the user's session, UI Automation) | `%ProgramFiles%\AmneziaWG UI Dark\tunnels\<name>.conf.dpapi`, DPAPI machine scope, folder open to SYSTEM and administrators only |
+| Config storage | the original's own encrypted store; this program never decrypts it and edits configs only through the original window (helper in the user's session, started outside the core's job with `CREATE_BREAKAWAY_FROM_JOB` - a job cannot hold processes of two sessions; UI Automation) | `%ProgramFiles%\AmneziaWG UI Dark\tunnels\<name>.conf.dpapi`, DPAPI machine scope, folder open to SYSTEM and administrators only |
 | Core prepares | ensures the service `AmneziaWGManager` is running | initializes the store; clears the services' own restart-on-failure actions (the supervisor is the only reconnector) |
 | Config requests | agent: `Native`, `Read`, `Write`, `Details`, `Delete` | agent: `Import`, `ExportAll`, `NewTunnel`, `TakeNative`, `Read`, `Write`, `Details`; the core deletes and renames (they touch the service) |
 | Engine files | not used | copied to `%ProgramFiles%` and checked against SHA-256 values pinned at build time or in the signed manifest (`src/engine.rs`) |
@@ -105,6 +105,8 @@ The mode 2 cue colour depends on the theme (`mode2_frame` in `src/app/theme.rs`)
 | Panic while handling one request | untouched | that request gets an error reply | none needed |
 | Panic in a secondary core thread (agent watchdog) | untouched | logged | the step repeats after a pause |
 | Window closes or crashes | untouched | none | start the window again; exit asks whether to keep the VPN running |
+
+A panic while a thread holds a lock does not make the lock unusable for the other threads: shared state is locked through `crash::lock`, `crash::read` and `crash::write` (`src/crash.rs`), which log one "lock recovered" event to the core log and clear the poison. A test in `src/crash.rs` forbids `.lock().unwrap()` and its `RwLock` variants outside test code.
 
 Not covered: the code has no watchdog for a core that hangs without exiting. The window only shows that the core does not answer.
 

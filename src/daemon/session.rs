@@ -12,9 +12,15 @@ use windows_sys::Win32::Security::{GetTokenInformation, TokenLinkedToken, TOKEN_
 use windows_sys::Win32::System::Environment::{CreateEnvironmentBlock, DestroyEnvironmentBlock};
 use windows_sys::Win32::System::RemoteDesktop::WTSQueryUserToken;
 use windows_sys::Win32::System::Threading::{
-    CreateProcessAsUserW, GetExitCodeProcess, TerminateProcess, WaitForSingleObject, CREATE_UNICODE_ENVIRONMENT,
-    PROCESS_INFORMATION, STARTUPINFOW,
+    CreateProcessAsUserW, GetExitCodeProcess, TerminateProcess, WaitForSingleObject, CREATE_BREAKAWAY_FROM_JOB,
+    CREATE_UNICODE_ENVIRONMENT, PROCESS_INFORMATION, STARTUPINFOW,
 };
+
+/// Флаги запуска помощника. Агент работает в объекте задания ядра (`agent_watch`), а задание не может держать
+/// процессы разных сеансов: без выхода из задания `CreateProcessAsUser` в сеанс пользователя падает с «Access is
+/// denied» (так было с 0.5.0 по 0.5.2: действия в окне AmneziaWG из агента не работали). Задание создано с
+/// `JOB_OBJECT_LIMIT_BREAKAWAY_OK`; процессу вне задания (ядру) флаг ничего не меняет.
+const LAUNCH_FLAGS: u32 = CREATE_UNICODE_ENVIRONMENT | CREATE_BREAKAWAY_FROM_JOB;
 
 /// Запустить `exe args` в сеансе `session` с повышенным токеном вошедшего пользователя и дождаться выхода.
 /// Только если в сеансе вошёл тот же пользователь, что прислал запрос (`caller_sid`): иначе чужой запрос
@@ -57,7 +63,7 @@ pub fn run_elevated(session: u32, caller_sid: &str, exe: &Path, args: &str, time
             null(),
             null(),
             0,
-            CREATE_UNICODE_ENVIRONMENT,
+            LAUNCH_FLAGS,
             if have_env { env } else { null() },
             null(),
             &si,
@@ -83,5 +89,18 @@ pub fn run_elevated(session: u32, caller_sid: &str, exe: &Path, args: &str, time
         };
         CloseHandle(pi.hProcess);
         result
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Помощник из агента запускается в чужом сеансе, а агент сидит в объекте задания ядра: без выхода из задания
+    /// запуск падает с «Access is denied» (0.5.0–0.5.2). Живой запуск в сеанс пользователя в тестах невозможен.
+    #[test]
+    fn helper_leaves_the_agent_job() {
+        assert_ne!(LAUNCH_FLAGS & CREATE_BREAKAWAY_FROM_JOB, 0);
+        assert_ne!(LAUNCH_FLAGS & CREATE_UNICODE_ENVIRONMENT, 0);
     }
 }

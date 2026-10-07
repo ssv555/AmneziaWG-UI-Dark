@@ -100,6 +100,8 @@ impl Tunnels {
             TunnelRequest::ExportAll => reply(need_engine().and_then(|()| store::export_all()), AgentResponse::Entries),
             TunnelRequest::NewTunnel(name) => reply(need_engine().and_then(|()| store::new_tunnel(&name)), AgentResponse::Text),
             TunnelRequest::TakeNative => reply(self.take_native(caller), AgentResponse::Report),
+            // Возврат окна, закрытого MSI, — в любом режиме: пользователь держал его открытым и в режиме 2.
+            TunnelRequest::Native(op @ NativeOp::Reopen) => self.helper_reply(caller, native_op(op)),
             TunnelRequest::Native(_) if engine => AgentResponse::Err(tr("core.only_overlay")),
             TunnelRequest::Native(op) => self.helper_reply(caller, native_op(op)),
         }
@@ -203,7 +205,7 @@ fn done(result: Result<(), String>) -> AgentResponse {
 
 fn native_op(op: NativeOp) -> Op {
     match op {
-        NativeOp::Open => Op::Open,
+        NativeOp::Open | NativeOp::Reopen => Op::Open,
         NativeOp::Edit(t) => Op::Edit(t),
         NativeOp::Import(f) => Op::Import(f),
         NativeOp::Close => Op::Close,
@@ -427,6 +429,16 @@ mod tests {
         assert_eq!(engine.tunnels.handle(TunnelRequest::Native(NativeOp::Close), &user()), AgentResponse::Err(tr("core.only_overlay")));
         assert_eq!(engine.tunnels.handle(TunnelRequest::Delete("a".into()), &user()), AgentResponse::Refused(tr("agent.delete_in_core")));
         assert!(overlay.ops().is_empty() && engine.ops().is_empty());
+    }
+
+    /// Окно AmneziaWG, закрытое MSI, возвращается и в режиме 2 — тем же запуском, что «Окно AmneziaWG».
+    #[test]
+    fn reopen_after_an_update_works_in_both_modes() {
+        for mode in [Mode::Engine, Mode::Overlay] {
+            let r = rig(FakeCore::in_mode(mode), |_| Out::Ok);
+            assert_eq!(r.tunnels.handle(TunnelRequest::Native(NativeOp::Reopen), &user()), AgentResponse::Ok, "{mode:?}");
+            assert_eq!(r.ops(), ["3 S-1-5-21-1-2-3-1001 Open"], "{mode:?}");
+        }
     }
 
     #[test]

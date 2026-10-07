@@ -43,6 +43,9 @@ When all are updated together, the order is Native, Engine, App (`ORDER`): the a
       replacement returned an error). A record left by a dead agent or a core that did not answer is re-sent on the next scheduler tick (every 30 s,
       not while a job runs); a failed retry is logged once until it succeeds.
    A failed component does not stop the others.
+   The same request without the window, for a scripted check of a live update: `awg-ui.exe --core-updates apply native|engine|app <version>`
+   (`parse_cli` in `src/update/mod.rs`). It goes to the agent like the window's Update button, with the same checks; the command waits up to
+   10 minutes while the job runs (2 minutes for `check`) and prints the state and the last history rows.
 4. `Restore(row)` - see [Rollback](#rollback).
 
 ## Verification
@@ -106,6 +109,19 @@ Nothing is installed before every check below passes.
 4. While an MSI runs, the core takes the mode 1 tunnels off supervision (`HoldNative`, a lease of 15 minutes; the core picks the running and desired
    tunnels itself) and gives them back afterwards (`Release`) whatever the outcome; if the core is unreachable or the lease cannot be taken, the MSI does
    not start.
+5. The MSI closes the AmneziaWG window (the `amneziawg.exe` process in the user's session) at its very start, and AmneziaWG does not open it
+   again. The core and the agent run as SYSTEM in session 0 and start no windows, so **the window of this program** reopens it
+   (`src/app/native_reopen.rs`):
+   1. The agent, the side that runs the MSI, looks right before it (before the install, or before the uninstall of a restore) whether an
+      `amneziawg.exe` process runs in any non-zero session (`update::native::ui_open`, process list with session ids only; session 0 holds its
+      services). A whole MSI takes 1-3 s, so a window polling once a second could see neither the job nor the open AmneziaWG window.
+   2. When the job ends (success or failure), the agent stores `NativeUiMark { seq, was_open }` in `state.json`: `seq` grows by one per job that ran
+      an MSI. The agent's `State` carries it as `native_ui`; the window reads it once a second, also while hidden in the tray.
+   3. The window decides once per new `seq`, even if it never saw the job running: `was_open`, the AmneziaWG process is not back in its session and
+      AmneziaWG is installed - it asks the agent `NativeOp::Reopen`, the same start as the **AmneziaWG window** menu item but allowed in either mode
+      (what the user had open comes back, in mode 2 too). A failure goes to the event log.
+   4. Not opened: the AmneziaWG window was closed before the MSI; the first `seq` the window sees after its own start (a past job); the window of
+      this program is not running at all. A mark stored by an agent that an app update restarted right after the job is still seen by the window.
 
 ## Installing the engine and the app
 

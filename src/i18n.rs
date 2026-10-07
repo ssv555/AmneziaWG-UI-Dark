@@ -365,6 +365,9 @@ const STRINGS: &[(&str, &str, &str)] = &[
     ("gr.peak", "peak {0}", "пик {0}"),
     ("gr.bucket", "maximum over {0}", "максимум за {0}"),
     ("gr.ping_legend", "ping, max {0}; red — no reply", "пинг, макс {0}; красное — нет ответа"),
+    ("gr.pause", "Pause graph", "Пауза графика"),
+    ("gr.resume", "Resume graph", "Продолжить"),
+    ("gr.paused", "Paused", "Пауза"),
     ("a11y.connected", "connected", "подключён"),
     ("a11y.disconnected", "disconnected", "отключён"),
     ("a11y.connecting", "connecting", "подключается"),
@@ -526,6 +529,7 @@ const STRINGS: &[(&str, &str, &str)] = &[
     ("upd.restore_title", "Roll back", "Возврат версии"),
     ("upd.warn_uac", "Windows will ask for administrator rights", "Windows запросит права администратора"),
     ("upd.restore_cancelled", "Rollback cancelled: administrator rights were not granted", "Возврат отменён: права администратора не предоставлены"),
+    ("upd.native_reopen_failed", "The AmneziaWG window closed by the AmneziaWG update was not opened again: {0}", "Окно AmneziaWG, закрытое обновлением AmneziaWG, не открылось снова: {0}"),
     ("upd.restore_failed", "Rollback helper exited with code {0}", "Помощник возврата завершился с кодом {0}"),
     ("upd.restore_text","Roll back {0} to version {1}? The current version will be saved to a backup — you will be able to return to it as well.", "Вернуть {0} к версии {1}? Текущая версия будет сохранена в резервную копию — к ней тоже можно будет вернуться."),
     // Обновление и возврат наших компонентов (движок режима 2, сборка программы).
@@ -686,15 +690,15 @@ pub fn set(dir: &Path, code: &str) {
     } else {
         Lang::builtin(DEFAULT)
     };
-    *CURRENT.write().unwrap() = Some(Arc::new(lang));
+    *crate::crash::write(&CURRENT) = Some(Arc::new(lang));
 }
 
 pub fn current_code() -> String {
-    CURRENT.read().unwrap().as_ref().map(|l| l.code.clone()).unwrap_or_else(|| DEFAULT.to_string())
+    crate::crash::read(&CURRENT).as_ref().map(|l| l.code.clone()).unwrap_or_else(|| DEFAULT.to_string())
 }
 
 pub fn tr(key: &str) -> String {
-    match CURRENT.read().unwrap().as_ref() {
+    match crate::crash::read(&CURRENT).as_ref() {
         Some(lang) => lang.get(key),
         None => Lang::builtin(DEFAULT).get(key),
     }

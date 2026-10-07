@@ -15,8 +15,10 @@ pub(super) enum Painted<'a> {
     Tunnel { name: &'a str, state: Primary, group: Option<&'a str>, selected: bool },
     /// Заголовок группы: развёрнута ли, сколько туннелей поддерева включено.
     Group { name: &'a str, expanded: bool, active: usize, total: usize, selected: bool },
-    /// График скорости: текущие приём и передача, пик за показанный период (уже отформатированы).
-    Graph { rx: &'a str, tx: &'a str, peak: &'a str },
+    /// График скорости: текущие приём и передача, пик за показанный период (уже отформатированы); `paused` — на паузе.
+    Graph { rx: &'a str, tx: &'a str, peak: &'a str, paused: bool },
+    /// Кнопка паузы графика (нарисована значком): подпись — что она сделает, `paused` — нажата.
+    GraphPause { paused: bool },
     /// Полоса пинга: узел и последний результат.
     Ping { host: &'a str, last: &'a str },
     /// Цветная точка состояния: её смысл словами (цвет диктор не передаёт).
@@ -46,7 +48,15 @@ impl Painted<'_> {
                 text
             }
             Painted::Group { name, active, total, .. } => trf("a11y.group", &[name, &active.to_string(), &total.to_string()]),
-            Painted::Graph { rx, tx, peak } => trf("a11y.graph", &[rx, tx, peak]),
+            Painted::Graph { rx, tx, peak, paused } => {
+                let text = trf("a11y.graph", &[rx, tx, peak]);
+                if *paused {
+                    format!("{text}, {}", tr("gr.paused"))
+                } else {
+                    text
+                }
+            }
+            Painted::GraphPause { paused } => tr(if *paused { "gr.resume" } else { "gr.pause" }),
             Painted::Ping { host, last } => trf("a11y.ping", &[host, last]),
             Painted::Dot { meaning } => meaning.to_string(),
         }
@@ -57,6 +67,8 @@ impl Painted<'_> {
             // Как у selectable_label egui: выделение — состояние «нажата», диктор читает его сам.
             Painted::Tunnel { selected, .. } => WidgetInfo::selected(WidgetType::SelectableLabel, true, *selected, self.label()),
             Painted::Group { selected, .. } => WidgetInfo::selected(WidgetType::CollapsingHeader, true, *selected, self.label()),
+            // Как у кнопки-переключателя egui: пауза — состояние «нажата».
+            Painted::GraphPause { paused } => WidgetInfo::selected(WidgetType::Button, true, *paused, self.label()),
             Painted::Graph { .. } | Painted::Ping { .. } | Painted::Dot { .. } => WidgetInfo::labeled(WidgetType::Image, true, self.label()),
         }
     }
@@ -136,9 +148,22 @@ mod tests {
 
     #[test]
     fn graph_summary_names_the_numbers() {
-        let label = Painted::Graph { rx: "1 KB/s", tx: "2 KB/s", peak: "3 KB/s" }.label();
+        let label = Painted::Graph { rx: "1 KB/s", tx: "2 KB/s", peak: "3 KB/s", paused: false }.label();
         for part in ["1 KB/s", "2 KB/s", "3 KB/s"] {
             assert!(label.contains(part), "{label}");
         }
+        assert!(!label.contains(&tr("gr.paused")), "{label}");
+        let paused = Painted::Graph { rx: "1 KB/s", tx: "2 KB/s", peak: "3 KB/s", paused: true }.label();
+        assert!(paused.ends_with(&tr("gr.paused")), "{paused}");
+    }
+
+    #[test]
+    fn pause_button_says_what_it_will_do_and_is_pressed_while_paused() {
+        let live = node_of(|| Painted::GraphPause { paused: false });
+        assert_eq!(live.label().as_deref(), Some(tr("gr.pause").as_str()));
+        assert_ne!(live.toggled(), Some(accesskit::Toggled::True));
+        let paused = node_of(|| Painted::GraphPause { paused: true });
+        assert_eq!(paused.label().as_deref(), Some(tr("gr.resume").as_str()));
+        assert_eq!(paused.toggled(), Some(accesskit::Toggled::True));
     }
 }

@@ -19,7 +19,7 @@ use super::clock::{check_due, Clock, SystemClock, TICK};
 use super::component::{ComponentOps, Components, Journal, RestoreJob};
 use super::core_link::CoreLink;
 use super::sources::{GithubSources, OursError, Sources};
-use super::{Action, Component, HistoryEntry, UpdateOp, UpdatesState, ORDER};
+use super::{Action, Component, HistoryEntry, NativeUiMark, UpdateOp, UpdatesState, ORDER};
 use super::jsonstore::{load_json, load_or_default, rotate_logs, safe_name, save_json};
 use super::backup::{BackupInfo, BACKUP_INFO};
 use super::busy::Busy;
@@ -65,6 +65,10 @@ struct Saved {
     /// Даты выхода версий, замеченные проверками (найденные и установленные сейчас); в `state.json` прежних версий поля нет.
     #[serde(default)]
     released: Vec<ReleaseDate>,
+    /// Последняя законченная работа с MSI родного AmneziaWG (окно открывает снова закрытое им окно AmneziaWG); в
+    /// `state.json` прежних версий поля нет.
+    #[serde(default)]
+    native_ui: NativeUiMark,
 }
 
 struct Data {
@@ -90,6 +94,9 @@ pub struct Manager {
     clock: Arc<dyn Clock>,
     /// Идущая работа; `Some` — занято. Текст для окна собирается при чтении (`state`).
     busy: Mutex<Option<Busy>>,
+    /// Идущая работа запускала MSI родного AmneziaWG и было ли перед ним открыто его окно (`note_native_ui`); в конце
+    /// работы становится `Saved::native_ui`.
+    native_ui_in_job: Mutex<Option<bool>>,
     data: Mutex<Data>,
     /// Отметка `OWED`; держится на время самого шага, чтобы такт планировщика и работа не слали его вразнобой.
     owed: Mutex<Owed>,
@@ -107,6 +114,7 @@ struct JobDone<'a>(&'a Manager);
 impl Drop for JobDone<'_> {
     fn drop(&mut self) {
         self.0.clean_downloads();
+        self.0.finish_native_ui();
         *lock(&self.0.busy) = None;
     }
 }
@@ -141,7 +149,7 @@ impl Manager {
         let data = Data { saved: load_or_default(&dir.join(STATE), &shared), history };
         // Отметка пишется атомарно; испорченная — чужая правка: событие в журнале и пусто (`load_or_default`).
         let owed = Mutex::new(Owed { components: load_or_default(&dir.join(OWED), &shared), failure_logged: false });
-        let m = Manager { shared, components, dir, sources, clock, busy: Mutex::new(None), data: Mutex::new(data), owed };
+        let m = Manager { shared, components, dir, sources, clock, busy: Mutex::new(None), native_ui_in_job: Mutex::new(None), data: Mutex::new(data), owed };
         for sub in [BACKUPS, DOWNLOADS, LOGS] {
             if let Err(e) = std::fs::create_dir_all(m.dir.join(sub)) {
                 m.shared.log("", Severity::Bad, &crate::fsutil::io_ctx(m.dir.join(sub), e));
@@ -323,6 +331,26 @@ impl Manager {
         if let Err(panic) = crate::crash::isolate(work) {
             self.shared.log("", Severity::Bad, &trf("updm.failed", &[&panic]));
         }
+    }
+
+    /// Перед MSI родного AmneziaWG: работает ли его окно в сеансе пользователя (`open`). За работу MSI может идти
+    /// не один раз (возврат и установка обратно) — окно было открыто, если хоть раз было.
+    pub(super) fn note_native_ui(&self, open: bool) {
+        let mut seen = lock(&self.native_ui_in_job);
+        *seen = Some(seen.unwrap_or(false) || open);
+    }
+
+    /// Отметка последней законченной работы с MSI для `State` агента.
+    pub fn native_ui(&self) -> NativeUiMark {
+        lock(&self.data).saved.native_ui
+    }
+
+    /// Конец работы: был MSI — новый номер и было ли окно AmneziaWG открыто, в `state.json`.
+    fn finish_native_ui(&self) {
+        let Some(was_open) = lock(&self.native_ui_in_job).take() else { return };
+        let mut data = lock(&self.data);
+        data.saved.native_ui = NativeUiMark { seq: data.saved.native_ui.seq + 1, was_open };
+        self.save(STATE, &data.saved);
     }
 
     pub(super) fn set_busy(&self, work: Busy) {
@@ -1379,6 +1407,31 @@ mod tests {
         assert_eq!(m.handle(UpdateOp::Apply(vec![(Component::App, "0.0.0".into())])).err(), Some(tr("updm.busy")));
         drop(JobDone(&m));
         assert!(lock(&m.busy).is_none(), "конец работы снимает занятость");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Отметка окна AmneziaWG: снимок перед MSI, новый номер в конце работы, переживает перезапуск агента.
+    #[test]
+    fn native_ui_mark_is_taken_before_the_msi_and_survives_a_restart() {
+        let dir = temp("native-ui");
+        let m = manager(&dir);
+        assert_eq!(m.native_ui(), NativeUiMark::default());
+        assert!(m.begin(Busy::Checking));
+        drop(JobDone(&m));
+        assert_eq!(m.native_ui(), NativeUiMark::default(), "работа без MSI отметку не трогает");
+        // Окно было открыто перед MSI; второй снимок (установка обратно после неудачи) его уже не видит — MSI закрыл.
+        assert!(m.begin(Busy::Restore { what: Component::Native, version: "2.0.1".into() }));
+        m.note_native_ui(true);
+        m.note_native_ui(false);
+        assert_eq!(m.native_ui(), NativeUiMark::default(), "пока работа идёт, отметка прежняя");
+        drop(JobDone(&m));
+        assert_eq!(m.native_ui(), NativeUiMark { seq: 1, was_open: true });
+        assert!(m.begin(Busy::Install { what: Component::Native, version: "3.1.0".into() }));
+        m.note_native_ui(false);
+        drop(JobDone(&m));
+        assert_eq!(m.native_ui(), NativeUiMark { seq: 2, was_open: false }, "окно было закрыто — открывать нечего");
+        drop(m);
+        assert_eq!(manager(&dir).native_ui(), NativeUiMark { seq: 2, was_open: false }, "из state.json");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

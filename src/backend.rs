@@ -8,6 +8,7 @@ use std::process::Command;
 use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use crate::crash::lock;
 use crate::uapi::{self, Peer, Status};
 
 const CONFIG_EXT: &str = ".conf.dpapi";
@@ -138,7 +139,7 @@ impl TunnelHost for Demo {
     }
 
     fn running(&self) -> io::Result<Vec<String>> {
-        Ok(self.running.lock().unwrap().iter().cloned().collect())
+        Ok(lock(&self.running).iter().cloned().collect())
     }
 
     fn query(&self, tunnel: &str) -> io::Result<Status> {
@@ -146,12 +147,12 @@ impl TunnelHost for Demo {
     }
 
     fn connect(&self, tunnel: &str) -> Result<(), String> {
-        self.running.lock().unwrap().insert(tunnel.to_string());
+        lock(&self.running).insert(tunnel.to_string());
         Ok(())
     }
 
     fn disconnect(&self, tunnel: &str) -> Result<(), String> {
-        self.running.lock().unwrap().remove(tunnel);
+        lock(&self.running).remove(tunnel);
         Ok(())
     }
 
@@ -270,6 +271,24 @@ fn running_pipes() -> io::Result<Vec<String>> {
 
 #[cfg(test)]
 mod tests {
+    /// Паника потока с замком демо-туннелей не роняет следующих: список восстанавливается, команды идут дальше.
+    #[test]
+    fn demo_survives_a_poisoned_lock() {
+        use super::TunnelHost;
+        let demo = std::sync::Arc::new(super::Demo::new());
+        let d = demo.clone();
+        let _ = std::thread::spawn(move || {
+            let _g = d.running.lock().unwrap();
+            panic!("poison it");
+        })
+        .join();
+        assert!(demo.running.is_poisoned());
+        assert_eq!(demo.running().unwrap(), ["home.nl-ams.full"]);
+        demo.connect("lab.sg.v4").unwrap();
+        assert_eq!(demo.running().unwrap(), ["home.nl-ams.full", "lab.sg.v4"]);
+        assert!(!demo.running.is_poisoned());
+    }
+
     #[test]
     fn hung_process_is_killed_at_the_deadline() {
         let started = std::time::Instant::now();

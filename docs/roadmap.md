@@ -25,12 +25,19 @@ Full per-version lists are in the [changelog](../CHANGELOG.md). Only the headlin
    Ctrl+N, Ctrl+I, F1, F5); screen reader support (accessibility tree, painted rows, graph and status dots are named).
 7. **0.5.2** (2026.10.06): three themes - Graphite, Slate and Daylight - plus Follow Windows, switched live
    in the Settings window.
+8. **0.5.3** (2026.10.07): pause button and speed scale on the graph; actions in the AmneziaWG window work again
+   and its window reopens after an AmneziaWG update; dialogs fit the main window, aligned tables in the Updates
+   window; a background thread failure no longer breaks the window; a lone Alt opens the menu; brighter faint text in
+   Graphite; the helper process follows the program language.
 
 ## Next
 
-1. **Accessibility**: check the screen reader support with Narrator and NVDA and fix what they find.
+1. **0.5.4**: graph range as a drop-down - 2 min, 10 min, 1 h, day, month, year - remembered between starts;
+   speed history kept by the helper process.
 
 ## Later, not scheduled
+
+Deferred to testers: check the screen reader support with Narrator and NVDA and fix what they find.
 
 Also listed in the [README](../README.md): code-signed builds, an extended built-in engine, more translations.
 Ideas and requests: open an [issue](https://github.com/ssv555/AmneziaWG-UI-Dark/issues).

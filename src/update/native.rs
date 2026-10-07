@@ -28,6 +28,12 @@ fn from_wide(buf: &[u16]) -> String {
     String::from_utf16_lossy(&buf[..len])
 }
 
+/// Окно AmneziaWG — процесс `amneziawg.exe` в сеансе пользователя (не 0: там его службы менеджера и туннелей).
+/// Только перебор процессов: агент от SYSTEM окон не трогает и не запускает.
+pub fn ui_open() -> bool {
+    crate::win::user_session_process_running("amneziawg.exe")
+}
+
 /// Установленный AmneziaWG: код продукта по UpgradeCode и его версия; `None` — не установлен.
 #[cfg_attr(not(test), allow(dead_code))]
 pub fn installed() -> Option<Installed> {

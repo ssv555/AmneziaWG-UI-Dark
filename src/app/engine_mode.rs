@@ -15,6 +15,7 @@ use super::theme::palette;
 use super::{dialog_buttons, App, Editor};
 use crate::archive::{self, ReadError};
 use crate::conf::TunnelInfo;
+use crate::crash::lock;
 use crate::daemon::proto::Request;
 use crate::events::Severity;
 use crate::i18n::{tr, trf};
@@ -42,11 +43,11 @@ fn fetch_store_info(
     let result = fetch(tunnel);
     match &result {
         Ok(info) => {
-            infos.lock().unwrap().insert(tunnel.to_string(), (info.clone(), tr("det.from_store")));
+            lock(&infos).insert(tunnel.to_string(), (info.clone(), tr("det.from_store")));
         }
         Err(_) => std::thread::sleep(retry),
     }
-    loading.lock().unwrap().remove(tunnel);
+    lock(&loading).remove(tunnel);
     result.map(|_| ())
 }
 
@@ -145,10 +146,10 @@ impl App {
     /// новый список придёт со следующим опросом.
     fn switch_mode(&mut self, target: Mode) {
         let (core, error, notice, ctx) = (self.core.clone(), self.action_error.clone(), self.notice.clone(), self.ctx.clone());
-        *notice.lock().unwrap() = Some(tr("mode.switching"));
+        *lock(&notice) = Some(tr("mode.switching"));
         std::thread::spawn(move || {
             let result = core.ok(Request::SetMode(target));
-            *notice.lock().unwrap() = None;
+            *lock(&notice) = None;
             if let Err(e) = result {
                 error.push(e);
             }
@@ -193,7 +194,7 @@ impl App {
             }
         }
         match self.core.report(Request::Import(entries)) {
-            Ok(r) => *self.notice.lock().unwrap() = Some(report_text(&r)),
+            Ok(r) => *lock(&self.notice) = Some(report_text(&r)),
             Err(e) => self.fail(e),
         }
     }
@@ -201,12 +202,12 @@ impl App {
     /// «Забрать всё из AmneziaWG»: ядро запускает родной экспорт в вашем сеансе и импортирует туннели.
     pub(super) fn engine_take_native(&self) {
         let (core, error, notice, ctx) = (self.core.clone(), self.action_error.clone(), self.notice.clone(), self.ctx.clone());
-        *notice.lock().unwrap() = Some(tr("eng.taking"));
+        *lock(&notice) = Some(tr("eng.taking"));
         std::thread::spawn(move || {
             match core.report(Request::TakeNative) {
-                Ok(r) => *notice.lock().unwrap() = Some(report_text(&r)),
+                Ok(r) => *lock(&notice) = Some(report_text(&r)),
                 Err(e) => {
-                    *notice.lock().unwrap() = None;
+                    *lock(&notice) = None;
                     error.push(e);
                 }
             }
@@ -228,7 +229,7 @@ impl App {
         let name = format!("AmneziaWG-UI-Dark-backup-{}.zip", crate::fmt::date(crate::monitor::unix_now()));
         let Some(file) = win::pick_files(win::Files::Zip, true, false, Some(&PathBuf::from(name))).into_iter().next() else { return };
         match self.core.entries(Request::ExportAll).and_then(|entries| archive::write_backup(&file, password, &entries).map(|()| entries.len())) {
-            Ok(n) => *self.notice.lock().unwrap() = Some(trf("eng.backup_done", &[&n.to_string(), &file.display().to_string()])),
+            Ok(n) => *lock(&self.notice) = Some(trf("eng.backup_done", &[&n.to_string(), &file.display().to_string()])),
             Err(e) => self.fail(e),
         }
     }
@@ -274,7 +275,7 @@ impl App {
     }
 
     fn fail(&self, e: String) {
-        *self.notice.lock().unwrap() = None;
+        *lock(&self.notice) = None;
         self.action_error.push(e);
     }
 

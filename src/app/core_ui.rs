@@ -8,6 +8,7 @@ use eframe::egui::{self, RichText};
 
 use super::theme::{self, ThemeId};
 use super::{Action, App, Core, ErrorSink};
+use crate::crash::lock;
 use crate::events::Severity;
 use crate::settings::{Mode, Theme};
 use crate::elevated::Outcome;
@@ -18,7 +19,7 @@ static SELF_UPDATE: Mutex<Option<(String, bool)>> = Mutex::new(None);
 
 /// Окно уже пробовало обновиться до этой версии ядра, и попытка не удалась.
 fn self_update_failed(core_version: &str) -> bool {
-    SELF_UPDATE.lock().unwrap().as_ref().is_some_and(|(v, failed)| *failed && v == core_version)
+    lock(&SELF_UPDATE).as_ref().is_some_and(|(v, failed)| *failed && v == core_version)
 }
 
 /// Связь окна с ядром — для полосы «установить / обновить ядро».
@@ -65,11 +66,11 @@ impl CoreLink {
     }
 
     pub(super) fn state(&self) -> LinkState {
-        self.cell.lock().unwrap().clone()
+        lock(&self.cell).clone()
     }
 
     fn set_installing(&self) {
-        *self.cell.lock().unwrap() = LinkState::Installing;
+        *lock(&self.cell) = LinkState::Installing;
     }
 
     /// Спросить ядро о версии в фоне; итог ляжет в состояние.
@@ -102,7 +103,7 @@ fn check_core(core: Core, ctx: egui::Context, link: LinkCell, error: ErrorSink, 
     std::thread::spawn(move || {
         let _guard = guard;
         let found = core_state(core.hello().map(|(v, _)| v), crate::daemon::install::installed);
-        let mut current = link.lock().unwrap();
+        let mut current = lock(&link);
         let state = settle(&current, found, probe);
         // Ядро забывает язык окна при перезапуске: шлём заново, когда связь только появилась или прерывалась.
         let reconnected = matches!(probe, Probe::Recheck { reconnected: true });
@@ -202,7 +203,7 @@ impl App {
             match crate::elevated::run(&args, "core.setup_failed") {
                 Outcome::Done(note) => {
                     let done = if flag == crate::daemon::install::INSTALL_FLAG { "core.installed" } else { "core.uninstalled" };
-                    *notice.lock().unwrap() = Some(tr(done));
+                    *lock(&notice) = Some(tr(done));
                     // У прежней версии был автозапуск через задачу планировщика — включаем его по-новому (ключ Run).
                     if note == crate::daemon::install::AUTOSTART_NOTE {
                         if let Err(e) = crate::win::set_autostart(true) {
@@ -212,7 +213,7 @@ impl App {
                 }
                 Outcome::Failed(e) => error.push(e),
                 // Отмена UAC — выбор пользователя, а не сбой: как у «Вернуть».
-                Outcome::Cancelled => *notice.lock().unwrap() = Some(tr("core.uac_declined")),
+                Outcome::Cancelled => *lock(&notice) = Some(tr("core.uac_declined")),
             }
             // Ядру нужно мгновение, чтобы открыть канал.
             std::thread::sleep(Duration::from_millis(500));
@@ -275,7 +276,7 @@ impl App {
     /// каждую версию ядра (`again` — повтор по кнопке «Повторить»); не вышло — ошибка в окне и кнопка повтора.
     fn self_update(&self, core_version: &str, again: bool) {
         {
-            let mut last = SELF_UPDATE.lock().unwrap();
+            let mut last = lock(&SELF_UPDATE);
             if !again && last.as_ref().is_some_and(|(v, _)| v == core_version) {
                 return;
             }
@@ -289,7 +290,7 @@ impl App {
                 std::process::exit(0);
             }
             Err(e) => {
-                *SELF_UPDATE.lock().unwrap() = Some((core_version.to_string(), true));
+                *lock(&SELF_UPDATE) = Some((core_version.to_string(), true));
                 self.action_error.push(trf("updo.self_update_failed", &[core_version, &e]));
             }
         }

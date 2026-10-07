@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 
 use eframe::egui::{self, RichText};
 
+use crate::crash::lock;
 use crate::daemon::agent::client::AgentApi;
 use crate::daemon::agent::proto::AgentRequest;
 use crate::daemon::CoreApi;
@@ -49,7 +50,7 @@ impl Confirm {
 impl App {
     /// Родной импорт с выделенным файлом; «Открыть» нажимает пользователь. Напоминание про дубликат.
     pub(super) fn import_source(&self, path: PathBuf) {
-        *self.notice.lock().unwrap() = Some(tr("src.import_hint"));
+        *lock(&self.notice) = Some(tr("src.import_hint"));
         let (core, error) = (self.core.clone(), self.action_error.clone());
         std::thread::spawn(move || {
             if let Err(e) = core.import_in_native(Some(&path)) {
@@ -168,7 +169,7 @@ impl App {
             Mode::Engine => ("eng.deleting", "eng.deleted", "eng.deleted_copy"),
             Mode::Overlay => ("del.running", "del.done", "del.done_copy"),
         };
-        *notice.lock().unwrap() = Some(trf(running_key, &[&tunnel]));
+        *lock(&notice) = Some(trf(running_key, &[&tunnel]));
         std::thread::spawn(move || {
             let result = delete_tunnel(core.as_ref(), &tunnel, copy.as_deref()).map(|()| match &copy {
                 Some(p) => trf(copy_key, &[&tunnel, &p.display().to_string()]),
@@ -176,14 +177,14 @@ impl App {
             });
             if report_outcome(result, &tunnel, Severity::Warn, &shared, &notice, &error) {
                 follow_stats(agent.as_deref(), &shared, StatsChange::Forget(tunnel.clone()));
-                deleted.lock().unwrap().push(tunnel);
+                lock(&deleted).push(tunnel);
             }
         });
     }
 
     /// Убрать удалённые туннели из настроек: группа, источник, выбор, кэш сведений. Файл-источник не трогаем.
     pub(super) fn apply_deleted(&mut self) {
-        let gone: Vec<String> = std::mem::take(&mut *self.deleted.lock().unwrap());
+        let gone: Vec<String> = std::mem::take(&mut *lock(&self.deleted));
         for t in gone {
             self.s.book.forget_tunnel(&t);
             self.sources.forget(&t);
@@ -209,7 +210,7 @@ impl App {
             Confirm::DeleteGroup(_) | Confirm::DeleteTunnel(_) | Confirm::UninstallCore | Confirm::Disconnect(_) => return,
         };
         let Some(path) = self.s.book.source(&tunnel).map(PathBuf::from) else { return };
-        *notice.lock().unwrap() = Some(trf("sync.running", &[&tunnel]));
+        *lock(&notice) = Some(trf("sync.running", &[&tunnel]));
         std::thread::spawn(move || {
             let result = if to_source {
                 save_config_copy(core.as_ref(), &tunnel, &path)
@@ -260,11 +261,11 @@ fn report_outcome(
     match result {
         Ok(text) => {
             shared.log(tunnel, done, &text);
-            *notice.lock().unwrap() = Some(text);
+            *lock(&notice) = Some(text);
             true
         }
         Err(e) => {
-            *notice.lock().unwrap() = None;
+            *lock(&notice) = None;
             error.push_for(tunnel, e);
             false
         }

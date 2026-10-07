@@ -15,6 +15,7 @@ use super::modals::{Modal, Outcome as ModalOutcome, Turn};
 use super::reminder::{self, Due, Presence};
 use super::theme::{palette, Palette};
 use super::{dialog_buttons, mono, ErrorSink};
+use crate::crash::lock;
 use crate::daemon::agent::client::{AgentApi, UpdatesError};
 use crate::fmt;
 use crate::i18n::{tr, trf};
@@ -31,23 +32,21 @@ const WINDOW_ID: &str = "updates";
 const NOTES_ID: &str = "updates-notes";
 const ROW: f32 = 26.0;
 const BUTTON: Vec2 = Vec2::new(120.0, 26.0);
-// Ширины колонок; «Компонент» занимает остаток, но не меньше своего минимума.
+/// Колонка с галочкой: ширина значка, не текста.
 const W_CHECK: f32 = 28.0;
-const W_VERSION: f32 = 170.0;
-const W_STATUS: f32 = 250.0;
-const W_NEWS: f32 = 110.0;
+/// Предел колонки «Состояние»: текст сбоя бывает любой длины, дальше — обрезка с подсказкой.
+const W_STATUS_MAX: f32 = 250.0;
+/// Окно «Обновления и откаты»: начальный и наименьший размер (ширина по таблице компонентов).
+const WINDOW_SIZE: [f32; 2] = [1000.0, 560.0];
+const WINDOW_MIN: [f32; 2] = [640.0, 320.0];
 /// Окно «Что нового»: начальный и наименьший размер.
 const NOTES_SIZE: [f32; 2] = [560.0, 420.0];
 const NOTES_MIN: [f32; 2] = [320.0, 200.0];
-const MIN_NAME: f32 = 200.0;
-const W_DATE: f32 = 140.0;
-const W_ACTION: f32 = 120.0;
-const W_FROM_TO: f32 = 150.0;
-const W_SIZE: f32 = 80.0;
-const W_RESULT: f32 = 70.0;
-// Подпись «Вернуть <версия>»: версии вида 3.1.20260814 длинные.
-const W_RESTORE: f32 = 170.0;
-const MIN_HIST_NAME: f32 = 120.0;
+/// Ниже этого колонка «Компонент» не ужимается, когда окно у́же таблицы: остаток обрезается с подсказкой.
+const MIN_NAME: f32 = 160.0;
+const MIN_HIST_NAME: f32 = 100.0;
+/// Запас к измеренной ширине текста: округление раскладки не должно обрезать последнюю букву.
+const SLACK: f32 = 2.0;
 
 /// Окно «Обновления и откаты»: состояние, показ, опрос ядра и подтверждение. Принадлежит `App`, остальное окно
 /// видит только публичные методы; поля закрыты.
@@ -250,7 +249,7 @@ impl UpdatesWindow {
         }
         self.poll();
         let (state, error) = {
-            let p = self.polled.lock().unwrap();
+            let p = lock(&self.polled);
             (p.state.clone(), p.error.clone())
         };
         sync_selection(&state.components, &mut self.selected, &mut self.offered);
@@ -259,11 +258,11 @@ impl UpdatesWindow {
         let mut open = true;
         dialog_window(ctx, tr("upd.title"), WINDOW_ID, &mut open)
             .resizable(true)
-            .default_size([1000.0, 560.0])
-            .min_size([920.0, 360.0])
+            .default_size(WINDOW_SIZE)
+            .min_size(WINDOW_MIN)
             .show(ctx, |ui| {
                 let view = View { state: &state, error: error.as_deref(), selected: &self.selected, busy, locked: busy || confirm_open };
-                egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| window_body(ui, &view, &mut clicks));
+                window_body(ui, &view, &mut clicks);
             });
         // Подтверждение (оно в `Modals`, его кадр уже прошёл) забрало Enter и Esc; без него Esc закрывает само окно,
         // если оно верхнее.
@@ -326,7 +325,7 @@ impl UpdatesWindow {
 
     /// Подтверждение установки или возврата — диалог из `Modals` поверх окна обновлений.
     pub(super) fn show_confirm(&mut self, ctx: &egui::Context, confirm: &Confirm, turn: Turn) -> ModalOutcome {
-        let state = &self.polled.lock().unwrap().state.clone();
+        let state = &lock(&self.polled).state.clone();
         let busy = state.busy.is_some() || self.command.any();
         let (title, primary, lines, notes) = match confirm {
             Confirm::Apply(list) => {
@@ -450,7 +449,7 @@ impl UpdatesWindow {
             match crate::elevated::run(&crate::update::restore_args(id), "upd.restore_failed") {
                 Outcome::Done(_) => {}
                 Outcome::Failed(e) => link.error.push(e),
-                Outcome::Cancelled => *link.notice.lock().unwrap() = Some(tr("upd.restore_cancelled")),
+                Outcome::Cancelled => *lock(&link.notice) = Some(tr("upd.restore_cancelled")),
             }
             drop(pending);
             link.ctx.request_repaint();
@@ -469,7 +468,7 @@ impl UpdatesWindow {
             // Ошибку в журнал не пишем: фоновая проверка повторялась бы в нём каждые 30 минут; окно покажет её само.
             if let Ok(state) = link.updates(UpdateOp::State) {
                 badge.store(has_updates(&state), Ordering::SeqCst);
-                *proposed.lock().unwrap() = Some(offered_updates(&state));
+                *lock(&proposed) = Some(offered_updates(&state));
                 link.ctx.request_repaint();
             }
         });
@@ -481,7 +480,7 @@ impl UpdatesWindow {
         if std::mem::take(&mut self.snoozed) {
             *reminded = Some(now);
         }
-        if let Some(offered) = self.proposed.lock().unwrap().take() {
+        if let Some(offered) = lock(&self.proposed).take() {
             // Установленное выпадает из открытого уведомления; новый ответ — повод проверить сразу, не ждать RECHECK.
             self.news.retain(|n| offered.contains(n));
             self.offered_now = offered;
@@ -585,13 +584,17 @@ fn window_body(ui: &mut Ui, v: &View, clicks: &mut Vec<Click>) {
     status_line(ui, v);
     ui.add_space(4.0);
     ui.separator();
+    // Таблица компонентов и кнопки всегда на виду; растёт только история, и она прокручивается внутри окна —
+    // окно за край главного не выходит (`dialog_window`).
     egui::CollapsingHeader::new(RichText::new(tr("upd.history")).strong())
         .id_salt("upd-history")
         .default_open(true)
-        .show(ui, |ui| history_table(ui, v, clicks));
+        .show(ui, |ui| {
+            egui::ScrollArea::vertical().id_salt("upd-history-scroll").auto_shrink([false, false]).show(ui, |ui| history_table(ui, v, clicks));
+        });
 }
 
-/// Ячейка постоянной ширины: колонки строк и заголовка совпадают, длинное обрезается.
+/// Ячейка заданной ширины: колонки строк и заголовка совпадают, длинное обрезается.
 fn cell(ui: &mut Ui, width: f32, right: bool, add: impl FnOnce(&mut Ui)) {
     let layout = if right { Layout::right_to_left(Align::Center) } else { Layout::left_to_right(Align::Center) };
     ui.allocate_ui_with_layout(Vec2::new(width, ROW), layout, |ui| {
@@ -600,10 +603,45 @@ fn cell(ui: &mut Ui, width: f32, right: bool, add: impl FnOnce(&mut Ui)) {
     });
 }
 
+fn head_text(key: &str) -> RichText {
+    RichText::new(tr(key)).color(palette().idle)
+}
+
 fn head(ui: &mut Ui, width: f32, right: bool, key: &str) {
     cell(ui, width, right, |ui| {
-        ui.add(egui::Label::new(RichText::new(tr(key)).color(palette().idle)).truncate());
+        ui.add(egui::Label::new(head_text(key)).truncate());
     });
+}
+
+/// Ширина текста, как его положит `Label` (без переноса), с запасом `SLACK`.
+fn text_width(ui: &Ui, text: RichText) -> f32 {
+    let galley = egui::WidgetText::from(text).into_galley(ui, Some(egui::TextWrapMode::Extend), f32::INFINITY, egui::TextStyle::Body);
+    galley.size().x + SLACK
+}
+
+/// Ширина кнопки с подписью `text`: текст в стиле кнопки (`small` — обычном, как у `small_button`) и её отступы.
+fn button_width(ui: &Ui, text: &str, small: bool) -> f32 {
+    let style = if small { egui::TextStyle::Body } else { egui::TextStyle::Button };
+    let galley = egui::WidgetText::from(text).into_galley(ui, Some(egui::TextWrapMode::Extend), f32::INFINITY, style);
+    galley.size().x + 2.0 * ui.spacing().button_padding.x + SLACK
+}
+
+/// Ширина колонки: по самому широкому из заголовка и ячеек.
+fn widest(head: f32, cells: impl IntoIterator<Item = f32>) -> f32 {
+    cells.into_iter().fold(head, f32::max)
+}
+
+/// Ширины колонок таблицы по `natural` (ширина самого широкого содержимого каждой). Таблица у́же окна — ширины как
+/// есть, лишнее остаётся после последней колонки (не между ними). Шире окна — ужимается только гибкая колонка
+/// `flex` (имя: его обрезают с подсказкой), но не ниже `min_flex`; остальные колонки не трогаются, чтобы версии
+/// и даты не обрезались.
+fn column_widths(available: f32, natural: &[f32], spacing: f32, flex: usize, min_flex: f32) -> Vec<f32> {
+    let total = natural.iter().sum::<f32>() + spacing * natural.len().saturating_sub(1) as f32;
+    let mut widths = natural.to_vec();
+    if total > available {
+        widths[flex] = (natural[flex] - (total - available)).max(min_flex.min(natural[flex]));
+    }
+    widths
 }
 
 /// Текст, обрезанный по ячейке, полный — во всплывающей подсказке.
@@ -617,27 +655,33 @@ fn clipped_tip(ui: &mut Ui, text: RichText, tip: String) {
     ui.add(egui::Label::new(text).truncate()).on_hover_text(tip);
 }
 
-/// Остаток ширины для гибкой колонки после постоянных и промежутков между ячейками.
-fn flex(total: f32, fixed: &[f32], spacing: f32, min: f32) -> f32 {
-    (total - fixed.iter().sum::<f32>() - spacing * fixed.len() as f32).max(min)
-}
-
-/// Версия моноширинным и дата выхода этой версии серым; `—`, если версии нет. `tip` — подсказка к ячейке.
-fn version_cell(ui: &mut Ui, version: Option<&str>, released: Option<u64>, tip: Option<String>, missing: &str) {
+/// Содержимое ячейки версии: версия моноширинным и дата выхода этой версии серым; одна серая подпись `missing`,
+/// если версии нет. Одна функция и для показа, и для измерения ширины колонки.
+fn version_texts(version: Option<&str>, released: Option<u64>, missing: &str) -> Vec<RichText> {
     match version {
         Some(v) => {
-            let mut shown = vec![ui.label(mono(v, palette().text_strong))];
+            let mut texts = vec![mono(v, palette().text_strong)];
             if let Some(at) = released.filter(|t| *t > 0) {
-                shown.push(ui.label(mono(fmt::date(at), palette().idle)));
+                texts.push(mono(fmt::date(at), palette().idle));
             }
-            if let Some(tip) = tip {
-                for r in shown {
-                    r.on_hover_text(&tip);
-                }
-            }
+            texts
         }
-        None => {
-            ui.label(RichText::new(missing).color(palette().idle));
+        None => vec![RichText::new(missing).color(palette().idle)],
+    }
+}
+
+/// Ширина ячейки из нескольких подписей в ряд (с промежутком между ними).
+fn texts_width(ui: &Ui, texts: Vec<RichText>) -> f32 {
+    let n = texts.len();
+    texts.into_iter().map(|t| text_width(ui, t)).sum::<f32>() + ui.spacing().item_spacing.x * n.saturating_sub(1) as f32
+}
+
+/// Ячейка версии (`version_texts`); `tip` — подсказка ко всей ячейке.
+fn version_cell(ui: &mut Ui, texts: Vec<RichText>, tip: Option<String>) {
+    for t in texts {
+        let r = ui.label(t);
+        if let Some(tip) = &tip {
+            r.on_hover_text(tip);
         }
     }
 }
@@ -648,38 +692,75 @@ fn installed_tip(c: &ComponentState) -> Option<String> {
     c.installed_at.filter(|t| *t > 0).map(|t| trf("upd.installed_on", &[&fmt::date(t)]))
 }
 
+/// Строка таблицы компонентов: тексты ячеек готовы заранее — по ним и меряются колонки, и рисуются строки.
+struct ComponentRow<'a> {
+    id: Component,
+    c: &'a ComponentState,
+    installed: Vec<RichText>,
+    available: Vec<RichText>,
+    status: Status,
+}
+
+fn component_rows<'a>(v: &View<'a>) -> Vec<ComponentRow<'a>> {
+    v.state
+        .components
+        .iter()
+        .filter_map(|c| {
+            let id = c.component?;
+            let missing = if id == Component::Native { tr("upd.not_installed") } else { tr("upd.unknown") };
+            let avail = offered(c);
+            Some(ComponentRow {
+                id,
+                c,
+                installed: version_texts(c.installed.as_deref(), c.released, &missing),
+                available: version_texts(avail.map(Available::shown).as_deref(), avail.map(|a| a.published), "—"),
+                status: status(c),
+            })
+        })
+        .collect()
+}
+
+/// Колонки: галочка, компонент (гибкая), установлено, доступно, состояние, «Что нового…».
+const COL_NAME: usize = 1;
+
 fn components_table(ui: &mut Ui, v: &View, clicks: &mut Vec<Click>) {
+    let rows = component_rows(v);
     let sp = ui.spacing().item_spacing.x;
-    let w_name = flex(ui.available_width(), &[W_CHECK, W_VERSION, W_VERSION, W_STATUS, W_NEWS], sp, MIN_NAME);
+    let natural = [
+        W_CHECK,
+        widest(text_width(ui, head_text("upd.col_component")), rows.iter().map(|r| text_width(ui, RichText::new(name(r.id))))),
+        widest(text_width(ui, head_text("upd.col_installed")), rows.iter().map(|r| texts_width(ui, r.installed.clone()))),
+        widest(text_width(ui, head_text("upd.col_available")), rows.iter().map(|r| texts_width(ui, r.available.clone()))),
+        widest(text_width(ui, head_text("upd.col_status")), rows.iter().map(|r| text_width(ui, RichText::new(status_text(&r.status))))).min(W_STATUS_MAX),
+        rows.iter().filter(|r| release_notes(r.c).is_some()).map(|_| button_width(ui, &tr("upd.notes"), true)).fold(0.0, f32::max),
+    ];
+    let w = column_widths(ui.available_width(), &natural, sp, COL_NAME, MIN_NAME);
     ui.horizontal(|ui| {
-        cell(ui, W_CHECK, false, |_| {});
-        head(ui, w_name, false, "upd.col_component");
-        head(ui, W_VERSION, false, "upd.col_installed");
-        head(ui, W_VERSION, false, "upd.col_available");
-        head(ui, W_STATUS, false, "upd.col_status");
-        cell(ui, W_NEWS, false, |_| {});
+        cell(ui, w[0], false, |_| {});
+        head(ui, w[1], false, "upd.col_component");
+        head(ui, w[2], false, "upd.col_installed");
+        head(ui, w[3], false, "upd.col_available");
+        head(ui, w[4], false, "upd.col_status");
+        cell(ui, w[5], false, |_| {});
     });
     ui.separator();
-    for c in &v.state.components {
-        let Some(id) = c.component else { continue };
+    for r in rows {
+        let (id, c) = (r.id, r.c);
         ui.horizontal(|ui| {
-            cell(ui, W_CHECK, false, |ui| {
+            cell(ui, w[0], false, |ui| {
                 let mut on = c.update && v.selected.contains(&id);
                 if ui.add_enabled(c.update, egui::Checkbox::without_text(&mut on)).changed() {
                     clicks.push(Click::Toggle(id));
                 }
             });
-            cell(ui, w_name, false, |ui| clipped(ui, RichText::new(name(id))));
-            let missing = if id == Component::Native { tr("upd.not_installed") } else { tr("upd.unknown") };
-            cell(ui, W_VERSION, false, |ui| version_cell(ui, c.installed.as_deref(), c.released, installed_tip(c), &missing));
-            let avail = offered(c);
-            cell(ui, W_VERSION, false, |ui| version_cell(ui, avail.map(Available::shown).as_deref(), avail.map(|a| a.published), None, "—"));
-            cell(ui, W_STATUS, false, |ui| {
-                let s = status(c);
-                clipped_tip(ui, RichText::new(status_text(&s)).color(status_color(palette(), &s)), status_tip(&s));
+            cell(ui, w[1], false, |ui| clipped(ui, RichText::new(name(id))));
+            cell(ui, w[2], false, |ui| version_cell(ui, r.installed, installed_tip(c)));
+            cell(ui, w[3], false, |ui| version_cell(ui, r.available, None));
+            cell(ui, w[4], false, |ui| {
+                clipped_tip(ui, RichText::new(status_text(&r.status)).color(status_color(palette(), &r.status)), status_tip(&r.status));
             });
             // Текст релиза — в отдельном окне: высота строки от его длины не зависит.
-            cell(ui, W_NEWS, false, |ui| {
+            cell(ui, w[5], false, |ui| {
                 if release_notes(c).is_some() && ui.small_button(tr("upd.notes")).clicked() {
                     clicks.push(Click::Notes(id));
                 }
@@ -713,53 +794,86 @@ fn history_table(ui: &mut Ui, v: &View, clicks: &mut Vec<Click>) {
         ui.weak(tr("upd.history_empty"));
         return;
     }
+    let rows: Vec<HistoryRow> = v.state.history.iter().map(|e| history_row(v, e)).collect();
     let sp = ui.spacing().item_spacing.x;
-    let fixed = [W_DATE, W_ACTION, W_FROM_TO, W_SIZE, W_RESULT, W_RESTORE];
-    let w_name = flex(ui.available_width(), &fixed, sp, MIN_HIST_NAME);
+    let p = palette();
+    let natural = [
+        widest(text_width(ui, head_text("upd.h_date")), rows.iter().map(|r| text_width(ui, mono(&r.date, p.idle)))),
+        widest(text_width(ui, head_text("upd.col_component")), rows.iter().map(|r| text_width(ui, RichText::new(&r.name)))),
+        widest(text_width(ui, head_text("upd.h_action")), rows.iter().map(|r| text_width(ui, RichText::new(&r.action)))),
+        widest(text_width(ui, head_text("upd.h_version")), rows.iter().map(|r| text_width(ui, mono(&r.versions, p.text_strong)))),
+        widest(text_width(ui, head_text("upd.h_backup")), rows.iter().map(|r| text_width(ui, mono(&r.size, p.idle)))),
+        widest(text_width(ui, head_text("upd.h_result")), rows.iter().map(|r| text_width(ui, RichText::new(&r.result)))),
+        rows.iter().map(|r| button_width(ui, &r.button.label, false)).fold(0.0, f32::max),
+    ];
+    let w = column_widths(ui.available_width(), &natural, sp, COL_NAME, MIN_HIST_NAME);
     ui.horizontal(|ui| {
-        head(ui, W_DATE, false, "upd.h_date");
-        head(ui, w_name, false, "upd.col_component");
-        head(ui, W_ACTION, false, "upd.h_action");
-        head(ui, W_FROM_TO, false, "upd.h_version");
-        head(ui, W_SIZE, true, "upd.h_backup");
-        head(ui, W_RESULT, false, "upd.h_result");
-        cell(ui, W_RESTORE, false, |_| {});
+        head(ui, w[0], false, "upd.h_date");
+        head(ui, w[1], false, "upd.col_component");
+        head(ui, w[2], false, "upd.h_action");
+        head(ui, w[3], false, "upd.h_version");
+        // Размеры — числа: и они, и заголовок по правому краю колонки.
+        head(ui, w[4], true, "upd.h_backup");
+        head(ui, w[5], false, "upd.h_result");
+        cell(ui, w[6], false, |_| {});
     });
     ui.separator();
-    for e in &v.state.history {
+    for r in rows {
+        let e = r.entry;
         ui.horizontal(|ui| {
-            cell(ui, W_DATE, false, |ui| {
-                ui.label(mono(fmt::date_time(e.at), palette().idle));
+            cell(ui, w[0], false, |ui| {
+                ui.label(mono(r.date, p.idle));
             });
-            cell(ui, w_name, false, |ui| clipped(ui, RichText::new(short(e.component))));
-            cell(ui, W_ACTION, false, |ui| clipped(ui, RichText::new(action_name(e.action))));
-            cell(ui, W_FROM_TO, false, |ui| clipped(ui, mono(versions(e), palette().text_strong)));
-            cell(ui, W_SIZE, true, |ui| {
-                let size = if e.backup.is_some() { fmt::bytes(e.backup_size as f64) } else { "—".to_string() };
-                ui.label(mono(size, palette().idle));
+            cell(ui, w[1], false, |ui| clipped(ui, RichText::new(r.name)));
+            cell(ui, w[2], false, |ui| clipped(ui, RichText::new(r.action)));
+            cell(ui, w[3], false, |ui| clipped(ui, mono(r.versions, p.text_strong)));
+            cell(ui, w[4], true, |ui| {
+                ui.label(mono(r.size, p.idle));
             });
-            cell(ui, W_RESULT, false, |ui| {
-                if e.ok {
-                    ui.label(RichText::new(tr("upd.result_ok")).color(palette().connected));
-                } else {
-                    let r = ui.label(RichText::new(tr("upd.result_err")).color(palette().error));
-                    if let Some(err) = &e.error {
-                        r.on_hover_text(err);
-                    }
+            cell(ui, w[5], false, |ui| {
+                let color = if e.ok { p.connected } else { p.error };
+                let label = ui.label(RichText::new(r.result).color(color));
+                if let Some(err) = e.error.as_ref().filter(|_| !e.ok) {
+                    label.on_hover_text(err);
                 }
             });
-            cell(ui, W_RESTORE, false, |ui| {
-                let button = restore_button(v.state.restores.iter().find(|o| o.id == e.id));
-                let r = ui.add_enabled(button.version.is_some() && !v.locked, egui::Button::new(&button.label));
-                if r.clicked() {
+            cell(ui, w[6], false, |ui| {
+                let button = r.button;
+                let resp = ui.add_enabled(button.version.is_some() && !v.locked, egui::Button::new(&button.label));
+                if resp.clicked() {
                     if let Some(version) = button.version {
                         clicks.push(Click::Restore { id: e.id, component: e.component, version });
                     }
                 } else if let Some(why) = button.why_not {
-                    r.on_disabled_hover_text(why);
+                    resp.on_disabled_hover_text(why);
                 }
             });
         });
+    }
+}
+
+/// Строка истории: тексты ячеек готовы заранее — по ним меряются колонки, по ним же рисуется строка.
+struct HistoryRow<'a> {
+    entry: &'a HistoryEntry,
+    date: String,
+    name: String,
+    action: String,
+    versions: String,
+    size: String,
+    result: String,
+    button: RestoreButton,
+}
+
+fn history_row<'a>(v: &View, e: &'a HistoryEntry) -> HistoryRow<'a> {
+    HistoryRow {
+        entry: e,
+        date: fmt::date_time(e.at),
+        name: short(e.component),
+        action: action_name(e.action),
+        versions: versions(e),
+        size: if e.backup.is_some() { fmt::bytes(e.backup_size as f64) } else { "—".to_string() },
+        result: tr(if e.ok { "upd.result_ok" } else { "upd.result_err" }),
+        button: restore_button(v.state.restores.iter().find(|o| o.id == e.id)),
     }
 }
 
@@ -888,11 +1002,11 @@ fn take_updates_reply(
     proposed: &Mutex<Option<Vec<(Component, String)>>>,
     error: &ErrorSink,
 ) {
-    let mut p = polled.lock().unwrap();
+    let mut p = lock(&polled);
     match result {
         Ok(state) => {
             badge.store(has_updates(&state), Ordering::SeqCst);
-            *proposed.lock().unwrap() = Some(offered_updates(&state));
+            *lock(&proposed) = Some(offered_updates(&state));
             if seq > p.applied {
                 p.state = state;
                 p.applied = seq;
@@ -1363,12 +1477,53 @@ mod tests {
     }
 
     #[test]
-    fn history_versions_and_flex_width() {
+    fn history_versions() {
         assert_eq!(versions(&entry(Some("3.1.0"), Some("3.1.1"))), "3.1.0 → 3.1.1");
         assert_eq!(versions(&entry(Some("3.1.0"), Some("3.1.0"))), "3.1.0");
         assert_eq!(versions(&entry(None, None)), "—");
-        assert_eq!(flex(900.0, &[100.0, 200.0], 10.0, 50.0), 580.0);
-        assert_eq!(flex(300.0, &[100.0, 200.0], 10.0, 50.0), 50.0);
+    }
+
+    /// Колонки по содержимому: ширина — самое широкое из заголовка и ячеек; лишняя ширина окна не раздвигает
+    /// колонки; нехватка ужимает только гибкую колонку имени, и не ниже минимума.
+    #[test]
+    fn columns_take_the_width_of_their_widest_content() {
+        assert_eq!(widest(50.0, [10.0, 80.0, 30.0]), 80.0, "ячейка шире заголовка");
+        assert_eq!(widest(50.0, [10.0, 30.0]), 50.0, "заголовок шире ячеек");
+        assert_eq!(widest(50.0, []), 50.0, "пустая таблица — по заголовку");
+        let natural = [100.0, 300.0, 150.0, 80.0];
+        // Есть место: ширины как есть, остаток (900 - 630 - 3*10) после последней колонки.
+        assert_eq!(column_widths(900.0, &natural, 10.0, 1, 120.0), natural.to_vec());
+        // Не хватает 60: ужимается только колонка имени.
+        assert_eq!(column_widths(600.0, &natural, 10.0, 1, 120.0), vec![100.0, 240.0, 150.0, 80.0]);
+        // Не хватает больше, чем имя может отдать: имя на минимуме, остальные не тронуты (обрезает окно).
+        assert_eq!(column_widths(300.0, &natural, 10.0, 1, 120.0), vec![100.0, 120.0, 150.0, 80.0]);
+        // Имя и так у́же минимума: не растёт.
+        assert_eq!(column_widths(100.0, &[100.0, 50.0], 10.0, 1, 120.0), vec![100.0, 50.0]);
+    }
+
+    /// Ячейка версии: версия и дата выхода — две подписи (дата нулевая — одна); нет версии — одна серая подпись.
+    #[test]
+    fn version_cell_texts() {
+        let texts = |t: Vec<RichText>| t.iter().map(|r| r.text().to_string()).collect::<Vec<_>>();
+        assert_eq!(texts(version_texts(Some("3.1.0"), Some(1_791_209_253), "n/a")), vec!["3.1.0", fmt::date(1_791_209_253).as_str()]);
+        assert_eq!(texts(version_texts(Some("3.1.0"), Some(0), "n/a")), vec!["3.1.0"]);
+        assert_eq!(texts(version_texts(None, Some(1), "n/a")), vec!["n/a"]);
+    }
+
+    /// Ширина колонки меряется тем же текстом, что рисуется: заголовок и ячейки измеряются в настоящем контексте
+    /// egui, и колонка версии не у́же самой длинной пары «версия + дата».
+    #[test]
+    fn measured_widths_follow_the_text() {
+        let ctx = egui::Context::default();
+        let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+            let short = text_width(ui, RichText::new("OK"));
+            let long = text_width(ui, RichText::new("Amnezia released v3.2.0 — comes with an app update"));
+            assert!(short > SLACK && long > short * 5.0, "{short} {long}");
+            let pair = texts_width(ui, version_texts(Some("3.1.20260814"), Some(1_791_209_253), "—"));
+            let alone = texts_width(ui, version_texts(Some("3.1.20260814"), None, "—"));
+            assert!(pair > alone + ui.spacing().item_spacing.x, "{pair} {alone}");
+            assert!(button_width(ui, "Restore 2.0.1", false) > text_width(ui, RichText::new("Restore 2.0.1")));
+        });
     }
 }
 

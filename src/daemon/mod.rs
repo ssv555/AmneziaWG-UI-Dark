@@ -11,6 +11,7 @@ pub mod install;
 pub mod pipe;
 pub mod proto;
 mod netwatch;
+pub(crate) mod phase_trace;
 pub(crate) mod restore;
 pub(crate) mod retry;
 pub mod server;
@@ -36,6 +37,12 @@ pub const DATA_SDDL: &str = "O:BAD:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)";
 /// `C:\ProgramData\AmneziaWG UI Dark`.
 pub fn data_dir() -> PathBuf {
     crate::win::program_data().join("AmneziaWG UI Dark")
+}
+
+/// Папка файлов языков (`.lng`) ядра и агента: только папка программы в Program Files (туда пишут администраторы),
+/// не папка окна. Нет файла — встроенный перевод или английский.
+fn lang_dir() -> PathBuf {
+    crate::engine::install_dir().join("lang")
 }
 
 /// Журнал событий ядра.
@@ -66,7 +73,12 @@ impl Config {
 
     /// Настройки ядра для чтения (окно берёт из них SID владельца): сбой чтения даёт умолчания, файл не трогается.
     pub fn load() -> Config {
-        Self::from_ini(&Ini::load(&Self::path()))
+        Self::load_from(&Self::path())
+    }
+
+    /// То же из заданного файла: агент читает язык ядра (`agent::language`), проверки — свой файл.
+    fn load_from(path: &std::path::Path) -> Config {
+        Self::from_ini(&Ini::load(path))
     }
 
     /// Настройки ядра, которые затем будут перезаписаны (запуск и установка ядра): нечитаемый `core.ini` отодвигается

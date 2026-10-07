@@ -32,6 +32,7 @@ use windows_sys::Win32::System::Pipes::{
 use windows_sys::Win32::System::Threading::{CreateEventW, GetCurrentThread, OpenThreadToken, ResetEvent, WaitForSingleObject, INFINITE};
 use windows_sys::Win32::System::IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED};
 
+use super::phase_trace::mark;
 use super::proto::{Request, Response};
 use crate::win::wide;
 
@@ -241,6 +242,7 @@ impl Server {
     }
 
     pub fn accept(&mut self) -> Result<ServerConn, AcceptError> {
+        mark("accept: create pipe instance");
         unsafe {
             let mut sd: PSECURITY_DESCRIPTOR = null_mut();
             if ConvertStringSecurityDescriptorToSecurityDescriptorW(wide(&self.sddl).as_ptr(), SDDL_REVISION_1, &mut sd, null_mut()) == 0 {
@@ -266,16 +268,19 @@ impl Server {
                 return Err(AcceptError { text: crate::i18n::tr("core.pipe_taken"), taken: true });
             }
             self.first = false;
+            mark("accept: instance ready, waiting for a client");
             match pipe.io(None, |h, ov| ConnectNamedPipe(h, ov)) {
                 Ok(_) => {}
                 // Клиент подключился между созданием экземпляра и ожиданием — это тоже подключение.
                 Err(e) if e.raw_os_error() == Some(ERROR_PIPE_CONNECTED as i32) => {}
                 Err(e) => return Err(AcceptError::other(format!("ConnectNamedPipe: {e}"))),
             }
+            mark("accept: client connected");
             let read_by = Instant::now() + SERVER_IO_TIMEOUT;
             let mut session = 0u32;
             GetNamedPipeClientSessionId(h, &mut session);
             let (client_sid, elevated) = client_identity(h);
+            mark("accept: client identity read");
             Ok(ServerConn { pipe, read_by, session, client_sid, elevated })
         }
     }
@@ -369,9 +374,14 @@ pub fn call_to(name: &str, req: &Request, timeouts: Timeouts) -> Result<Response
 
 /// То же для канала со своими типами запроса и ответа (канал агента — `agent::proto`).
 pub fn call_with<Q: serde::Serialize, R: serde::de::DeserializeOwned>(name: &str, req: &Q, timeouts: Timeouts) -> Result<R, String> {
+    mark("client: connect");
     let pipe = connect(name)?;
+    mark("client: connected, server owner checked");
     write_json(&mut pipe.until(Instant::now() + timeouts.send), req)?;
-    read_json(&mut pipe.until(Instant::now() + timeouts.reply), MAX_RESPONSE)
+    mark("client: request sent");
+    let reply = read_json(&mut pipe.until(Instant::now() + timeouts.reply), MAX_RESPONSE);
+    mark("client: reply received");
+    reply
 }
 
 fn connect(name: &str) -> Result<Pipe, String> {
@@ -393,6 +403,7 @@ fn connect(name: &str) -> Result<Pipe, String> {
             if GetLastError() != ERROR_PIPE_BUSY {
                 return Err(crate::i18n::trf("core.unavailable", &[&std::io::Error::last_os_error().to_string()]));
             }
+            mark("client: all pipe instances busy, waiting");
             WaitNamedPipeW(name.as_ptr(), 500);
         }
     }

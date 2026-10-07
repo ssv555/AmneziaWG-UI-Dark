@@ -34,7 +34,7 @@
 **Live status**
 - Is there a handshake and how long ago, are packets flowing, download / upload speed, ping through the VPN.
   Numbers use a monospaced font in fixed-width cells, so nothing jumps around when values change.
-- Speed graph (2 min / 10 min / 1 h) with a ping strip underneath.
+- Speed graph (2 min / 10 min / 1 h) with a speed scale on the right and a ping strip underneath; the pause button freezes both so you can hover over peaks.
 - Per-tunnel statistics since the first launch: traffic, peak speed, time connected and its share of the total.
 - Event log: connections, disconnections, lost and restored links; filter by severity and tunnel, search, copy, save to a file.
 - If the core stops answering, the tunnels show "Unknown: no connection to the core" instead of a guess, the tray icon and
@@ -293,6 +293,7 @@ folder. Statistics and time connected are counted by the core all the time, whet
 | `--core-status` | Ask the core for its version, mode and tunnels, as the window does |
 | `--core-mode overlay\|engine` | Switch the working mode through the core |
 | `--core-updates state\|check` | Show the updates state / check for updates now through the core |
+| `--core-updates apply native\|engine\|app <version>` | Update one component to the given version through the core, exactly as the window's Update button does; waits up to 10 minutes for the end |
 | `--core-updates restore <id>` | Roll back to the backup of history entry `<id>`; the core accepts it only from a process with administrator rights |
 | `--core-details <tunnel>` | Details of a disconnected tunnel through the core (prints only the number of addresses and peers) |
 | `--core-take-native` | Built-in engine: take all tunnels from AmneziaWG through the core |

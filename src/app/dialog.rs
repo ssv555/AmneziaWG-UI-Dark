@@ -4,21 +4,39 @@
 //! и Esc, закрывающий его. Поэтому окна строятся только через `dialog_window` — тест `windows_follow_the_standard`
 //! не пускает окно egui в обход него и запрещает закреплять окно на месте или прятать заголовок.
 
-use eframe::egui::{self, Align2, Ui, Vec2};
+use eframe::egui::{self, Align2, Rect, Ui, Vec2};
+
+/// Отступ окна от краёв главного окна: окно не прилипает к границе и не уходит за неё.
+const WINDOW_MARGIN: f32 = 12.0;
 
 /// Окно программы: заголовок, перетаскивается, крестик в заголовке. Крестик сбрасывает `open` — вызывающий
 /// обязан понимать `!open` как свою отмену («Отмена», «Позже», «Закрыть»), так же как Esc.
 /// При открытии по центру; позицию egui дальше помнит по `id`, поэтому он постоянный, а не из заголовка (тот меняется
 /// с языком и содержимым). Не сворачивается и не меняет размер, пока вызывающий не разрешит: ширину задаёт содержимое.
 /// Начальное место можно сменить (`pivot` + `default_pos`), закрепить — нельзя.
+/// Окно всегда внутри главного (`window_bounds`): и положение, и наибольший размер — в том числе после того, как
+/// главное окно уменьшили. Предел размера держит окно с изменяемым размером; окно по размеру содержимого egui растит
+/// по содержимому, поэтому такое окно обязано само умещать его в главное окно (текст переносится по ширине, длинное —
+/// в свою `ScrollArea`, как история в окне обновлений). Общий `vscroll` не годится: он растягивает маленькие диалоги
+/// до размера по умолчанию, а в окне со своей `ScrollArea` делает остаток высоты бесконечным.
 pub(super) fn dialog_window<'a>(ctx: &egui::Context, title: impl Into<egui::WidgetText>, id: &str, open: &'a mut bool) -> egui::Window<'a> {
+    let bounds = window_bounds(ctx.content_rect());
     egui::Window::new(title)
         .id(egui::Id::new(id))
         .open(open)
         .collapsible(false)
         .resizable(false)
         .pivot(Align2::CENTER_CENTER)
-        .default_pos(ctx.content_rect().center())
+        .default_pos(bounds.center())
+        .constrain_to(bounds)
+        .max_size(bounds.size())
+}
+
+/// Где может быть окно: содержимое главного окна без отступа `WINDOW_MARGIN` с каждой стороны. В слишком маленьком
+/// главном окне отступ уменьшается, чтобы область не вывернулась (egui не терпит прямоугольник с min > max).
+fn window_bounds(content: Rect) -> Rect {
+    let margin = WINDOW_MARGIN.min(content.width() / 2.0).min(content.height() / 2.0).max(0.0);
+    content.shrink(margin)
 }
 
 /// Esc для немодального окна `id`: забирается из ввода, только если это окно верхнее (его последним щёлкнули
@@ -191,6 +209,56 @@ pub(super) mod tests {
         assert!(rects[0].right() <= rects[1].left() && rects[1].right() <= rects[2].left(), "order: {rects:?}");
         let screen = ctx.content_rect();
         assert!(screen.right() - rects[2].right() < 20.0, "row is right-aligned: {rects:?} in {screen:?}");
+    }
+
+    #[test]
+    fn window_bounds_keep_a_margin_and_never_invert() {
+        let content = Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(800.0, 500.0));
+        assert_eq!(window_bounds(content), Rect::from_min_max(egui::pos2(12.0, 12.0), egui::pos2(788.0, 488.0)));
+        // Крошечное главное окно: отступ не больше половины стороны, область не пустая и не вывернутая.
+        let tiny = window_bounds(Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(16.0, 100.0)));
+        assert_eq!((tiny.min.x, tiny.max.x), (8.0, 8.0));
+        assert!(tiny.width() >= 0.0 && tiny.height() >= 0.0, "{tiny:?}");
+    }
+
+    /// Окно с этим содержимым три кадра подряд (положение и размер egui уточняет по прошлому кадру); прямоугольник
+    /// окна из последнего кадра и область, где оно обязано быть.
+    fn shown_rect(screen: Vec2, build: fn(egui::Window<'_>) -> egui::Window<'_>, content: Vec2) -> (Rect, Rect) {
+        let ctx = egui::Context::default();
+        let mut rect = Rect::NOTHING;
+        for _ in 0..3 {
+            let input = egui::RawInput { screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, screen)), ..Default::default() };
+            let _ = ctx.run_ui(input, |ui| {
+                let ctx = ui.ctx();
+                let mut open = true;
+                let shown = build(dialog_window(ctx, "t", "test-bounds", &mut open)).show(ctx, |ui| {
+                    ui.allocate_space(content);
+                });
+                rect = shown.expect("window is open").response.rect;
+            });
+        }
+        (rect, window_bounds(ctx.content_rect()))
+    }
+
+    /// Правило: окно с изменяемым размером никогда не выходит за главное окно (с отступом `WINDOW_MARGIN`), даже если
+    /// заданный размер больше, — а окно по размеру содержимого остаётся своего размера и по центру.
+    #[test]
+    fn dialogs_stay_inside_the_main_window() {
+        let screen = Vec2::new(800.0, 500.0);
+        fn big(w: egui::Window<'_>) -> egui::Window<'_> {
+            w.resizable(true).default_size([1000.0, 560.0]).min_size([920.0, 360.0])
+        }
+        let (resizable, bounds) = shown_rect(screen, big, Vec2::new(10.0, 10.0));
+        assert!(bounds.contains_rect(resizable), "resizable window {resizable:?} leaves {bounds:?}");
+        // Ширина 1000 срезана до области (776), а не схлопнута; высоту egui у окна с изменяемым размером берёт по
+        // содержимому (здесь оно 10 pt), поэтому её здесь не проверить — ограничение то же, `max_size`.
+        assert!(resizable.width() > 700.0, "clamped to the bounds, not collapsed: {resizable:?}");
+        // Окно по размеру содержимого: ограничение не растягивает и не сдвигает его.
+        let (small, bounds) = shown_rect(screen, |w| w, Vec2::new(200.0, 100.0));
+        // Ширина не меньше ~320: окно по содержимому egui начинает с размера по умолчанию и не сужает.
+        assert!(small.width() < 400.0 && small.height() < 200.0, "{small:?}");
+        assert!((small.center() - bounds.center()).length() < 2.0, "centred: {small:?} in {bounds:?}");
+        assert!(bounds.contains_rect(small), "{small:?} in {bounds:?}");
     }
 
     #[test]

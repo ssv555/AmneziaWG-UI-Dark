@@ -91,6 +91,8 @@ Grouped by purpose.
    2. `State { events_after }` - everything the window shows (`CoreState`) and the events newer than `events_after`. The agent passes `u64::MAX` to
       read the state without events.
    3. `SetLanguage(code)` - window language (ISO 639-2 code); the core writes its event log in it and stores it in `core.ini`.
+      The agent reads the language from `core.ini` at start and re-reads it when the file changes (checked on each one-second core poll,
+      `src/daemon/agent/language.rs`); texts already written (log lines, update history) keep their language, only new ones use the new one.
 2. **Tunnel control**
    1. `Switch { tunnel, plan, multiple }` - `plan` is `Connect`, `Disconnect` or `Reconnect`. Without `multiple` the other connected tunnels are
       disconnected; with it only those that cannot run together (same address, or both route all traffic). A user command also updates
@@ -112,7 +114,8 @@ Grouped by purpose.
    4. `Footprint { tunnel, info }` - details of a mode 1 tunnel read from the native window (`None` - the config changed, old details are stale);
       the core uses them to find conflicts when connecting.
 
-`NativeOp` (inside `Native` and the agent's `TunnelRequest::Native`): `Open`, `Edit(name)`, `Import(optional file)`, `Close`.
+`NativeOp` (inside `Native` and the agent's `TunnelRequest::Native`): `Open`, `Edit(name)`, `Import(optional file)`, `Close`, `Reopen` (the same start as `Open`, in
+either mode: the window reopens the AmneziaWG window an update or restore closed, see [Updates](updates.md#rollback)).
 
 ### Responses (`Response`)
 
@@ -139,7 +142,9 @@ current core.
 
 1. **State**
    1. `Hello` - agent version; the core's watchdog uses it as the liveness probe. The window asks it for **Copy diagnostics**.
-   2. `State` - `AgentState { ping, stats }`; the window asks once a second next to the core's `State`.
+   2. `State` - `AgentState { ping, stats, native_ui }`; the window asks once a second next to the core's `State`. `native_ui` is the mark of
+      the last finished job that ran the AmneziaWG MSI (`NativeUiMark { seq, was_open }`); by it the window reopens the AmneziaWG window the MSI
+      closed ([Updates](updates.md#rollback)).
    3. `Events { after }` - the agent's event log (core events and its own) newer than a number: history when the window opens, live
       events afterwards. The answer carries `instance`, `loaded` and `core` (how far the core's log is already contained, so the window does not
       show an event twice).
@@ -149,7 +154,7 @@ current core.
 3. **Updates.** `Updates(UpdateOp)` with `State`, `Check`, `Apply(list of component and confirmed version)` and `Restore(history row)`; the answer is
    `Updates(UpdatesState)`. See [Updates](updates.md).
 4. **Tunnel configs and the native window.** `Tunnel(TunnelRequest)`: `Read`, `Write`, `Details`, `Delete` (mode 1 only; deleting a mode 2 tunnel stays in
-   the core), `Import`, `ExportAll`, `NewTunnel`, `TakeNative` (the last three mode 2 only) and `Native(NativeOp)` (mode 1 only). The agent asks the core for
+   the core), `Import`, `ExportAll`, `NewTunnel`, `TakeNative` (the last three mode 2 only) and `Native(NativeOp)` (mode 1 only, except `Reopen`). The agent asks the core for
    the mode (`Hello`) and refuses what does not fit it. Mode 2 `Write` saves only an existing tunnel: renamed or deleted by the core meanwhile -
    `Err`, nothing written (store lock: see [architecture](architecture.md)).
 

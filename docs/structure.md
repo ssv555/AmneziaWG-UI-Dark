@@ -63,7 +63,7 @@ Top-level files, by layer. Layers are explained in [modules](modules.md).
 |---|---|
 | `window.rs` | Window state: size and position, closing, settings saving, scaling, `--snapshot` |
 | `list.rs`, `list/rows.rs` | Tunnel table: columns, keyboard, group and tunnel rows, menus, drag and drop; the primary action of a tunnel (`Primary`: button, menus, tray, double click and `Enter` only connect) and the disconnect confirmation rule (`asks_first`) |
-| `details.rs`, `graph.rs`, `status.rs` | Selected tunnel details (right click on a value: Copy; private and preshared keys are never shown or copied), speed graph with ping strip, status bar |
+| `details.rs`, `graph.rs`, `status.rs` | Selected tunnel details (right click on a value: Copy; private and preshared keys are never shown or copied), speed graph with ping strip (speed scale on the right; pause button: a frozen snapshot of the graph and the ping strip for the window session, `GraphPause`, dropped when another tunnel is shown), status bar |
 | `event_log.rs` | Event log panel: severity and tunnel filter, search, copy, "Save as…"; the filter is a pure function (`visible`) |
 | `menu.rs`, `theme.rs` | Menu bar with its keyboard (`MenuNav`: F10, lone Alt, Alt+letter mnemonics, arrows and submenus, command shortcuts; window filter for `SC_KEYMENU`), the one context-menu helper (right click, Shift+F10, Menu key); theme palettes (`Palette` by role: Graphite, Slate, Daylight; the active one from `palette()`, `resolve` turns "follow Windows" into Daylight or Graphite, `Palette::visuals` builds the egui look) and fonts |
 | `a11y.rs` | Screen reader names for custom-painted elements (tunnel and group rows, speed graph, ping strip, status dots): one helper `describe` |
@@ -73,6 +73,7 @@ Top-level files, by layer. Layers are explained in [modules](modules.md).
 | `core_ui.rs` | Core install and update strip, install through one UAC prompt, mode from the core, window look per mode and theme (`apply_look`) |
 | `engine_mode.rs` | Mode 2 in the window: mode switch, import, take over from AmneziaWG, backup, new tunnel, rename |
 | `updates.rs`, `reminder.rs`, `markdown.rs` | "Updates and rollbacks" window, update reminder timing, release notes rendering |
+| `native_reopen.rs` | Reopens the AmneziaWG window an AmneziaWG update or restore closed, by the agent's `native_ui` mark |
 | `sources.rs`, `watcher.rs` | Source `.conf` files opened for editing and the config details cache |
 | `exit.rs`, `errors.rs` | Exit with the "keep the VPN" question, action errors into the event log |
 | `tray_menu.rs` | Tray menu with the tunnels (groups as submenus) and its click: the same switch request and the same primary action (`list::Primary`) as the window; a disconnect is confirmed in the window first (`list::asks_first`); without the core a note on top, tunnels unchecked and grey; a click on a tunnel notification selects the tunnel |
@@ -92,9 +93,11 @@ Top-level files, by layer. Layers are explained in [modules](modules.md).
 | `install.rs` | Install, upgrade and removal of the core service |
 | `session.rs`, `helper.rs` | Starting the helper in the user's session and the helper itself |
 | `fake.rs` | Fake core for tests |
+| `phase_trace.rs` | Test-only timing trace of the Switch path; empty in a non-test build (see [development](development.md#flaky-test-logs)) |
 | `agent/mod.rs` | Agent process: pipe server, request dispatch |
 | `agent/proto.rs`, `agent/client.rs` | Agent protocol; window-side client and request routing |
-| `agent/core_poll.rs` | One-second poll of the core state shared by statistics and the journal |
+| `agent/core_poll.rs` | One-second poll of the core state shared by the language follower, statistics and the journal |
+| `agent/language.rs` | The agent's language: the core's `language` from `core.ini`, re-read when the file changes |
 | `agent/journal.rs` | Writes `events.log` |
 | `agent/stats.rs`, `agent/ping.rs`, `agent/settings.rs` | Statistics, ping, `agent.ini` |
 | `agent/updates.rs` | Starts the update manager and forwards its log to the journal |
