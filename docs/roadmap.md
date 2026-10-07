@@ -31,11 +31,12 @@ Full per-version lists are in the [changelog](../CHANGELOG.md). Only the headlin
    Graphite; the helper process follows the program language.
 9. **0.5.4** (2026.10.07): graph range as a drop-down - 2 min, 10 min, 1 h, day, month, year - remembered between
    starts; speed history kept by the helper process; an active tunnel stands out in the list in every theme.
-
 10. **0.5.5** (2026.10.07): fixes from a full audit - Enter acts on the focused button, dialogs and the card fit the
    window at 760x480 and 200 %, readable controls in Daylight, human error texts, list columns sized to content, units
    in Latin letters; mode 1 tunnels stay wanted after a failed reconnect or an outside AmneziaWG install, journaled
    app and engine updates, interrupted AmneziaWG rollbacks keep the tunnels.
+11. **0.5.6** (2026.10.07): backups whose rows were lost from the update history (an unreadable history file, for
+   example) are shown in the history again and can be restored.
 
 ## Next
 

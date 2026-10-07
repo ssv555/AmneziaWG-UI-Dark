@@ -21,7 +21,7 @@ use super::core_link::CoreLink;
 use super::sources::{GithubSources, OursError, Sources};
 use super::{Action, Component, HistoryEntry, NativeUiMark, UpdateOp, UpdatesState, ORDER};
 use super::jsonstore::{load_json, load_or_default, rotate_logs, safe_name, save_json, set_aside};
-use super::backup::{BackupInfo, BACKUP_INFO};
+use super::backup::{adopt_orphans, BackupInfo, BACKUP_INFO};
 use super::busy::Busy;
 use super::history::{entry, History, HISTORY};
 use super::restore_target::{offers as restore_offers, resolve as resolve_restore, RestoreBlock};
@@ -160,6 +160,8 @@ impl Manager {
         m.clean_downloads();
         m.mark_interrupted();
         m.recover_components();
+        // До `tidy`: найденные копии подчиняются тем же пределам, что и остальные.
+        m.adopt_orphan_backups();
         m.tidy();
         m.announce_owed();
         m
@@ -687,6 +689,15 @@ impl Manager {
         match data.history.amend(id, error) {
             Ok(()) => self.save_history(&data.history),
             Err(e) => self.shared.log("", Severity::Warn, &e),
+        }
+    }
+
+    /// Папки копий без строки истории — снова строки (`adopt_orphans`), сохраняются сразу: следующий запуск видит их
+    /// уже строками.
+    fn adopt_orphan_backups(&self) {
+        let mut data = lock(&self.data);
+        if adopt_orphans(&mut data.history, &self.dir.join(BACKUPS), &|c| self.name(c), &self.shared) {
+            self.save_history(&data.history);
         }
     }
 
@@ -1271,6 +1282,10 @@ mod tests {
         ]
     }
 
+    fn components_of([n, e, a]: [FakeOps; 3]) -> Components {
+        components(n, e, a)
+    }
+
     fn rows_of(m: &Manager, c: Component, action: Action) -> Vec<HistoryEntry> {
         lock(&m.data).history.entries().iter().filter(|e| e.component == c && e.action == action).cloned().collect()
     }
@@ -1534,6 +1549,93 @@ mod tests {
         for p in [&h[0], &s[0]] {
             let name = p.display().to_string();
             assert!(logged.iter().any(|(sev, t)| *sev == Severity::Bad && t.contains(&name)), "{name}: {logged:?}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Папка копии `name` в хранилище `dir` с описанием `info` (`None` — без `component.json`, `Some(Err)` — испорченный).
+    fn stored_copy(dir: &Path, name: &str, info: Option<Result<(Component, &str), &str>>) -> PathBuf {
+        let copy = dir.join(BACKUPS).join(name);
+        std::fs::create_dir_all(&copy).unwrap();
+        std::fs::write(copy.join("payload"), b"12345").unwrap();
+        match info {
+            Some(Ok((component, version))) => save_json(&copy.join(BACKUP_INFO), &BackupInfo { component, version: version.into() }).unwrap(),
+            Some(Err(text)) => std::fs::write(copy.join(BACKUP_INFO), text).unwrap(),
+            None => {}
+        }
+        copy
+    }
+
+    /// Папки копий, на которые не ссылается ни одна строка (история отодвинута как нечитаемая или строки потеряны
+    /// иначе), при открытии снова становятся строками «Резервная копия» с «Вернуть»; строки сохраняются, повторное
+    /// открытие их не удваивает. Папка без годного `component.json` остаётся на диске, строкой не становится, в
+    /// журнале — предупреждение с путём.
+    #[test]
+    fn orphan_backup_folders_become_restorable_rows_once() {
+        let dir = temp("orphans");
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut known = hist(7, Component::Engine, Action::Backup, None, Some("7-engine-3.0"));
+        known.from = Some("3.0".into());
+        save_json(&dir.join(HISTORY), &vec![hist(8, Component::Engine, Action::Update, Some("3.1"), None), known]).unwrap();
+        stored_copy(&dir, "7-engine-3.0", Some(Ok((Component::Engine, "3.0"))));
+        stored_copy(&dir, "34-native-3.1.0", Some(Ok((Component::Native, "3.1.0"))));
+        stored_copy(&dir, "5-app-0.4.9", Some(Ok((Component::App, "0.4.9"))));
+        let missing = stored_copy(&dir, "40-engine-2.0", None);
+        let broken = stored_copy(&dir, "41-engine-2.1", Some(Err("{broken")));
+        std::fs::write(dir.join(BACKUPS).join("note.txt"), b"not a copy").unwrap();
+        let calls = Calls::default();
+        let m = with_ops(&dir, components_of(fakes(&calls)));
+        let ids = |m: &Manager| lock(&m.data).history.entries().iter().map(|e| e.id).collect::<Vec<_>>();
+        assert_eq!(ids(&m), vec![34, 8, 7, 5], "строки встают по номеру из имени папки, новые сверху");
+        let native = rows_of(&m, Component::Native, Action::Backup);
+        assert_eq!(native.len(), 1);
+        let n = &native[0];
+        assert_eq!((n.from.as_deref(), n.to.as_deref(), n.backup.as_deref(), n.ok), (Some("3.1.0"), None, Some("34-native-3.1.0"), true));
+        assert!(n.backup_size >= 5, "размер папки: {}", n.backup_size);
+        assert_eq!(rows_of(&m, Component::Engine, Action::Backup).len(), 1, "папка со строкой не удваивается");
+        assert_eq!(m.restore_target(34), Ok(("34-native-3.1.0".to_string(), BackupInfo { component: Component::Native, version: "3.1.0".into() })));
+        assert_eq!(m.restore_target(5).err(), Some(trf("upd.restore_too_old", &[super::super::restore_target::MIN_APP_RESTORE])), "правила возврата прежние");
+        let offered = m.state().restores;
+        assert!(offered.iter().any(|o| o.id == 34 && o.blocked.is_none()), "{offered:?}");
+        let log = logged(&m);
+        for name in ["34-native-3.1.0", "5-app-0.4.9"] {
+            assert_eq!(log.iter().filter(|(sev, t)| *sev == Severity::Warn && t.contains(name)).count(), 1, "{name}: {log:?}");
+        }
+        for path in [&missing, &broken] {
+            let path = path.display().to_string();
+            assert_eq!(log.iter().filter(|(sev, t)| *sev == Severity::Warn && t.contains(&path)).count(), 1, "{path}: {log:?}");
+            assert!(Path::new(&path).is_dir(), "папку без годного описания не удаляем: {path}");
+        }
+        assert!(!log.iter().any(|(_, t)| t.contains("7-engine-3.0") || t.contains("note.txt")), "{log:?}");
+        assert_eq!(m.next_id(), 42, "новые строки и папки не займут номера найденных папок");
+        drop(m);
+        assert_eq!(History::open(&dir).unwrap().entries().iter().map(|e| e.id).collect::<Vec<_>>(), vec![34, 8, 7, 5], "строки сохранены");
+        let again = with_ops(&dir, components_of(fakes(&calls)));
+        assert_eq!(ids(&again), vec![34, 8, 7, 5], "повторное открытие не удваивает");
+        assert!(!logged(&again).iter().any(|(_, t)| t.contains("34-native-3.1.0")), "и не пишет о возврате строк снова");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Номер из имени найденной папки уже занят строкой новой истории — строка получает свободный номер; найденные
+    /// копии подчиняются обычному пределу копий на компонент.
+    #[test]
+    fn orphan_rows_take_a_free_id_and_follow_the_backup_limit() {
+        let dir = temp("orphans-limit");
+        std::fs::create_dir_all(&dir).unwrap();
+        save_json(&dir.join(HISTORY), &vec![hist(2, Component::Native, Action::Update, Some("1.0"), None)]).unwrap();
+        for id in 1..=7 {
+            stored_copy(&dir, &backup_name(id, Component::Engine, &format!("3.{id}")), Some(Ok((Component::Engine, &format!("3.{id}")))));
+        }
+        let calls = Calls::default();
+        let m = with_ops(&dir, components_of(fakes(&calls)));
+        let engine = rows_of(&m, Component::Engine, Action::Backup);
+        let kept: Vec<_> = engine.iter().filter_map(|e| e.backup.clone()).collect();
+        assert_eq!(kept.len(), BACKUPS_MAX, "{engine:?}");
+        assert!(engine.iter().all(|e| e.id != 2), "номер 2 занят строкой AmneziaWG: {engine:?}");
+        let gone: Vec<_> = (1..=7).filter(|id| !dir.join(BACKUPS).join(backup_name(*id, Component::Engine, &format!("3.{id}"))).exists()).collect();
+        assert_eq!(gone.len(), 7 - BACKUPS_MAX, "лишние копии удалены пределом: {gone:?}");
+        for name in &kept {
+            assert!(dir.join(BACKUPS).join(name).is_dir(), "{name}");
         }
         let _ = std::fs::remove_dir_all(&dir);
     }

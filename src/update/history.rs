@@ -4,6 +4,7 @@
 
 use std::path::{Path, PathBuf};
 
+use super::backup::StoredBackup;
 use super::jsonstore::{load_json, save_json};
 use super::{Action, Component, HistoryEntry, ORDER};
 use crate::i18n::{tr, trf};
@@ -11,7 +12,8 @@ use crate::monitor::unix_now;
 
 /// Файл истории в хранилище.
 pub(super) const HISTORY: &str = "history.json";
-/// Строк истории не больше этого; папки копий отброшенных строк удаляются.
+/// Строк истории не больше этого (кроме последнего обновления каждого компонента и его точки отката, см. `trim`);
+/// папки копий отброшенных строк удаляются.
 pub(super) const HISTORY_MAX: usize = 200;
 /// Копий одного компонента не больше этого (новые по номеру строки), кроме копии перед последним обновлением
 /// или возвратом.
@@ -71,6 +73,37 @@ impl History {
         Ok(())
     }
 
+    /// Есть строка, у которой копия — папка `name`.
+    pub(super) fn references(&self, name: &str) -> bool {
+        self.entries.iter().any(|e| e.backup.as_deref() == Some(name))
+    }
+
+    /// Номера до `id` включительно больше не выдаются: номер есть в имени папки копии на диске, и новая копия с тем
+    /// же компонентом и версией попала бы в чужую папку (а при сбое удалила бы её).
+    pub(super) fn reserve_through(&mut self, id: u64) {
+        self.next = self.next.max(id.saturating_add(1));
+    }
+
+    /// Папка копии `b`, на которую не ссылается ни одна строка, снова становится строкой «Резервная копия» — с
+    /// «Вернуть» и под пределами `trim`, как любая копия. Номер — из имени папки (`backup_name`), если свободен: так
+    /// строка встаёт на своё место по времени; занят (история начата заново) — новый. Строки остаются упорядочены
+    /// по номеру, новые сверху. Возвращает номер строки; на папку уже ссылается строка — `None`.
+    pub(super) fn adopt(&mut self, b: StoredBackup) -> Option<u64> {
+        if self.references(&b.name) {
+            return None;
+        }
+        let id = match backup_id(&b.name) {
+            Some(id) if id > 0 && !self.entries.iter().any(|e| e.id == id) => id,
+            _ => self.allocate(),
+        };
+        self.reserve_through(id);
+        let mut row = entry(id, b.info.component, Action::Backup, Some(b.info.version), None).with_backup(b.name, b.size);
+        row.at = b.at;
+        let at = self.entries.iter().position(|e| e.id < id).unwrap_or(self.entries.len());
+        self.entries.insert(at, row);
+        Some(id)
+    }
+
     /// Привести прочитанные строки к допустимым сочетаниям полей (см. `HistoryEntry::repair`); по записи на каждую
     /// исправленную строку — для журнала ядра. Формат `history.json` прежний: исправляется только содержимое.
     pub(super) fn repair(&mut self) -> Vec<String> {
@@ -83,18 +116,22 @@ impl History {
     }
 
     /// Пределы истории: строки сверх `HISTORY_MAX` отбрасываются, у копий сверх `BACKUPS_MAX` снимается `backup`.
-    /// Возвращает папки копий для удаления. Копия перед последним обновлением или возвратом компонента не
-    /// удаляется никогда, даже если её строка ушла за `HISTORY_MAX`.
+    /// Возвращает папки копий для удаления. Последнее обновление или возврат компонента и копия перед ним (точка
+    /// отката) остаются строками и за `HISTORY_MAX`: папка без строки стала бы сиротой, которую `adopt` при каждом
+    /// открытии возвращал бы снова, а «Вернуть» у последнего обновления пропала бы.
     pub(super) fn trim(&mut self) -> Vec<String> {
-        let in_use: Vec<String> = ORDER.iter().filter_map(|c| backup_in_use(&self.entries, *c).map(str::to_string)).collect();
-        let cut = self.entries.len().min(HISTORY_MAX);
-        let (kept, dropped) = self.entries.split_at(cut);
-        let mut pruned: Vec<String> = dropped
-            .iter()
-            .filter_map(|e| e.backup.clone())
-            .filter(|b| !in_use.contains(b) && !kept.iter().any(|e| e.backup.as_ref() == Some(b)))
-            .collect();
-        self.entries.truncate(cut);
+        let keep: Vec<u64> = ORDER.iter().flat_map(|c| rollback_rows(&self.entries, *c)).collect();
+        let (mut kept, mut dropped) = (Vec::new(), Vec::new());
+        for (i, e) in std::mem::take(&mut self.entries).into_iter().enumerate() {
+            if i < HISTORY_MAX || keep.contains(&e.id) {
+                kept.push(e);
+            } else {
+                dropped.push(e);
+            }
+        }
+        let mut pruned: Vec<String> =
+            dropped.iter().filter_map(|e| e.backup.clone()).filter(|b| !kept.iter().any(|e| e.backup.as_ref() == Some(b))).collect();
+        self.entries = kept;
         let excess = excess_backups(&self.entries);
         for e in self.entries.iter_mut() {
             if e.backup.as_ref().map_or(false, |b| excess.contains(b)) {
@@ -207,12 +244,29 @@ fn excess_backups(history: &[HistoryEntry]) -> Vec<String> {
 /// Копия, сделанная перед последним обновлением или возвратом компонента (последняя копия с меньшим номером
 /// строки), — точка отката к прежней версии.
 fn backup_in_use(history: &[HistoryEntry], c: Component) -> Option<&str> {
-    let last = history.iter().filter(|e| e.component == c && e.action != Action::Backup).map(|e| e.id).max()?;
-    history
-        .iter()
-        .filter(|e| e.component == c && e.id < last && e.backup.is_some())
-        .max_by_key(|e| e.id)
-        .and_then(|e| e.backup.as_deref())
+    rollback_point(history, c).and_then(|e| e.backup.as_deref())
+}
+
+/// Строка копии `backup_in_use`.
+fn rollback_point(history: &[HistoryEntry], c: Component) -> Option<&HistoryEntry> {
+    let last = last_change(history, c)?;
+    history.iter().filter(|e| e.component == c && e.id < last && e.backup.is_some()).max_by_key(|e| e.id)
+}
+
+/// Номер последней строки обновления или возврата компонента.
+fn last_change(history: &[HistoryEntry], c: Component) -> Option<u64> {
+    history.iter().filter(|e| e.component == c && e.action != Action::Backup).map(|e| e.id).max()
+}
+
+/// Строки компонента, которые `trim` не отбрасывает и за `HISTORY_MAX`: последнее обновление или возврат и его точка
+/// отката.
+fn rollback_rows(history: &[HistoryEntry], c: Component) -> Vec<u64> {
+    last_change(history, c).into_iter().chain(rollback_point(history, c).map(|e| e.id)).collect()
+}
+
+/// Номер строки из имени папки копии (`backup_name`: `<номер>-<компонент>-<версия>`); имя не того вида — `None`.
+pub(super) fn backup_id(name: &str) -> Option<u64> {
+    name.split('-').next().and_then(|n| n.parse().ok())
 }
 
 #[cfg(test)]
@@ -241,11 +295,51 @@ mod tests {
             h.push(hist(id, Component::Engine, Action::Update, None, None));
         }
         let pruned = h.trim();
-        assert_eq!(h.entries().len(), HISTORY_MAX);
+        // Последнее обновление программы и его точка отката остаются строками и за пределом: иначе папка копии
+        // осталась бы без строки (сирота, которую открытие возвращало бы каждый раз), а «Вернуть» у обновления пропала бы.
+        assert_eq!(h.entries().len(), HISTORY_MAX + 2);
+        let tail: Vec<u64> = h.entries()[HISTORY_MAX..].iter().map(|e| e.id).collect();
+        assert_eq!(tail, vec![2, 1]);
         assert_eq!(h.entries()[0].id, (HISTORY_MAX + 5) as u64, "новые сверху");
         assert_eq!(h.allocate(), (HISTORY_MAX + 6) as u64);
         assert_eq!(pruned, vec!["3-native-1".to_string()], "папка отброшенной строки удаляется");
         assert!(!pruned.contains(&"1-app-0.1".to_string()), "копия перед последним обновлением программы — никогда");
+        assert!(h.trim().is_empty(), "второй проход ничего не удаляет");
+        assert_eq!(h.entries().len(), HISTORY_MAX + 2, "и строк не отбрасывает");
+    }
+
+    /// Найденная папка без строки становится строкой «Резервная копия» на месте по номеру из имени; номер занят или
+    /// имя не того вида — новый номер; папка, на которую есть строка, не удваивается.
+    #[test]
+    fn adopted_backup_rows_keep_id_order_and_skip_referenced_folders() {
+        let stored = |name: &str, component, version: &str| StoredBackup {
+            name: name.into(),
+            info: crate::update::backup::BackupInfo { component, version: version.into() },
+            at: 77,
+            size: 5,
+        };
+        let mut h = History::empty(Path::new("none"));
+        let mut known = hist(3, Component::Engine, Action::Backup, None, Some("3-engine-1"));
+        known.from = Some("1".into());
+        h.push(known);
+        h.push(hist(9, Component::Engine, Action::Update, Some("2"), None));
+        assert_eq!(h.adopt(stored("3-engine-1", Component::Engine, "1")), None, "на папку есть строка");
+        assert_eq!(h.adopt(stored("5-native-1.0", Component::Native, "1.0")), Some(5));
+        assert_eq!(h.adopt(stored("9-app-0.5.1", Component::App, "0.5.1")), Some(10), "номер занят — следующий свободный");
+        assert_eq!(h.adopt(stored("copy", Component::App, "0.5.2")), Some(11), "имя без номера — новый номер");
+        assert_eq!(h.adopt(stored("5-native-1.0", Component::Native, "1.0")), None, "второй раз не добавляется");
+        assert_eq!(h.entries().iter().map(|e| e.id).collect::<Vec<_>>(), vec![11, 10, 9, 5, 3], "по номеру, новые сверху");
+        let row = h.entries().iter().find(|e| e.id == 5).unwrap().clone();
+        assert_eq!(
+            (row.component, row.action, row.from.as_deref(), row.to.as_deref(), row.backup.as_deref(), row.backup_size, row.at, row.ok),
+            (Component::Native, Action::Backup, Some("1.0"), None, Some("5-native-1.0"), 5, 77, true)
+        );
+        assert!(h.repair().is_empty(), "строка собрана как обычная строка копии");
+        assert_eq!(h.allocate(), 12);
+        h.reserve_through(40);
+        assert_eq!(h.allocate(), 41, "номера папок на диске не выдаются");
+        assert_eq!(backup_id("34-native-3.1.0"), Some(34));
+        assert_eq!(backup_id("native"), None);
     }
 
     #[test]

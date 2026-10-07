@@ -87,7 +87,12 @@ Nothing is installed before every check below passes.
    success, error text and `prior_backup`. A file that cannot be parsed is moved aside as `history.json.unreadable-<date>` (the same for `state.json`),
    reported in the event log with the new name, and the history starts empty: the rows with the backup names stay in the moved file instead of being
    overwritten by the next job. Rows with impossible field combinations are repaired and each repair is logged.
-3. Limits, applied after every job and at start: at most 200 rows, at most 5 backups per component (the oldest by row number go first, **except** the backup made
+   At start every folder in `backups\` with a valid `component.json` that no row refers to (rows lost with an unreadable file, for example) becomes a
+   `Backup` row again (`adopt_orphans` in `src/update/backup.rs`, `History::adopt` in `src/update/history.rs`): the row number comes from the folder name if it is free, otherwise a new one; the rows
+   are saved at once and each one is logged. A folder without a valid `component.json` is left untouched, is not offered and is logged with its path.
+   Row numbers found in folder names are never given to new rows.
+3. Limits, applied after every job and at start: at most 200 rows (the last update or restore of each component and the backup before it
+   stay even beyond that), at most 5 backups per component (the oldest by row number go first, **except** the backup made
    before the last update or restore of that component, which is never deleted), at most 20 `msiexec` logs. Backup folders of dropped rows are deleted.
 4. The **Restore** button of a row goes to (`src/update/restore_target.rs`; one rule for the window and for the command):
    1. a `Backup` row: its own copy;

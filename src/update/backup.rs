@@ -6,13 +6,14 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use super::busy::Busy;
-use super::history::entry;
-use super::jsonstore::{backup_name, dir_size, save_json};
+use super::history::{backup_id, entry, History};
+use super::jsonstore::{backup_name, dir_size, load_json, safe_name, save_json};
 use super::manager::{Manager, BACKUPS, DOWNLOADS};
 use super::{feed, native, sign};
 use super::{Action, Component};
 use crate::events::Severity;
-use crate::i18n::trf;
+use crate::i18n::{tr, trf};
+use crate::monitor::{unix_now, Shared};
 
 /// Предел загрузки MSI AmneziaWG, байт (DLL и exe наших релизов ограничивает `ours`).
 const MSI_MAX: u64 = 64 * 1024 * 1024;
@@ -29,6 +30,69 @@ pub(super) const CONFIGS: &str = "configs";
 pub(super) struct BackupInfo {
     pub(super) component: Component,
     pub(super) version: String,
+}
+
+/// Папка копии на диске с её описанием: из неё `History::adopt` собирает строку «Резервная копия».
+pub(super) struct StoredBackup {
+    pub(super) name: String,
+    pub(super) info: BackupInfo,
+    /// Когда копия закончена: время изменения `component.json` (его `Manager::backup` пишет последним).
+    pub(super) at: u64,
+    pub(super) size: u64,
+}
+
+/// Папки копий, на которые не ссылается ни одна строка истории (история отодвинута как нечитаемая, строки потеряны
+/// иначе), снова становятся строками (`History::adopt`): по событию в журнале на каждую. Папка без `component.json`
+/// или с испорченным не трогается (в ней может быть то, что владельцу ещё нужно) и строкой не становится —
+/// предупреждение с путём. Номера всех папок копий с этого момента не выдаются (`History::reserve_through`).
+/// `name_of` — имя компонента для журнала. Возвращает, добавлены ли строки (тогда историю нужно сохранить).
+pub(super) fn adopt_orphans(history: &mut History, backups: &Path, name_of: &dyn Fn(Component) -> String, shared: &Shared) -> bool {
+    let list = match std::fs::read_dir(backups) {
+        Ok(list) => list,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return false,
+        Err(e) => {
+            shared.log("", Severity::Bad, &crate::fsutil::io_ctx(backups, e));
+            return false;
+        }
+    };
+    // Файлы в `backups` — не копии (копия всегда папка), их не касаемся.
+    let mut dirs: Vec<PathBuf> = list.flatten().filter(|e| e.file_type().map_or(false, |t| t.is_dir())).map(|e| e.path()).collect();
+    // Порядок по номеру: свободный номер для занятого достаётся папкам одинаково при каждом открытии.
+    dirs.sort_by_key(|p| (p.file_name().and_then(|n| n.to_str()).and_then(backup_id), p.clone()));
+    for id in dirs.iter().filter_map(|p| p.file_name().and_then(|n| n.to_str()).and_then(backup_id)) {
+        history.reserve_through(id);
+    }
+    let mut adopted = false;
+    for dir in dirs {
+        let name = dir.file_name().and_then(|n| n.to_str()).map(str::to_string);
+        if name.as_deref().map_or(false, |n| history.references(n)) {
+            continue;
+        }
+        match stored_backup(&dir, name) {
+            Ok(b) => {
+                let (component, version, name) = (b.info.component, b.info.version.clone(), b.name.clone());
+                if let Some(id) = history.adopt(b) {
+                    adopted = true;
+                    shared.log("", Severity::Warn, &trf("updm.backup_adopted", &[&name, &name_of(component), &version, &id.to_string()]));
+                }
+            }
+            Err(why) => shared.log("", Severity::Warn, &trf("updm.backup_not_adopted", &[&dir.display().to_string(), &why])),
+        }
+    }
+    adopted
+}
+
+/// Папка копии `dir` с именем `name` (`None` — имя не UTF-8) и годным описанием.
+fn stored_backup(dir: &Path, name: Option<String>) -> Result<StoredBackup, String> {
+    let name = name.filter(|n| safe_name(n)).ok_or_else(|| tr("updm.backup_bad_name"))?;
+    let file = dir.join(BACKUP_INFO);
+    let info: BackupInfo = load_json(&file)?;
+    let at = std::fs::metadata(&file)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map_or_else(unix_now, |d| d.as_secs());
+    Ok(StoredBackup { name, info, at, size: dir_size(dir) })
 }
 
 impl Manager {
