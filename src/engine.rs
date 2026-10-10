@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use windows_sys::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryExW, LOAD_WITH_ALTERED_SEARCH_PATH};
 use windows_sys::Win32::System::Services::{
-    ChangeServiceConfig2W, CreateServiceW, SERVICE_ALL_ACCESS, SERVICE_AUTO_START, SERVICE_CHANGE_CONFIG, SERVICE_CONFIG_DESCRIPTION,
+    ChangeServiceConfig2W, CreateServiceW, SERVICE_ALL_ACCESS, SERVICE_AUTO_START, SERVICE_CONFIG_DESCRIPTION,
     SERVICE_CONFIG_SERVICE_SID_INFO, SERVICE_DESCRIPTIONW, SERVICE_ERROR_NORMAL, SERVICE_QUERY_STATUS, SERVICE_SID_INFO,
     SERVICE_SID_TYPE_UNRESTRICTED, SERVICE_WIN32_OWN_PROCESS,
 };
@@ -213,7 +213,12 @@ pub fn connect(conf: &Path) -> Result<(), String> {
     }
     match owner(&tunnel) {
         Owner::Foreign => return Err(trf("eng.name_taken", &[&tunnel])),
-        Owner::Ours => disconnect(&tunnel)?,
+        Owner::Ours => {
+            if let Some(done) = join_starting(&tunnel) {
+                return done;
+            }
+            disconnect(&tunnel)?
+        }
         Owner::Free => {}
     }
     let exe = deploy()?;
@@ -254,6 +259,29 @@ pub fn connect(conf: &Path) -> Result<(), String> {
     }
 }
 
+/// Своя служба туннеля, которую диспетчер уже поднимает сам (`wait_if_starting`). Не открылась — `None`: путь обычный,
+/// ошибку скажет пересоздание.
+fn join_starting(tunnel: &str) -> Option<Result<(), String>> {
+    let svc = Handle::scm_connect().and_then(|scm| Service::open(&scm, tunnel, SERVICE_QUERY_STATUS)).ok()?;
+    wait_if_starting(&svc, tunnel, START_TIMEOUT)
+}
+
+/// Служба в `StartPending` (Windows запустила её при загрузке, а `tunnel.dll` в начале загрузки ждёт сети) — дождаться
+/// `Running`, а не пересоздавать: остановку в `StartPending` служба не принимает, и пересоздание оставляло её работающей,
+/// но помеченной на удаление (`stop_and_delete`), с ошибкой «не остановился вовремя». Поднялась — `Ok`, туннель наш;
+/// всё ещё поднимается — ошибка без остановки и удаления (следующую попытку назначит надзор). `None` — служба не
+/// поднимается или за время ожидания остановилась: путь обычный, пересоздать.
+fn wait_if_starting(svc: &dyn ServiceControl, tunnel: &str, timeout: Duration) -> Option<Result<(), String>> {
+    if svc.query().ok()?.state != State::StartPending {
+        return None;
+    }
+    match svc.wait_state(State::Running, timeout) {
+        Ok(()) => Some(Ok(())),
+        Err(st) if st.state == State::StartPending => Some(Err(trf("eng.still_starting", &[tunnel, &timeout.as_secs().to_string()]))),
+        Err(_) => None,
+    }
+}
+
 /// Запустить только что созданную службу туннеля и дождаться `Running`. Не запустилась или не поднялась за
 /// `timeout` — остановить и удалить: иначе туннель мог бы подняться уже после сообщения об ошибке, а имя осталось бы занятым.
 fn start_or_remove(svc: &dyn ServiceControl, tunnel: &str, timeout: Duration) -> Result<(), String> {
@@ -288,7 +316,7 @@ pub fn clear_restart_on_failure() -> Vec<(String, String)> {
         Ok(tunnels) => tunnels,
         Err(e) => return vec![(String::new(), e.to_string())],
     };
-    clear_each(&tunnels, |t| has_service(t).then(|| Handle::scm_connect().and_then(|scm| Service::open(&scm, t, SERVICE_CHANGE_CONFIG))))
+    clear_each(&tunnels, |t| has_service(t).then(|| Handle::scm_connect().and_then(|scm| Service::open(&scm, t, crate::scm::failure_actions_access(&[])))))
 }
 
 /// `open` — служба туннеля, `None` — своей службы у него нет.
@@ -449,6 +477,40 @@ mod tests {
         assert!(text.contains("office") && text.contains("1168"), "{text}");
         assert_eq!(exit_text("office", &st(State::Stopped, 0, 0)), None, "остановлена штатно");
         assert_eq!(exit_text("office", &st(State::Running, 0, 0)), None);
+    }
+
+    /// Загрузка Windows: служба туннеля уже поднимается сама (`tunnel.dll` при загрузке ждёт сети), а надзор пришёл с
+    /// попыткой. Остановку служба в `StartPending` не принимает: пересоздание оставляло её работающей, но помеченной на
+    /// удаление («не остановился вовремя» при каждой загрузке). Дождаться — и она наша, без остановки и удаления.
+    #[test]
+    fn connect_waits_for_a_service_windows_is_starting() {
+        let svc = FakeService::starting(Status::new(State::Running), 3);
+        assert_eq!(wait_if_starting(&svc, "office", Duration::from_secs(5)), Some(Ok(())));
+        assert!(svc.calls().is_empty(), "не останавливается и не удаляется: {:?}", svc.calls());
+    }
+
+    #[test]
+    fn a_service_still_starting_after_the_wait_is_left_alone() {
+        let svc = FakeService::in_state(State::StartPending);
+        let e = wait_if_starting(&svc, "office", SHORT).expect("ждали").unwrap_err();
+        assert!(e.contains("office"), "{e}");
+        assert!(svc.calls().is_empty(), "остановка не принимается, удаление сделало бы зомби: {:?}", svc.calls());
+    }
+
+    #[test]
+    fn a_starting_service_that_stops_is_recreated() {
+        let died = Status { state: State::Stopped, win32_exit: 1066, specific_exit: 7 };
+        let svc = FakeService::starting(died, 2);
+        assert_eq!(wait_if_starting(&svc, "office", Duration::from_secs(5)), None, "обычный путь: пересоздать");
+    }
+
+    #[test]
+    fn running_or_stopped_services_take_the_usual_path_without_waiting() {
+        for state in [State::Running, State::Stopped, State::StopPending] {
+            let svc = FakeService::in_state(state);
+            assert_eq!(wait_if_starting(&svc, "office", Duration::from_secs(60)), None, "{state:?}");
+            assert_eq!(svc.queries.get(), 1, "{state:?}: спрошено один раз");
+        }
     }
 
     #[test]

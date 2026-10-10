@@ -232,6 +232,7 @@ const STRINGS: &[(&str, &str, &str)] = &[
     ("eng.service_desc", "Tunnel of the built-in AmneziaWG engine (AmneziaWG UI Dark)", "Туннель встроенного движка AmneziaWG (AmneziaWG UI Dark)"),
     ("eng.start_failed", "Tunnel {0} did not start (code {1}, engine code {2})", "Туннель {0} не запустился (код {1}, код движка {2})"),
     ("eng.stop_failed", "Tunnel {0} did not stop in time", "Туннель {0} не остановился вовремя"),
+    ("eng.still_starting", "Windows is still starting the service of tunnel {0} (more than {1} s); it is left as is", "Windows всё ещё запускает службу туннеля {0} (дольше {1} с); она оставлена как есть"),
     ("eng.no_engine_build", "this build has no built-in engine", "в этой сборке нет встроенного движка"),
     ("eng.untrusted", "{0} differs from the file this build was made with — it will not be given to the tunnel service", "{0} отличается от файла, с которым собрана программа, — службе туннеля он не передаётся"),
     ("core.menu", "Core (service)", "Ядро (служба)"),

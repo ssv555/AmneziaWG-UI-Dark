@@ -51,7 +51,10 @@ A tunnel in the set that is not running gets a track (`Track`) with its own sche
    2. A later drop: the first attempt after 10 s.
    3. `Retry` from the window or a returned lease: at once, schedule from the beginning.
 3. **Attempt.** The ordinary `Switch` with `Connect` (origin "retry"), under the core's `switching` lock. It does nothing if the tunnel is already
-   running, is no longer desired or is held; the next tick decides what follows.
+   running, is no longer desired or is held; the next tick decides what follows. In mode 2, if the tunnel's own service is still starting (`StartPending`:
+   Windows started it at boot and `tunnel.dll` may wait for the network), the attempt waits for it up to 25 s instead of recreating it
+   (`engine::wait_if_starting`): such a service does not accept a stop, and recreating it used to leave it running but marked for deletion. Still starting
+   after the wait - the attempt fails without touching the service; stopped meanwhile - the service is recreated as usual.
 4. **Confirmation.** A started service is not yet "connected": `tunnel.dll` reports "running" before the interface addresses are set, and that step can still
    fail (`Element not found`, code 1168), after which the service stops within a fraction of a second. The tunnel is marked connected only after `CONFIRM_FOR`;
    a stop before that counts as a failed attempt with the service's stop reason (or "the tunnel stopped right after start"), and the schedule goes on.
@@ -59,7 +62,8 @@ A tunnel in the set that is not running gets a track (`Track`) with its own sche
    "Connected" logged.
 6. **No new decisions when the list of running tunnels cannot be read**; attempts already due still go and their errors reach the log.
 7. **Ownership of reconnects.** In mode 2 the core removes the Windows "restart on failure" action of the tunnel services on mode preparation
-   (`engine::clear_restart_on_failure`): two mechanisms would recreate one service against each other.
+   (`engine::clear_restart_on_failure`): two mechanisms would recreate one service against each other. A service already marked for deletion is skipped
+   silently: the service manager never restarts it.
 
 ## Network change
 

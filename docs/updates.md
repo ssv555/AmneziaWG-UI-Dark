@@ -169,7 +169,8 @@ Nothing is installed before every check below passes.
 `src/update/ours/fallback.rs`. The helper runs only as SYSTEM (otherwise exit code 2).
 
 1. First it turns the service manager's restart-on-failure actions of the core service off and turns them back on at every exit (the core also re-applies them
-   when it reaches "running", `install::reapply_failure_actions`, in case the helper was killed): otherwise, after the first failed start of the new build, the
+   when it reaches "running", `install::reapply_failure_actions`, in case the helper was killed; the service is opened with the change-config and start rights, as
+   `ChangeServiceConfig2` requires for restart actions, `scm::failure_actions_access`): otherwise, after the first failed start of the new build, the
    service manager would start it again on its own 5 s later - concurrently with the helper's retries, in the middle of the file rollback or the previous build
    before the history is written. Then, after 2 s, it stops the core service (waits up to 30 s) and starts it again: up to 4 attempts, 5 s apart, each waiting
    up to 30 s for the "running" state, which the core reports only after its own pipe answers `Hello` with the same version.

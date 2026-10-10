@@ -15,9 +15,9 @@ use windows_sys::Win32::Foundation::{
 };
 use windows_sys::Win32::System::Services::{
     ChangeServiceConfig2W, CloseServiceHandle, ControlService, DeleteService, OpenSCManagerW, OpenServiceW,
-    QueryServiceStatus, StartServiceW, SC_ACTION, SC_ACTION_NONE, SC_HANDLE, SC_MANAGER_ALL_ACCESS, SC_MANAGER_CONNECT,
-    SERVICE_CONFIG_FAILURE_ACTIONS, SERVICE_CONFIG_FAILURE_ACTIONS_FLAG, SERVICE_CONTROL_STOP, SERVICE_FAILURE_ACTIONSW,
-    SERVICE_FAILURE_ACTIONS_FLAG, SERVICE_RUNNING, SERVICE_START_PENDING, SERVICE_STATUS, SERVICE_STOPPED,
+    QueryServiceStatus, StartServiceW, SC_ACTION, SC_ACTION_NONE, SC_ACTION_RESTART, SC_HANDLE, SC_MANAGER_ALL_ACCESS, SC_MANAGER_CONNECT,
+    SERVICE_CHANGE_CONFIG, SERVICE_CONFIG_FAILURE_ACTIONS, SERVICE_CONFIG_FAILURE_ACTIONS_FLAG, SERVICE_CONTROL_STOP, SERVICE_FAILURE_ACTIONSW,
+    SERVICE_FAILURE_ACTIONS_FLAG, SERVICE_RUNNING, SERVICE_START, SERVICE_START_PENDING, SERVICE_STATUS, SERVICE_STOPPED,
     SERVICE_STOP_PENDING,
 };
 
@@ -82,6 +82,7 @@ pub(crate) trait ServiceControl {
     fn delete(&self) -> Result<(), String>;
     fn query(&self) -> Result<Status, String>;
     /// Убрать действия диспетчера при сбое (перезапуск и прочее). Повторы туннелей ведёт ядро (`daemon::retry`).
+    /// Служба помечена на удаление — не ошибка: её диспетчер уже не перезапустит.
     fn clear_failure_actions(&self) -> Result<(), String>;
 
     /// Ждать состояния `want`; служба остановилась раньше (при ожидании не-остановки) или вышло время — последнее
@@ -266,11 +267,28 @@ impl ServiceControl for Service {
         let none = no_failure_actions(&mut placeholder);
         unsafe {
             if ChangeServiceConfig2W(self.handle.0, SERVICE_CONFIG_FAILURE_ACTIONS, (&none as *const SERVICE_FAILURE_ACTIONSW).cast()) == 0 {
-                return Err(self.fail("clear failure actions"));
+                let code = GetLastError();
+                if !clear_tolerated(code) {
+                    return Err(format!("clear failure actions {}: {}", self.name, std::io::Error::from_raw_os_error(code as i32)));
+                }
             }
         }
         Ok(())
     }
+}
+
+/// Код ошибки снятия действий при сбое, при котором снимать нечего: служба помечена на удаление (например, её не
+/// удалось остановить при отключении, `engine::stop_and_delete`) — такую диспетчер уже не перезапустит, она исчезнет,
+/// как только остановится.
+fn clear_tolerated(code: u32) -> bool {
+    code == ERROR_SERVICE_MARKED_FOR_DELETE
+}
+
+/// Права дескриптора службы для `set_failure_actions` с этими `actions`: смена настроек, а при действии «перезапуск» —
+/// ещё и запуск (требование `ChangeServiceConfig2`; без него — `ERROR_ACCESS_DENIED`, хотя открыть службу удалось).
+pub(crate) fn failure_actions_access(actions: &[SC_ACTION]) -> u32 {
+    let restarts = actions.iter().any(|a| a.Type == SC_ACTION_RESTART);
+    SERVICE_CHANGE_CONFIG | if restarts { SERVICE_START } else { 0 }
 }
 
 /// Действия диспетчера при сбое службы: `actions` по очереди (после последнего повторяется последнее), счётчик сбоев
@@ -347,6 +365,14 @@ pub(crate) mod fake {
                 calls: RefCell::new(Vec::new()),
                 queries: Cell::new(0),
             }
+        }
+
+        /// Служба, которую уже поднимает сам диспетчер (запуск при загрузке): `StartPending`, через `lag` опросов —
+        /// `target`.
+        pub(crate) fn starting(target: Status, lag: u32) -> FakeService {
+            let svc = FakeService::in_state(State::StartPending);
+            svc.pending.set(Some((lag, target)));
+            svc
         }
 
         pub(crate) fn calls(&self) -> Vec<&'static str> {
@@ -510,6 +536,26 @@ mod tests {
         assert!(stop_tolerated(ERROR_SERVICE_CANNOT_ACCEPT_CTRL));
         assert!(!stop_tolerated(ERROR_ACCESS_DENIED));
         assert!(!stop_tolerated(ERROR_SERVICE_REQUEST_TIMEOUT));
+    }
+
+    /// Действие «перезапуск» диспетчер ставит только по дескриптору с правом запуска: со сменой настроек одной
+    /// `ChangeServiceConfig2` отвечает «отказано в доступе» (так ядро и не могло вернуть себе действия при сбое).
+    #[test]
+    fn restart_actions_need_the_start_right_on_the_handle() {
+        let restart = [SC_ACTION { Type: SC_ACTION_RESTART, Delay: 5000 }];
+        assert_eq!(failure_actions_access(&restart), SERVICE_CHANGE_CONFIG | SERVICE_START);
+        let none = [SC_ACTION { Type: SC_ACTION_NONE, Delay: 0 }];
+        assert_eq!(failure_actions_access(&none), SERVICE_CHANGE_CONFIG, "без перезапуска право запуска не просится");
+        assert_eq!(failure_actions_access(&[]), SERVICE_CHANGE_CONFIG, "снятие действий");
+    }
+
+    /// Служба, помеченная на удаление, диспетчером уже не перезапускается: снимать нечего, это не ошибка.
+    #[test]
+    fn clearing_actions_of_a_service_marked_for_deletion_is_not_an_error() {
+        use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_SERVICE_DOES_NOT_EXIST};
+        assert!(clear_tolerated(ERROR_SERVICE_MARKED_FOR_DELETE));
+        assert!(!clear_tolerated(ERROR_ACCESS_DENIED));
+        assert!(!clear_tolerated(ERROR_SERVICE_DOES_NOT_EXIST));
     }
 
     #[test]

@@ -40,6 +40,9 @@ Full per-version lists are in the [changelog](../CHANGELOG.md). Only the headlin
 12. **0.5.7** (2026.10.10): when the video driver is reset or reinstalled, the window starts itself again (hidden in the
    tray if it was hidden, at most 3 times in 10 minutes) instead of closing; `crash.log` names the video adapter, the
    driver and the relaunch outcome.
+13. **0.5.8** (2026.10.10): the core really re-applies its restart-on-failure actions at start (no more "Access is
+   denied" warning); after a reboot it waits for a tunnel service that Windows is still starting instead of tearing it
+   down.
 
 ## Next
 

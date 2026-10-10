@@ -1,5 +1,4 @@
 /target
-*.local.md
 /engine/.deps
 /engine/.src
 /engine/out

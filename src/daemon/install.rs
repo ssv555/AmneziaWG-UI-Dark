@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use windows_sys::Win32::System::Services::{
     ChangeServiceConfig2W, ChangeServiceConfigW, CreateServiceW, SC_ACTION, SC_ACTION_RESTART, SERVICE_ALL_ACCESS,
-    SERVICE_AUTO_START, SERVICE_CHANGE_CONFIG, SERVICE_CONFIG_DESCRIPTION, SERVICE_DESCRIPTIONW, SERVICE_ERROR_NORMAL,
+    SERVICE_AUTO_START, SERVICE_CONFIG_DESCRIPTION, SERVICE_DESCRIPTIONW, SERVICE_ERROR_NORMAL,
     SERVICE_NO_CHANGE, SERVICE_WIN32_OWN_PROCESS,
 };
 
@@ -226,8 +226,13 @@ fn cleanup_allowed(outcome: crate::update::ours::swap::Recovery) -> bool {
 /// Поднявшееся ядро ставит действия при сбое своей службы заново: помощник `--restart-core`, снятый посреди работы,
 /// оставил бы службу без перезапуска при сбое до следующей установки.
 pub(crate) fn reapply_failure_actions() -> Result<(), String> {
-    let svc = Service::open(&Handle::scm_connect()?, SERVICE, SERVICE_CHANGE_CONFIG)?;
+    let svc = Service::open(&Handle::scm_connect()?, SERVICE, reapply_access())?;
     set_core_failure_actions(&svc)
+}
+
+/// Права, с которыми старт ядра открывает свою службу, чтобы поставить действия при сбое (`set_core_failure_actions`).
+fn reapply_access() -> u32 {
+    crate::scm::failure_actions_access(&failure_actions())
 }
 
 /// Запустить службу ядра и дождаться `Running`.
@@ -324,6 +329,15 @@ mod tests {
             assert_eq!(a.Delay, 5000);
         }
         assert_eq!(RESET_PERIOD, 86_400);
+    }
+
+    /// Старт ядра ставит действия при сбое заново (`reapply_failure_actions`): дескриптор только со сменой настроек
+    /// давал «отказано в доступе» при каждом старте — действия «перезапуск» требуют и права запуска.
+    #[test]
+    fn reapplying_core_failure_actions_opens_the_service_with_the_start_right() {
+        use windows_sys::Win32::System::Services::{SERVICE_CHANGE_CONFIG, SERVICE_START};
+        assert_eq!(reapply_access() & SERVICE_CHANGE_CONFIG, SERVICE_CHANGE_CONFIG);
+        assert_eq!(reapply_access() & SERVICE_START, SERVICE_START);
     }
 
     use crate::scm::fake::{FakeService, Reaction};
