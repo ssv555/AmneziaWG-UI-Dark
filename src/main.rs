@@ -54,7 +54,7 @@ fn window_title() -> String {
 }
 
 const USAGE: &str =
-    "awg-ui [--tray] [--demo] [--about] [--snapshot file.png] | --install-core | --uninstall-core | --status | --autostart on|off";
+    "awg-ui [--tray] [--demo] [--about] [--snapshot file.png] [--after-crash pid] | --install-core | --uninstall-core | --status | --autostart on|off";
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -254,6 +254,9 @@ fn main() {
     }
     // После самообновления окна: дождаться выхода прежнего процесса, убрать его отодвинутый exe.
     update::ours::window_startup_cleanup();
+    // Перезапуск после сбоя видеоадаптера: прежнее окно ещё выходит и держит мьютекс одного экземпляра — дождаться его
+    // до проверки ниже, иначе новое окно приняло бы умирающее за уже открытое и вышло.
+    let after_crash = crash::relaunch::take_after_crash(&args);
     if !demo && snapshot.is_none() && win::another_instance(&window_title()) {
         return;
     }
@@ -300,9 +303,20 @@ fn main() {
         }
     }
     let options = eframe::NativeOptions { viewport, renderer: eframe::Renderer::Wgpu, ..Default::default() };
-    let start = app::Start { settings, settings_path, base_dir: dir, hidden: has("--tray"), snapshot_file: snapshot, demo, about: has("--about"), settings_problem };
+    let relaunched = after_crash.is_some();
+    let start = app::Start {
+        settings,
+        settings_path,
+        base_dir: dir,
+        hidden: has(crash::relaunch::TRAY_FLAG),
+        snapshot_file: snapshot,
+        demo,
+        about: has("--about"),
+        settings_problem,
+        after_crash,
+    };
     if let Err(e) = eframe::run_native(APP_TITLE, options, Box::new(move |cc| Ok(Box::new(app::App::new(cc, shared, start))))) {
-        crash::report_window_failure(&log_dir, &e.to_string(), "crash.start");
+        crash::report_start_failure(&log_dir, &e.to_string(), relaunched);
     }
 }
 

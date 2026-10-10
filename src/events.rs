@@ -1,6 +1,6 @@
 //! Журнал событий: подключения, отключения, потеря и восстановление связи.
 //! В памяти — последние записи для окна; на диске — `events.log` в корзине логов
-//! (`C:\tmp\<пользователь>\awg-ui\logs\`), ротация при 1 МиБ.
+//! (`C:\Temp\<пользователь>\awg-ui\logs\`), ротация при 1 МиБ.
 //!
 //! Файл ведёт только агент (`daemon::agent::journal`): он забирает события ядра по курсору (`Cursor`) и дописывает
 //! их вместе со своими; у ядра журнал только в памяти. Файл пишет отдельный поток `events-writer`
@@ -95,7 +95,7 @@ impl Event {
     }
 
     /// То же событие с местом в журнале ядра.
-    pub fn from_core(self, origin: Origin) -> Event {
+    pub fn with_origin(self, origin: Origin) -> Event {
         Event { origin: Some(origin), ..self }
     }
 
@@ -664,7 +664,7 @@ mod tests {
         let path = dir.join("events.log");
         let mut log = EventLog::open(Some(path.clone()));
         let origin = Origin { instance: 42, seq: 7 };
-        log.push(Event::new(1_790_000_000, "a", Severity::Info, "from core", false).from_core(origin));
+        log.push(Event::new(1_790_000_000, "a", Severity::Info, "from core", false).with_origin(origin));
         log.push(Event::new(1_790_000_001, "", Severity::Warn, "agent own", false));
         assert_eq!(last_core_mark(&path), Some(origin));
         let back = EventLog::open(Some(path.clone()));

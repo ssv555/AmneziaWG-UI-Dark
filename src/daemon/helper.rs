@@ -177,7 +177,7 @@ impl Jobs {
 
 fn write_job(input: &Path, op: &Op) -> Result<(), String> {
     let bytes = serde_json::to_vec(op).map_err(|e| format!("helper: {e}"))?;
-    std::fs::write(input, bytes).map_err(|e| crate::fsutil::io_ctx(&input, e))
+    std::fs::write(input, bytes).map_err(|e| crate::fsutil::io_ctx(input, e))
 }
 
 /// Ответ помощника по коду выхода и файлу ответа. Не 0 — ответа нет: причина — код, а не «файл не найден».
@@ -187,7 +187,7 @@ fn answer(code: u32, out: std::io::Result<Vec<u8>>, output: &Path) -> Result<Out
         c if c == EXPIRED as u32 => return Err(tr("core.helper_timeout")),
         c => return Err(trf("core.helper_exit", &[&c.to_string()])),
     }
-    let out = out.map_err(|e| crate::fsutil::io_ctx(&output, e))?;
+    let out = out.map_err(|e| crate::fsutil::io_ctx(output, e))?;
     serde_json::from_slice(&out).map_err(|e| format!("helper: {e}"))
 }
 
@@ -213,7 +213,7 @@ fn serve(input: &Path, execute: &dyn Fn(Op) -> Out) -> i32 {
     std::fs::remove_file(input).ok();
     let out = match job.map_err(|e| e.to_string()).and_then(|b| serde_json::from_slice::<Op>(&b).map_err(|e| e.to_string())) {
         Ok(op) => execute(op),
-        Err(e) => Out::Err(crate::fsutil::io_ctx(&input, e)),
+        Err(e) => Out::Err(crate::fsutil::io_ctx(input, e)),
     };
     match serde_json::to_vec(&out).map(|b| std::fs::write(out_path(input), b)) {
         Ok(Ok(())) => 0,
@@ -225,7 +225,7 @@ fn execute(exe: &Path, op: Op) -> Out {
     use crate::native;
     let done = |r: Result<(), String>| r.map_or_else(Out::Err, |()| Out::Ok);
     match op {
-        Op::Open => done(std::process::Command::new(exe).spawn().map(drop).map_err(|e| crate::fsutil::io_ctx(&exe, e))),
+        Op::Open => done(std::process::Command::new(exe).spawn().map(drop).map_err(|e| crate::fsutil::io_ctx(exe, e))),
         Op::Edit(t) => done(native::edit(exe, &t)),
         Op::Import(file) => done(native::import(exe, file.as_deref().map(Path::new))),
         Op::Close => {

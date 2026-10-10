@@ -190,7 +190,7 @@ pub(super) mod fake {
                 return Err(format!("response too large: {len} > {max} bytes"));
             }
             progress(len / 2, Some(len));
-            std::fs::write(dest, &body).map_err(|e| crate::fsutil::io_ctx(&dest, e))?;
+            std::fs::write(dest, &body).map_err(|e| crate::fsutil::io_ctx(dest, e))?;
             progress(len, Some(len));
             Ok(len)
         }

@@ -346,7 +346,7 @@ fn retire(path: &Path, fs: &dyn Fs) -> Result<Option<PathBuf>, String> {
         return Ok(None);
     }
     let to = aside_name(path);
-    fs.rename(path, &to).map_err(|e| crate::fsutil::io_ctx(&path, e))?;
+    fs.rename(path, &to).map_err(|e| crate::fsutil::io_ctx(path, e))?;
     Ok(Some(to))
 }
 
@@ -354,7 +354,7 @@ fn retire(path: &Path, fs: &dyn Fs) -> Result<Option<PathBuf>, String> {
 fn swap_back(path: &Path, aside: &Path, fs: &dyn Fs) -> Result<(), String> {
     let current = retire(path, fs)?;
     let Err(e) = fs.rename(aside, path) else { return Ok(()) };
-    let e = crate::fsutil::io_ctx_move(&aside, &path, e);
+    let e = crate::fsutil::io_ctx_move(aside, path, e);
     match current.map(|c| fs.rename(&c, path).map_err(|e2| format!("{} → {}: {e2}", c.display(), path.display()))) {
         Some(Err(e2)) => Err(format!("{e}; {e2}")),
         _ => Err(e),

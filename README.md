@@ -279,6 +279,7 @@ folder. Statistics and time connected are counted by the core all the time, whet
 | `--tray` | Start hidden in the tray (this is what autostart uses) |
 | `--demo` | Invented tunnels and statistics; no AmneziaWG, no administrator rights. Demo settings live in `%TEMP%\awg-ui-demo` |
 | `--about` | Open the About window at start |
+| `--after-crash <pid>` | Set by the window itself when it restarts after a video adapter failure: wait up to 10 s for the crashed process `<pid>` to exit, then start and say so in the event log |
 | `--snapshot <file.png>` | Once the speed graph covers its whole period (about 2 minutes), save a screenshot of a 1600×1100-point window at the Windows display scale and exit (used for the images in this README) |
 | `--status` | No window: print the tunnel list and the state of the running ones |
 | `--autostart on\|off` | Enable or disable autostart |

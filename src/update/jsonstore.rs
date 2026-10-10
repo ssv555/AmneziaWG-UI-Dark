@@ -28,8 +28,8 @@ pub(super) fn backup_name(id: u64, c: Component, version: &str) -> String {
 pub(super) use crate::fsutil::plain_name as safe_name;
 
 pub(super) fn load_json<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T, String> {
-    let text = std::fs::read(path).map_err(|e| crate::fsutil::io_ctx(&path, e))?;
-    serde_json::from_slice(&text).map_err(|e| crate::fsutil::io_ctx(&path, e))
+    let text = std::fs::read(path).map_err(|e| crate::fsutil::io_ctx(path, e))?;
+    serde_json::from_slice(&text).map_err(|e| crate::fsutil::io_ctx(path, e))
 }
 
 /// Нет файла — пусто; испорчен — файл отодвигается (`set_aside`), пусто и событие в журнале: иначе следующая запись
@@ -56,14 +56,14 @@ pub(super) fn set_aside(path: &Path, error: &str) -> String {
 
 /// Запись через временный файл: оборванная запись не портит прежний.
 pub(super) fn save_json<T: Serialize>(path: &Path, value: &T) -> Result<(), String> {
-    let text = serde_json::to_vec_pretty(value).map_err(|e| crate::fsutil::io_ctx(&path, e))?;
+    let text = serde_json::to_vec_pretty(value).map_err(|e| crate::fsutil::io_ctx(path, e))?;
     crate::fsutil::write_atomic(path, &text).map_err(|e| crate::fsutil::io_ctx(path, e))
 }
 
 pub(super) fn move_file(from: &Path, to: &Path) -> Result<(), String> {
     std::fs::rename(from, to)
         .or_else(|_| std::fs::copy(from, to).and_then(|_| std::fs::remove_file(from)))
-        .map_err(|e| crate::fsutil::io_ctx_move(&from, &to, e))
+        .map_err(|e| crate::fsutil::io_ctx_move(from, to, e))
 }
 
 /// Размер файлов папки, байт (ссылки не учитываются).
@@ -81,7 +81,7 @@ pub(super) fn rotate_logs(dir: &Path, keep: usize) -> Vec<String> {
     let Ok(list) = std::fs::read_dir(dir) else { return Vec::new() };
     let mut files: Vec<(u64, String, PathBuf)> = list
         .flatten()
-        .filter(|e| e.file_type().map_or(false, |t| t.is_file()))
+        .filter(|e| e.file_type().is_ok_and(|t| t.is_file()))
         .map(|e| {
             let name = e.file_name().to_string_lossy().into_owned();
             (name.split('-').next().and_then(|s| s.parse().ok()).unwrap_or(0), name, e.path())

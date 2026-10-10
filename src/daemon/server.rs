@@ -258,7 +258,7 @@ fn serve(core: &Arc<Core>, taken: &AtomicBool, name: &str) {
         if errors.recovered() {
             core.shared.log("", Severity::Info, &tr("core.pipe_recovered"));
         }
-        let Some((slot, hello_only)) = core.connections.admit(conn.from_system()) else {
+        let Some((slot, hello_only)) = core.connections.admit(conn.client_is_system()) else {
             mark("accept: no connection slot, refused");
             // Не дошёл отказ — клиент сам увидит ошибку канала; ядру тут терять нечего.
             drop(conn.reply(&Response::Refused(tr("core.busy"))));
@@ -276,7 +276,7 @@ fn serve(core: &Arc<Core>, taken: &AtomicBool, name: &str) {
                 Ok(req) if hello_only && !matches!(req, Request::Hello) => Response::Refused(tr("core.busy")),
                 Ok(req) => {
                     mark("request: read");
-                    core.handle_isolated(req, conn.client_sid.as_deref(), conn.from_system())
+                    core.handle_isolated(req, conn.client_sid.as_deref(), conn.client_is_system())
                 }
                 Err(e) => Response::Refused(e),
             };
@@ -420,7 +420,7 @@ impl Core {
         })
     }
 
-    /// `system` — клиент канала работает от SYSTEM (`ServerConn::from_system`): только ему открыты внутренние запросы.
+    /// `system` — клиент канала работает от SYSTEM (`ServerConn::client_is_system`): только ему открыты внутренние запросы.
     fn handle(&self, req: Request, caller: Option<&str>, system: bool) -> Response {
         // Снять туннели с надзора, дёрнуть переподключение или убрать туннель из желаемого набора может только служба:
         // окно (любая программа владельца) так оставляло бы желаемые туннели без надзора.
@@ -1651,7 +1651,7 @@ mod tests {
         core.supervise_tick(t0 + Duration::from_secs(1), false);
         assert!(core.is_desired("a"), "туннель остаётся желаемым");
         let outside = trf("core.retry_outside", &["a"]);
-        assert!(!journal(&core).iter().any(|t| *t == outside), "{:?}", journal(&core));
+        assert!(!journal(&core).contains(&outside), "{:?}", journal(&core));
         assert!(lock(&core.retries).view(t0).contains_key("a"), "под надзором повторов");
         core.supervise_tick(t0 + retry::FAST_EVERY + Duration::from_secs(1), false);
         assert_eq!(calls(&host), ["down a", "up a", "up a"], "попытка надзора через обычный шаг");
@@ -1673,7 +1673,7 @@ mod tests {
             core.supervise_tick(t0 + Duration::from_secs(s), false);
         }
         let connected = tr("ev.connected");
-        assert!(!journal(&core).iter().any(|t| *t == connected), "ложного «подключён» нет: {:?}", journal(&core));
+        assert!(!journal(&core).contains(&connected), "ложного «подключён» нет: {:?}", journal(&core));
         assert!(core.is_desired("a"));
         // Та же команда от пользователя: ошибка в журнале, надзора нет.
         assert_eq!(core.switch("a", Plan::Reconnect, false), Err("down a: refused".into()));
@@ -1695,7 +1695,7 @@ mod tests {
         }
         assert!(core.is_desired("a"));
         let outside = trf("core.retry_outside", &["a"]);
-        assert!(!journal(&core).iter().any(|t| *t == outside), "{:?}", journal(&core));
+        assert!(!journal(&core).contains(&outside), "{:?}", journal(&core));
         assert_eq!(journal(&core).iter().filter(|t| t.contains("refused")).count(), 1, "ошибка команды — одна строка: {:?}", journal(&core));
         core.supervise_tick(t0 + retry::FAST_EVERY + Duration::from_secs(1), false);
         assert_eq!(calls(&host), ["down a", "up a", "up a"]);
@@ -2043,7 +2043,7 @@ mod tests {
         let deadline = Instant::now() + within;
         let mut answers = 0u32;
         loop {
-            let plan = if answers % 2 == 0 { Plan::Connect } else { Plan::Disconnect };
+            let plan = if answers.is_multiple_of(2) { Plan::Connect } else { Plan::Disconnect };
             let asked = Instant::now();
             let result = PipeAt(&rig.pipe).ok(Request::Switch { tunnel: "b".into(), plan, multiple: true });
             let took = asked.elapsed();

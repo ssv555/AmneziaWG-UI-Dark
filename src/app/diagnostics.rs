@@ -319,7 +319,7 @@ fn hide_user_dirs(text: &str) -> String {
     while let Some(found) = lower[at..].find(MARK) {
         let name_start = at + found + MARK.len();
         out.push_str(&text[at..name_start]);
-        let name_len = text[name_start..].find(|c: char| matches!(c, '\\' | '/' | '"' | '\'' | '<' | '>' | '\r' | '\n')).unwrap_or(text.len() - name_start);
+        let name_len = text[name_start..].find(['\\', '/', '"', '\'', '<', '>', '\r', '\n']).unwrap_or(text.len() - name_start);
         // Имя профиля может содержать пробел («John Smith»): сначала профиль из окружения заменён целиком, здесь —
         // остальные; для них режем по первому разделителю.
         if name_len == 0 {
@@ -627,8 +627,7 @@ mod tests {
 
     #[test]
     fn tunnel_states_follow_the_snapshot() {
-        let mut snap = Snapshot::default();
-        snap.tunnels = ["a", "b", "c", "d", "e"].iter().map(|s| s.to_string()).collect();
+        let mut snap = Snapshot { tunnels: ["a", "b", "c", "d", "e"].iter().map(|s| s.to_string()).collect(), ..Default::default() };
         snap.running.insert("a".into(), Default::default());
         snap.retries.insert("c".into(), RetryState { attempt: 1, next_in_s: 5, last_error: String::new(), slow: false });
         let pending = BTreeMap::from([("b".to_string(), "busy.connect")]);

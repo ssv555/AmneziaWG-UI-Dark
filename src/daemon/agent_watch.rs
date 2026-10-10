@@ -123,7 +123,7 @@ impl Restarts {
             self.failures = 0;
         }
         self.failures = self.failures.saturating_add(1);
-        let log = self.failures <= LOG_FIRST || self.failures % LOG_EVERY == 0;
+        let log = self.failures <= LOG_FIRST || self.failures.is_multiple_of(LOG_EVERY);
         Restart { delay: restart_delay(self.failures), failures: self.failures, log }
     }
 }
@@ -606,7 +606,7 @@ mod tests {
 
     /// Ответы по сценарию: `silent` промахов подряд, потом `then`.
     fn script(silent: usize, then: &[bool]) -> VecDeque<bool> {
-        std::iter::repeat(false).take(silent).chain(then.iter().copied()).collect()
+        std::iter::repeat_n(false, silent).chain(then.iter().copied()).collect()
     }
 
     /// Медленный запуск (антивирус сканирует свежий exe): 8 `Hello` подряд (40 с) без канала, потом агент отвечает и

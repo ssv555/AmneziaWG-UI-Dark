@@ -83,7 +83,7 @@ pub fn manifest_with_key(json: &[u8], armored_sig: &str, public_key: &str) -> Re
 /// Размер и SHA-256 файла совпадают с записью манифеста.
 #[cfg_attr(not(test), allow(dead_code))]
 pub fn check_file(path: &Path, entry: &FileEntry) -> Result<(), String> {
-    let size = std::fs::metadata(path).map_err(|e| crate::fsutil::io_ctx(&path, e))?.len();
+    let size = std::fs::metadata(path).map_err(|e| crate::fsutil::io_ctx(path, e))?.len();
     if size != entry.size {
         return Err(format!("{}: размер {size}, ожидался {}", entry.name, entry.size));
     }
@@ -97,12 +97,12 @@ pub fn check_file(path: &Path, entry: &FileEntry) -> Result<(), String> {
 /// SHA-256 (64 строчных hex-цифр) и размер файла, прочитанного кусками: файлы релиза бывают десятки мегабайт, в
 /// памяти целиком они не нужны. Одна реализация для проверки по манифесту и для журнала замены файлов.
 pub fn file_digest(path: &Path) -> Result<(String, u64), String> {
-    let mut f = std::fs::File::open(path).map_err(|e| crate::fsutil::io_ctx(&path, e))?;
+    let mut f = std::fs::File::open(path).map_err(|e| crate::fsutil::io_ctx(path, e))?;
     let mut hasher = Sha256::new();
     let mut buf = vec![0u8; 64 * 1024];
     let mut size = 0u64;
     loop {
-        let n = f.read(&mut buf).map_err(|e| crate::fsutil::io_ctx(&path, e))?;
+        let n = f.read(&mut buf).map_err(|e| crate::fsutil::io_ctx(path, e))?;
         if n == 0 {
             break;
         }
@@ -209,7 +209,7 @@ fn base64_decode(s: &str) -> Option<Vec<u8>> {
         } as u32)
     }
     let bytes = s.as_bytes();
-    if bytes.is_empty() || bytes.len() % 4 != 0 {
+    if bytes.is_empty() || !bytes.len().is_multiple_of(4) {
         return None;
     }
     let mut out = Vec::with_capacity(bytes.len() / 4 * 3);

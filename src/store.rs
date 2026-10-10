@@ -57,7 +57,7 @@ struct StoreLock {
 /// `ERROR_SHARING_VIOLATION` и ждёт до `wait`.
 fn lock_in(dir: &Path, wait: Duration) -> Result<StoreLock, String> {
     let file = dir.join(LOCK_FILE);
-    let open = || std::fs::OpenOptions::new().read(true).write(true).create(true).share_mode(0).open(&file);
+    let open = || std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(false).share_mode(0).open(&file);
     let busy = |r: &std::io::Result<std::fs::File>| matches!(r, Err(e) if e.raw_os_error() == Some(ERROR_SHARING_VIOLATION as i32));
     let mut last = open();
     if busy(&last) {
@@ -162,9 +162,9 @@ fn create_in(dir: &Path, tunnel: &str, text: &str, wait: Duration) -> Result<boo
 
 /// Текст конфига: `.dpapi` расшифровывается, обычный `.conf` читается как есть.
 pub fn read(file: &Path) -> Result<String, String> {
-    let data = std::fs::read(file).map_err(|e| crate::fsutil::io_ctx(&file, e))?;
+    let data = std::fs::read(file).map_err(|e| crate::fsutil::io_ctx(file, e))?;
     let plain = if file.to_string_lossy().ends_with(".dpapi") { unprotect(&data)? } else { data };
-    String::from_utf8(plain).map_err(|e| crate::fsutil::io_ctx(&file, e))
+    String::from_utf8(plain).map_err(|e| crate::fsutil::io_ctx(file, e))
 }
 
 /// Записать конфиг туннеля (создать или заменить) — импорт файла из командной строки.

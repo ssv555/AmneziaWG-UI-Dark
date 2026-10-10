@@ -461,10 +461,7 @@ mod tests {
     use super::*;
 
     fn book(groups: &[&str], assign: &[(&str, &str)]) -> TunnelBook {
-        let mut b = TunnelBook::default();
-        b.groups = groups.iter().map(|g| g.to_string()).collect();
-        b.assignment = assign.iter().map(|(t, g)| (t.to_string(), g.to_string())).collect();
-        b
+        TunnelBook { groups: groups.iter().map(|g| g.to_string()).collect(), assignment: assign.iter().map(|(t, g)| (t.to_string(), g.to_string())).collect(), ..Default::default() }
     }
 
     fn list(b: &TunnelBook) -> Vec<&str> {

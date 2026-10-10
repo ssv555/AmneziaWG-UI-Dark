@@ -85,7 +85,7 @@ fn resample(src: &[u8], from: u32, to: u32) -> Vec<u8> {
             }
             let n = ((y1 - y0) * (x1 - x0)) as u32;
             for c in &acc[..3] {
-                out.push(if acc[3] == 0 { 0 } else { ((*c + acc[3] / 2) / acc[3]) as u8 });
+                out.push(((*c + acc[3] / 2).checked_div(acc[3]).unwrap_or(0)) as u8);
             }
             out.push(((acc[3] + n / 2) / n) as u8);
         }
@@ -99,7 +99,7 @@ const ENGINE_HUE: f32 = 50.0;
 /// Перекрасить цветные пиксели в оттенок `hue` (градусы), сохранив насыщенность и яркость; серые и тёмные
 /// (фон, обводка) не меняются.
 fn retint(px: &mut [u8], hue: f32) {
-    for p in px.chunks_exact_mut(4) {
+    for p in px.as_chunks_mut::<4>().0 {
         let [r, g, b] = [p[0], p[1], p[2]].map(|v| v as f32 / 255.0);
         let max = r.max(g).max(b);
         let min = r.min(g).min(b);
@@ -242,7 +242,7 @@ mod tests {
         let (base, yellow) = (rgba(64), themed(64, true));
         assert_eq!(themed(64, false), base, "режим 1 — иконка без изменений");
         let mut tinted = 0;
-        for (a, b) in base.chunks_exact(4).zip(yellow.chunks_exact(4)) {
+        for (a, b) in base.as_chunks::<4>().0.iter().zip(yellow.as_chunks::<4>().0.iter()) {
             assert_eq!(a[3], b[3], "прозрачность не меняется");
             if a != b {
                 tinted += 1;

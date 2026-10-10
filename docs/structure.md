@@ -55,7 +55,8 @@ Top-level files, by layer. Layers are explained in [modules](modules.md).
 | `fmt.rs` | Number and time formatting |
 | `fsutil.rs` | Atomic write, error text with a path, name checks, bounded waiting |
 | `explain.rs` | Errors for people: known Windows, WinHTTP and HTTP failures as a sentence in the program language (`short`), the raw text in parentheses for the event log (`log_line`), enum variant name instead of a `{:?}` dump |
-| `crash.rs` | Panic hook, isolated execution, lock recovery, non-fatal thread loops |
+| `crash.rs` | Panic hook, isolated execution, lock recovery, non-fatal thread loops; window `crash.log` lines with the video adapter and relaunch outcome |
+| `crash/relaunch.rs` | Window relaunch after a GPU-layer panic: classification, arguments (`--tray`, `--after-crash`), limit of 3 per 10 minutes with `relaunch-history.txt`, waiting for the old process |
 | `tray.rs`, `taskbar.rs`, `icon.rs`, `shortcut.rs` | Tray icon and notifications, taskbar button and overlay badge, program icon, desktop shortcut |
 
 ### `src/app/` (window)

@@ -117,8 +117,11 @@ mod tests {
     use crate::daemon::agent::client::FakeAgent;
     use crate::daemon::agent::proto::{AgentRequest, AgentResponse, HistoryBucket};
 
+    /// Отложенные работы: тест сам решает, когда их выполнить.
+    type Queue = Arc<Mutex<Vec<Box<dyn FnOnce() + Send>>>>;
+
     /// Работа откладывается, пока тест не выполнит её сам: так видно, что кадр не ждёт ответа.
-    fn feed(agent: Option<FakeAgent>, queue: &Arc<Mutex<Vec<Box<dyn FnOnce() + Send>>>>) -> HistoryFeed {
+    fn feed(agent: Option<FakeAgent>, queue: &Queue) -> HistoryFeed {
         let queue = queue.clone();
         HistoryFeed {
             agent: agent.map(|a| Arc::new(a) as Arc<dyn AgentApi>),
@@ -129,7 +132,7 @@ mod tests {
         }
     }
 
-    fn run_all(queue: &Arc<Mutex<Vec<Box<dyn FnOnce() + Send>>>>) {
+    fn run_all(queue: &Queue) {
         let jobs: Vec<_> = queue.lock().unwrap().drain(..).collect();
         jobs.into_iter().for_each(|job| job());
     }

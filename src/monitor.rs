@@ -756,7 +756,7 @@ fn mirror_core(shared: &Shared, link: &mut CoreLink) {
     // Место в журнале ядра — при каждом событии: то же событие придёт и от агента, повтор не показывается.
     let instance = state.events_instance;
     let batch = lock(&shared.core_cursor).accept(instance, state.events_loaded, state.events);
-    let events = batch.events.into_iter().map(|(seq, e)| e.from_core(events::Origin { instance, seq }));
+    let events = batch.events.into_iter().map(|(seq, e)| e.with_origin(events::Origin { instance, seq }));
     let options = lock(&shared.options).clone();
     record_and_notify(&shared.events, events, !batch.quiet && options.notify && options.tray, &mut |e| toast(e));
 }
@@ -995,13 +995,13 @@ mod tests {
         let at = |instance, seq| Origin { instance, seq };
         let core_event = |seq: u64| Event::new(seq, "t", Severity::Info, &format!("core {seq}"), true);
         // Ядро ответило раньше агента: всё его кольцо (номера 5..=7) — первой, тихой порцией.
-        let first = (5..=7).map(|n| core_event(n).from_core(at(9, n)));
+        let first = (5..=7).map(|n| core_event(n).with_origin(at(9, n)));
         record_and_notify(&shared.events, first, false, &mut |_| panic!("первая порция без уведомлений"));
         // История агента: старое из файла (до перезапуска ядра) и события ядра 5..=6 — 6 прочитано из файла без
         // метки (номера нет), но входит в «полно до 9/6».
         let history = vec![
             (1, Event::new(1, "t", Severity::Info, "old", false)),
-            (2, core_event(5).from_core(at(9, 5))),
+            (2, core_event(5).with_origin(at(9, 5))),
             (3, core_event(6)),
         ];
         let answers = Arc::new(Mutex::new(vec![
@@ -1010,7 +1010,7 @@ mod tests {
             AgentEvents {
                 instance: 4,
                 loaded: 3,
-                events: vec![(4, Event::new(8, "", Severity::Warn, "update failed", false)), (5, core_event(7).from_core(at(9, 7)))],
+                events: vec![(4, Event::new(8, "", Severity::Warn, "update failed", false)), (5, core_event(7).with_origin(at(9, 7)))],
                 core: Some(at(9, 7)),
             },
         ]));
@@ -1018,7 +1018,7 @@ mod tests {
         mirror_agent_events(&shared, &agent);
         mirror_agent_events(&shared, &agent);
         // Ядро повторяет 6 (окно спросило с прежнего номера) и шлёт новое 8.
-        let late = [6, 8].map(|n| core_event(n).from_core(at(9, n)));
+        let late = [6, 8].map(|n| core_event(n).with_origin(at(9, n)));
         record_and_notify(&shared.events, late, false, &mut |_| {});
         let texts: Vec<String> = shared.events_since(0).into_iter().map(|(_, e)| e.text).collect();
         assert_eq!(texts, ["old", "core 5", "core 6", "core 7", "update failed", "core 8"]);

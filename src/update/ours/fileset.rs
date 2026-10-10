@@ -249,9 +249,9 @@ fn suffixed(path: &Path, tag: &str) -> PathBuf {
 /// Скопировать файл (папка назначения создаётся); размер.
 pub(super) fn copy(from: &Path, to: &Path) -> Result<u64, String> {
     if let Some(dir) = to.parent() {
-        std::fs::create_dir_all(dir).map_err(|e| crate::fsutil::io_ctx(&dir, e))?;
+        std::fs::create_dir_all(dir).map_err(|e| crate::fsutil::io_ctx(dir, e))?;
     }
-    std::fs::copy(from, to).map_err(|e| crate::fsutil::io_ctx_move(&from, &to, e))
+    std::fs::copy(from, to).map_err(|e| crate::fsutil::io_ctx_move(from, to, e))
 }
 
 #[cfg(test)]

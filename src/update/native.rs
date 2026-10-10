@@ -308,7 +308,7 @@ fn is_reparse(md: &std::fs::Metadata) -> bool {
 /// Подпапки, прочие файлы и точки повторной обработки пропускаются. Ok — число скопированных файлов.
 #[cfg_attr(not(test), allow(dead_code))]
 pub fn copy_configs(from: &Path, to: &Path) -> Result<u64, String> {
-    let err = |p: &Path, e: std::io::Error| crate::fsutil::io_ctx(&p, e);
+    let err = |p: &Path, e: std::io::Error| crate::fsutil::io_ctx(p, e);
     let entries = std::fs::read_dir(from).map_err(|e| err(from, e))?;
     std::fs::create_dir_all(to).map_err(|e| err(to, e))?;
     let mut count = 0;

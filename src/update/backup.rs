@@ -56,7 +56,7 @@ pub(super) fn adopt_orphans(history: &mut History, backups: &Path, name_of: &dyn
         }
     };
     // Файлы в `backups` — не копии (копия всегда папка), их не касаемся.
-    let mut dirs: Vec<PathBuf> = list.flatten().filter(|e| e.file_type().map_or(false, |t| t.is_dir())).map(|e| e.path()).collect();
+    let mut dirs: Vec<PathBuf> = list.flatten().filter(|e| e.file_type().is_ok_and(|t| t.is_dir())).map(|e| e.path()).collect();
     // Порядок по номеру: свободный номер для занятого достаётся папкам одинаково при каждом открытии.
     dirs.sort_by_key(|p| (p.file_name().and_then(|n| n.to_str()).and_then(backup_id), p.clone()));
     for id in dirs.iter().filter_map(|p| p.file_name().and_then(|n| n.to_str()).and_then(backup_id)) {
@@ -65,7 +65,7 @@ pub(super) fn adopt_orphans(history: &mut History, backups: &Path, name_of: &dyn
     let mut adopted = false;
     for dir in dirs {
         let name = dir.file_name().and_then(|n| n.to_str()).map(str::to_string);
-        if name.as_deref().map_or(false, |n| history.references(n)) {
+        if name.as_deref().is_some_and(|n| history.references(n)) {
             continue;
         }
         match stored_backup(&dir, name) {

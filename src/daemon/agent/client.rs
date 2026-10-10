@@ -182,9 +182,13 @@ impl CoreApi for Routed {
     }
 }
 
+/// Ответ подделки на запрос: его задаёт тест.
+#[cfg(test)]
+pub type Reply = Box<dyn Fn(&AgentRequest) -> Result<AgentResponse, String> + Send + Sync>;
+
 /// Подделка агента для тестов окна: ответ задаёт тест.
 #[cfg(test)]
-pub struct FakeAgent(pub Box<dyn Fn(&AgentRequest) -> Result<AgentResponse, String> + Send + Sync>);
+pub struct FakeAgent(pub Reply);
 
 #[cfg(test)]
 impl FakeAgent {

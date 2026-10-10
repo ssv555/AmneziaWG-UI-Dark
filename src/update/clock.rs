@@ -51,7 +51,7 @@ pub(super) fn check_due(first: bool, uptime: Duration, checked_at: Option<u64>, 
     if first {
         return uptime >= FIRST_CHECK;
     }
-    checked_at.map_or(true, |t| now.saturating_sub(t) >= CHECK_EVERY)
+    checked_at.is_none_or(|t| now.saturating_sub(t) >= CHECK_EVERY)
 }
 
 #[cfg(test)]

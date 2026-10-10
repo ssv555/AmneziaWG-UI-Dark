@@ -51,7 +51,7 @@ pub(super) fn verdict(live: &Live, now: Instant, now_unix: u64, since: Option<In
         return Verdict::Unknown;
     }
     let Some(from) = now.checked_sub(WINDOW) else { return Verdict::Unknown };
-    let first = live.history.iter().rev().find(|s| s.at <= from).filter(|s| since.map_or(true, |at| s.at > at));
+    let first = live.history.iter().rev().find(|s| s.at <= from).filter(|s| since.is_none_or(|at| s.at > at));
     match first {
         Some(first) if last.tx > first.tx && last.rx == first.rx => Verdict::Dead,
         _ => Verdict::Unknown,

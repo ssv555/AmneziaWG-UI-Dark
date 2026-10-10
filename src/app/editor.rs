@@ -101,7 +101,7 @@ impl Editor {
                 self.saved = self.text.clone();
                 let note = match &self.tunnel {
                     Some(t) => {
-                        lock(&infos).remove(t);
+                        lock(infos).remove(t);
                         (trf("eng.saved", &[t]), false)
                     }
                     None => (trf("ed.saved", &[&self.path.display().to_string()]), false),

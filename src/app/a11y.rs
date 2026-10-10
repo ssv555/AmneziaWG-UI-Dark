@@ -163,10 +163,10 @@ mod tests {
     #[test]
     fn pause_button_says_what_it_will_do_and_is_pressed_while_paused() {
         let live = node_of(|| Painted::GraphPause { paused: false });
-        assert_eq!(live.label().as_deref(), Some(tr("gr.pause").as_str()));
+        assert_eq!(live.label(), Some(tr("gr.pause").as_str()));
         assert_ne!(live.toggled(), Some(accesskit::Toggled::True));
         let paused = node_of(|| Painted::GraphPause { paused: true });
-        assert_eq!(paused.label().as_deref(), Some(tr("gr.resume").as_str()));
+        assert_eq!(paused.label(), Some(tr("gr.resume").as_str()));
         assert_eq!(paused.toggled(), Some(accesskit::Toggled::True));
     }
 }

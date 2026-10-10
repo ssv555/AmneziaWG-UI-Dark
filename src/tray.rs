@@ -23,7 +23,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     SetMenuDefaultItem, ShowWindow, TrackPopupMenu, HMENU, ICONINFO, MF_CHECKED, MF_GRAYED, MF_POPUP, MF_SEPARATOR,
     MF_STRING, ICON_BIG, ICON_SMALL, MSGFLT_ALLOW, SM_CXICON, SM_CXSMICON, SW_HIDE, SW_RESTORE, SW_SHOW, TPM_NONOTIFY,
     TPM_RETURNCMD, TPM_RIGHTBUTTON, WM_APP, WM_DESTROY, WM_LBUTTONDBLCLK, WM_LBUTTONUP, WM_NULL, WM_RBUTTONUP,
-    WM_SETICON,
+    WM_SETICON, WM_SHOWWINDOW,
 };
 
 use crate::crash::lock;
@@ -457,6 +457,11 @@ unsafe extern "system" fn subclass_proc(
             // Приходит при каждом (пере)создании кнопки: показ окна после скрытия, перезапуск Explorer.
             apply_taskbar(t, TASKBAR_BUTTON | TASKBAR_IDENTITY | TASKBAR_OVERLAY);
         }
+        if msg == WM_SHOWWINDOW {
+            // Любая смена видимости, и чужая тоже (второй запуск поднимает окно через ShowWindow): окно, упавшее в
+            // трее, перезапускается в трей.
+            crate::crash::set_window_shown(wparam != 0);
+        }
         if msg == WM_DESTROY {
             taskbar::release();
             if let Err(e) = taskbar::clear_identity(t.hwnd) {
@@ -605,7 +610,7 @@ fn make_icon(size: u32, rgba: &[u8]) -> isize {
             return 0;
         }
         let dst = std::slice::from_raw_parts_mut(bits as *mut u8, rgba.len());
-        for (d, s) in dst.chunks_exact_mut(4).zip(rgba.chunks_exact(4)) {
+        for (d, s) in dst.as_chunks_mut::<4>().0.iter_mut().zip(rgba.as_chunks::<4>().0.iter()) {
             d.copy_from_slice(&[s[2], s[1], s[0], s[3]]);
         }
         let mask = CreateBitmap(size as i32, size as i32, 1, 1, null());

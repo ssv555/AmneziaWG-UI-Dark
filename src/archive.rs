@@ -39,7 +39,7 @@ impl std::fmt::Display for ReadError {
 
 /// Все `*.conf` из архива (папки внутри не важны). Пароль нужен только для зашифрованных записей.
 pub fn read(file: &Path, password: Option<&str>) -> Result<Vec<Entry>, ReadError> {
-    let other = |e: &dyn std::fmt::Display| ReadError::Other(crate::fsutil::io_ctx(&file, e));
+    let other = |e: &dyn std::fmt::Display| ReadError::Other(crate::fsutil::io_ctx(file, e));
     let reader = std::fs::File::open(file).map_err(|e| other(&e))?;
     let mut zip = ZipArchive::new(reader).map_err(|e| other(&e))?;
     let mut out = Vec::new();
@@ -74,7 +74,7 @@ pub fn read(file: &Path, password: Option<&str>) -> Result<Vec<Entry>, ReadError
 
 /// Резервная копия: каждый туннель — `<имя>.conf`, зашифрован AES-256 паролем пользователя.
 pub fn write_backup(file: &Path, password: &str, entries: &[Entry]) -> Result<(), String> {
-    let err = |e: &dyn std::fmt::Display| crate::fsutil::io_ctx(&file, e);
+    let err = |e: &dyn std::fmt::Display| crate::fsutil::io_ctx(file, e);
     // Архив собирается в памяти (конфиги — килобайты), чтобы запись на диск была одна и атомарная.
     let mut zip = ZipWriter::new(std::io::Cursor::new(Vec::new()));
     let options = SimpleFileOptions::default()
@@ -90,7 +90,7 @@ pub fn write_backup(file: &Path, password: &str, entries: &[Entry]) -> Result<()
 
 /// Обычный `.conf` с диска.
 pub fn read_conf(file: &Path) -> Result<Entry, String> {
-    let bytes = std::fs::read(file).map_err(|e| crate::fsutil::io_ctx(&file, e))?;
+    let bytes = std::fs::read(file).map_err(|e| crate::fsutil::io_ctx(file, e))?;
     let name = crate::engine::tunnel_name(file);
     Ok(Entry { name, text: decode_text(&bytes) })
 }
@@ -105,7 +105,7 @@ fn conf_name(path: &str) -> Option<String> {
 /// UTF-8 (с BOM или без) или UTF-16 LE с BOM — как сохраняют Блокнот и родной клиент.
 fn decode_text(bytes: &[u8]) -> String {
     if let Some(rest) = bytes.strip_prefix(&[0xFF, 0xFE]) {
-        let units: Vec<u16> = rest.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
+        let units: Vec<u16> = rest.as_chunks::<2>().0.iter().map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
         return String::from_utf16_lossy(&units);
     }
     let bytes = bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(bytes);

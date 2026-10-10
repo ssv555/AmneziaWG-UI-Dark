@@ -37,6 +37,9 @@ Full per-version lists are in the [changelog](../CHANGELOG.md). Only the headlin
    app and engine updates, interrupted AmneziaWG rollbacks keep the tunnels.
 11. **0.5.6** (2026.10.07): backups whose rows were lost from the update history (an unreadable history file, for
    example) are shown in the history again and can be restored.
+12. **0.5.7** (2026.10.10): when the video driver is reset or reinstalled, the window starts itself again (hidden in the
+   tray if it was hidden, at most 3 times in 10 minutes) instead of closing; `crash.log` names the video adapter, the
+   driver and the relaunch outcome.
 
 ## Next
 

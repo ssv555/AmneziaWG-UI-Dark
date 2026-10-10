@@ -369,10 +369,10 @@ fn live_plot(ui: &Ui, painter: &Painter, hover: &Response, rect: Rect, period: f
             ui.label(RichText::new(trf("gr.bucket", &[&fmt::duration(per_point as f64)])).weak());
         }
         egui::Grid::new("graph-tip").num_columns(2).spacing([16.0, 2.0]).show(ui, |ui| {
-            ui.label(&tr("st.rx_rate"));
+            ui.label(tr("st.rx_rate"));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| ui.label(mono(fmt::rate(p.0), palette().graph_rx)));
             ui.end_row();
-            ui.label(&tr("st.tx_rate"));
+            ui.label(tr("st.tx_rate"));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| ui.label(mono(fmt::rate(p.1), palette().graph_tx)));
             ui.end_row();
         });

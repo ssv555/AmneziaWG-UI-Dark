@@ -39,7 +39,7 @@ pub(super) fn due(offered: &[(Component, String)], notified: &BTreeMap<String, S
     }
     // Метка из будущего (часы переводили назад) не должна глушить напоминания на месяцы: считаем, что срок пришёл.
     let elapsed = reminded.filter(|t| *t <= now).map(|t| now - t);
-    elapsed.map_or(true, |s| s >= REMIND_EVERY).then_some(Due::Remind)
+    elapsed.is_none_or(|s| s >= REMIND_EVERY).then_some(Due::Remind)
 }
 
 /// Что известно о пользователе в эту минуту.

@@ -42,7 +42,7 @@ pub(super) type DisconnectAsk = Arc<Mutex<Option<String>>>;
 
 /// Положить в общую раскладку настройки окна, если они изменились (зовётся каждый кадр — сравнение дешёвое).
 pub(super) fn publish(layout: &SharedLayout, s: &Settings) {
-    let mut l = lock(&layout);
+    let mut l = lock(layout);
     if l.groups != s.view.groups || l.multiple != s.multiple || l.book != s.book || l.hidden != s.hidden_dialogs {
         *l = Layout::of(s);
     }

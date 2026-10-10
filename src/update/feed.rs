@@ -177,7 +177,7 @@ fn unstable_tags(releases_json: &str) -> Result<Vec<String>, String> {
 fn newest_stable_tag<'a>(names: impl IntoIterator<Item = &'a str>, skip: &[String]) -> Option<String> {
     let mut best: Option<&str> = None;
     for name in names {
-        if is_stable_tag(name) && !skip.iter().any(|s| s == name) && best.map_or(true, |b| newer(name, b)) {
+        if is_stable_tag(name) && !skip.iter().any(|s| s == name) && best.is_none_or(|b| newer(name, b)) {
             best = Some(name);
         }
     }

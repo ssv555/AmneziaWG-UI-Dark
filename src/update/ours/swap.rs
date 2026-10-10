@@ -290,7 +290,10 @@ mod tests {
         (base, journal, plan)
     }
 
-    fn logged() -> (std::rc::Rc<std::cell::RefCell<Vec<(Severity, String)>>>, impl FnMut(Severity, &str)) {
+    /// Записи журнала, накопленные за тест: тяжесть и текст.
+    type Log = std::rc::Rc<std::cell::RefCell<Vec<(Severity, String)>>>;
+
+    fn logged() -> (Log, impl FnMut(Severity, &str)) {
         let log = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
         let sink = log.clone();
         (log, move |s: Severity, t: &str| sink.borrow_mut().push((s, t.to_string())))

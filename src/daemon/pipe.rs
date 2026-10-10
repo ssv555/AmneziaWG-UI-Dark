@@ -179,7 +179,7 @@ impl ServerConn {
     }
 
     /// Клиент — сама система: так ядро проверяет при старте, что его канал отвечает.
-    pub fn from_system(&self) -> bool {
+    pub fn client_is_system(&self) -> bool {
         self.client_sid.as_deref() == Some(crate::win::LOCAL_SYSTEM_SID)
     }
 }

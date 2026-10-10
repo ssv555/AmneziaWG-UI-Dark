@@ -397,7 +397,8 @@ pub(super) mod tests {
 
     /// Диалог показан несколько кадров (egui уточняет раскладку окна по прошлому кадру).
     fn settled(ctx: &egui::Context, keys_first: bool) -> Seen {
-        (0..3).map(|_| dialog_frame(ctx, Vec::new(), keys_first)).last().unwrap()
+        // Кадры идут все три подряд (`next_back` выполнил бы только последний), результат — последнего.
+        (0..3).map(|_| dialog_frame(ctx, Vec::new(), keys_first)).reduce(|_, last| last).unwrap()
     }
 
     /// U1: Tab на «Отмена» и Enter — это «Отмена», как в Windows, а не главная кнопка (раньше удалялся туннель).

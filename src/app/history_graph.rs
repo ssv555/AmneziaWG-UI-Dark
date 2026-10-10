@@ -14,6 +14,9 @@ use crate::daemon::agent::proto::{HistoryBucket, HistoryRange};
 use crate::fmt;
 use crate::i18n::{tr, trf};
 
+/// Линия графика: какое значение ведёт, цвет и толщина.
+type Line = (fn(&HistoryBucket) -> f64, egui::Color32, f32);
+
 /// Полоса под кривыми для подписей оси времени.
 const AXIS_H: f32 = 14.0;
 const AXIS_FONT: f32 = 11.0;
@@ -52,7 +55,7 @@ pub(super) fn plot(ui: &Ui, painter: &Painter, hover: &Response, p: &Plot) {
 
     paint_axis(painter, plot, p.range, from, to, weak);
     let mid = |b: &HistoryBucket| b.start + bucket_s / 2;
-    let lines: [(fn(&HistoryBucket) -> f64, _, f32); 4] = [
+    let lines: [Line; 4] = [
         (|b| b.peak_tx, palette().graph_tx.gamma_multiply(PEAK_FADE), 1.0),
         (|b| b.peak_rx, palette().graph_rx.gamma_multiply(PEAK_FADE), 1.0),
         (|b| b.tx, palette().graph_tx, 1.5),
@@ -209,7 +212,7 @@ fn tooltip(ui: &mut Ui, range: HistoryRange, b: &HistoryBucket) {
         ui.label(RichText::new(tr("gr.peak_col")).weak());
         ui.end_row();
         for (title, avg, peak, color) in [("st.rx_rate", b.rx, b.peak_rx, palette().graph_rx), ("st.tx_rate", b.tx, b.peak_tx, palette().graph_tx)] {
-            ui.label(&tr(title));
+            ui.label(tr(title));
             ui.label(mono(fmt::rate(avg), color));
             ui.label(mono(fmt::rate(peak), color));
             ui.end_row();
@@ -229,7 +232,8 @@ mod tests {
     #[test]
     fn gaps_split_the_lines() {
         assert!(runs(&[], 60).is_empty());
-        assert_eq!(runs(&at(&[0, 60, 120]), 60), [0..3]);
+        // Один отрезок записан через `once`: `[0..3]` clippy принимает за попытку получить 0, 1, 2.
+        assert_eq!(runs(&at(&[0, 60, 120]), 60), std::iter::once(0..3).collect::<Vec<_>>());
         // Пропуск в две минуты и одиночный интервал между пропусками — отдельные отрезки.
         assert_eq!(runs(&at(&[0, 60, 240, 360, 420]), 60), [0..2, 2..3, 3..5]);
         assert_eq!(runs(&at(&[0, 86_400, 3 * 86_400]), 86_400), [0..2, 2..3]);

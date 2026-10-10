@@ -93,7 +93,7 @@ impl CoreFeed for AgentJournal {
             }
         }
         for (seq, event) in batch.events {
-            log.push(event.from_core(Origin { instance: state.events_instance, seq }));
+            log.push(event.with_origin(Origin { instance: state.events_instance, seq }));
         }
     }
 }

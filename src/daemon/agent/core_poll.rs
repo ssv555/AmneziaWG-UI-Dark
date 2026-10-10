@@ -71,8 +71,11 @@ impl CorePoll {
     }
 }
 
+/// Отчёт о панике части потока: текст паники и пауза до следующего шага.
+type Report = Box<dyn Fn(&str, Duration) + Send>;
+
 /// Поток опроса. Вторичный (`crash::nonfatal_loop`): паника части — запись в журнал и пауза, а не остановка агента.
-pub(super) fn spawn(mut poll: CorePoll, feeds: Vec<Arc<dyn CoreFeed>>, report: Box<dyn Fn(&str, Duration) + Send>) {
+pub(super) fn spawn(mut poll: CorePoll, feeds: Vec<Arc<dyn CoreFeed>>, report: Report) {
     crate::crash::spawn_named("agent-core-poll", move || {
         crate::crash::nonfatal_loop(PERIOD, &std::thread::sleep, &*report, || {
             poll.step(&feeds, Instant::now());

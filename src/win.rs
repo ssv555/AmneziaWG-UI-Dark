@@ -173,9 +173,9 @@ pub fn protect_dir(dir: &std::path::Path, sddl: &str) -> Result<(), String> {
     };
     if dir.exists() && !owned_by_admins(dir)? {
         let aside = dir.with_file_name(format!("{}.foreign-{}", dir.file_name().unwrap_or_default().to_string_lossy(), crate::store::random_hex()));
-        std::fs::rename(dir, &aside).map_err(|e| crate::fsutil::io_ctx(&dir, e))?;
+        std::fs::rename(dir, &aside).map_err(|e| crate::fsutil::io_ctx(dir, e))?;
     }
-    std::fs::create_dir_all(dir).map_err(|e| crate::fsutil::io_ctx(&dir, e))?;
+    std::fs::create_dir_all(dir).map_err(|e| crate::fsutil::io_ctx(dir, e))?;
     unsafe {
         let mut sd: PSECURITY_DESCRIPTOR = null_mut();
         if ConvertStringSecurityDescriptorToSecurityDescriptorW(wide(sddl).as_ptr(), SDDL_REVISION_1, &mut sd, null_mut()) == 0 {

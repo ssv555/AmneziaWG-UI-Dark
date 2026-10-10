@@ -211,7 +211,7 @@ fn span_at(rest: &str, prev: Option<char>) -> Option<(Inline, usize)> {
         return is_web_url(&body[..end]).then(|| (link(&body[..end], &body[..end]), end + 2));
     }
     // Голая ссылка — только с начала слова, а не из середины (`xhttp://…`).
-    if prev.map_or(true, |c| c.is_whitespace() || matches!(c, '(' | '[' | '"')) && (rest.starts_with("http://") || rest.starts_with("https://")) {
+    if prev.is_none_or(|c| c.is_whitespace() || matches!(c, '(' | '[' | '"')) && (rest.starts_with("http://") || rest.starts_with("https://")) {
         let raw = rest.split(|c: char| c.is_whitespace() || matches!(c, '<' | '>')).next().unwrap_or("");
         // Знаки конца фразы к адресу не относятся; закрывающая скобка — только если открывающей в адресе не было.
         let mut url = raw.trim_end_matches(['.', ',', ';', ':', '!', '?', '"', '\'']);

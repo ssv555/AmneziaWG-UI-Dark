@@ -9,6 +9,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use super::proto::{AgentResponse, TunnelRequest};
+use super::LogFn;
 use crate::conf::TunnelInfo;
 use crate::daemon::helper::{Jobs, Op, Out};
 use crate::daemon::pipe::{self, Timeouts};
@@ -49,16 +50,16 @@ pub(super) struct Tunnels {
     core: Box<dyn CoreSide>,
     /// Действия в родном окне идут по одному и не ждут друг друга дольше срока (`helper::Jobs`).
     helper: Box<dyn Helper>,
-    log: Box<dyn Fn(Severity, &str) + Send + Sync>,
+    log: LogFn,
 }
 
 impl Tunnels {
-    pub(super) fn new(core: Box<dyn CoreSide>, helper: Box<dyn Helper>, log: Box<dyn Fn(Severity, &str) + Send + Sync>) -> Tunnels {
+    pub(super) fn new(core: Box<dyn CoreSide>, helper: Box<dyn Helper>, log: LogFn) -> Tunnels {
         Tunnels { core, helper, log }
     }
 
     /// Над каналом ядра и настоящим помощником (`jobs` — его задания, общие с уборкой при запуске агента).
-    pub(super) fn real(jobs: Arc<Jobs>, log: Box<dyn Fn(Severity, &str) + Send + Sync>) -> Tunnels {
+    pub(super) fn real(jobs: Arc<Jobs>, log: LogFn) -> Tunnels {
         Tunnels::new(Box::new(PipeCoreSide), Box::new(SessionHelper(jobs)), log)
     }
 

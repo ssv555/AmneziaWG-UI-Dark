@@ -151,8 +151,11 @@ fn report_panic(journal: &Arc<AgentJournal>) -> impl Fn(&str, Duration) + Send +
     move |panic, wait| journal.log(Severity::Bad, &trf("core.secondary_failed", &[panic, &wait.as_secs().to_string()]))
 }
 
+/// Функция записи в журнал: общий вид для частей агента, которым журнал передаётся извне.
+pub(super) type LogFn = Box<dyn Fn(Severity, &str) + Send + Sync>;
+
 /// Запись в журнал агента — для частей, которым журнал передаётся функцией.
-fn log_to(journal: &Arc<AgentJournal>) -> Box<dyn Fn(Severity, &str) + Send + Sync> {
+fn log_to(journal: &Arc<AgentJournal>) -> LogFn {
     let journal = journal.clone();
     Box::new(move |severity, text| journal.log(severity, text))
 }
@@ -215,7 +218,7 @@ fn updates(agent: &Agent, op: crate::update::UpdateOp, caller: &Caller) -> Agent
 
 /// То же, но паника в обработчике не роняет процесс: она записана хуком, клиент получает отказ.
 fn handle_isolated(agent: &Agent, request: Result<AgentRequest, String>, caller: &Caller) -> AgentResponse {
-    crate::crash::isolate(|| handle(agent, request, caller)).unwrap_or_else(|panic| AgentResponse::Refused(panic))
+    crate::crash::isolate(|| handle(agent, request, caller)).unwrap_or_else(AgentResponse::Refused)
 }
 
 /// Цикл канала: ждать клиента и отвечать ему в своём потоке.
@@ -240,7 +243,7 @@ fn serve(agent: Arc<Agent>) {
                 continue;
             }
         };
-        let Some((slot, hello_only)) = connections.admit(conn.from_system()) else {
+        let Some((slot, hello_only)) = connections.admit(conn.client_is_system()) else {
             // Не дошёл отказ — клиент сам увидит ошибку канала.
             drop(conn.reply_with(&AgentResponse::Refused("agent busy".into())));
             continue;

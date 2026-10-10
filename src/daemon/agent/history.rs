@@ -436,7 +436,7 @@ fn read_series(r: &mut Reader, range: HistoryRange) -> Result<Series, String> {
     let mut series = VecDeque::with_capacity(count);
     for _ in 0..count {
         let b = Bucket { start: r.u64()?, rx: r.u64()?, tx: r.u64()?, secs: r.f32()?, peak_rx: r.f32()?, peak_tx: r.f32()? };
-        let aligned = b.start % range.bucket_secs() == 0;
+        let aligned = b.start.is_multiple_of(range.bucket_secs());
         let ordered = series.back().is_none_or(|prev: &Bucket| prev.start < b.start);
         let sane = [b.secs, b.peak_rx, b.peak_tx].iter().all(|v| v.is_finite() && *v >= 0.0);
         if !(aligned && ordered && sane) {
@@ -549,7 +549,7 @@ mod tests {
         }
         let expected = HistoryBucket { start: BASE, secs: 10.0, rx: 5_900.0, tx: 590.0, peak_rx: 50_000.0, peak_tx: 5_000.0 };
         for range in HistoryRange::ALL {
-            assert_eq!(rig.series(range), [expected.clone()], "{range:?}");
+            assert_eq!(rig.series(range), std::slice::from_ref(&expected), "{range:?}");
         }
     }
 

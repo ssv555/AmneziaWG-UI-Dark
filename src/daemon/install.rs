@@ -255,8 +255,8 @@ fn place(path: &Path, data: &[u8]) -> Result<(), String> {
         return Ok(());
     }
     let aside = path.with_file_name(format!("{}.old-{}", path.file_name().unwrap_or_default().to_string_lossy(), crate::store::random_hex()));
-    std::fs::rename(path, &aside).map_err(|e| crate::fsutil::io_ctx(&path, e))?;
-    crate::fsutil::write_atomic(path, data).map_err(|e| crate::fsutil::io_ctx(&path, e))
+    std::fs::rename(path, &aside).map_err(|e| crate::fsutil::io_ctx(path, e))?;
+    crate::fsutil::write_atomic(path, data).map_err(|e| crate::fsutil::io_ctx(path, e))
 }
 
 /// Убрать из `dir` отодвинутые обновлением прежние файлы (`.old-`) и не вставшие на место новые (`.new-`), кроме тех,

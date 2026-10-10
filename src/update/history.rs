@@ -134,7 +134,7 @@ impl History {
         self.entries = kept;
         let excess = excess_backups(&self.entries);
         for e in self.entries.iter_mut() {
-            if e.backup.as_ref().map_or(false, |b| excess.contains(b)) {
+            if e.backup.as_ref().is_some_and(|b| excess.contains(b)) {
                 e.backup = None;
             }
         }
@@ -235,7 +235,7 @@ fn excess_backups(history: &[HistoryEntry]) -> Vec<String> {
         let keep = backup_in_use(history, c);
         let mut list: Vec<(u64, &String)> =
             history.iter().filter(|e| e.component == c).filter_map(|e| e.backup.as_ref().map(|b| (e.id, b))).collect();
-        list.sort_by(|a, b| b.0.cmp(&a.0));
+        list.sort_by_key(|e| std::cmp::Reverse(e.0));
         out.extend(list.into_iter().skip(BACKUPS_MAX).filter(|(_, b)| Some(b.as_str()) != keep).map(|(_, b)| b.clone()));
     }
     out

@@ -480,26 +480,27 @@ mod tests {
 
     #[test]
     fn full_roundtrip() {
-        let mut s = Settings::default();
-        s.window = Some(WindowRect { x: -1200.0, y: 40.0, width: 1300.0, height: 800.0 });
-        s.maximized = true;
-        s.left_width = 610.0;
-        s.graph_range = GraphRange::Month;
-        s.view.groups = false;
-        s.view.col_tx = true;
-        s.sort = SortKey::Share;
-        s.sort_desc = true;
-        s.ping_host = "8.8.8.8".into();
-        s.language = "deu".into();
-        s.log_dir = r"D:\logs".into();
-        s.book = TunnelBook::from_stored(
-            &strs(&["Home", "Office"]),
-            ["Office".to_string()].into(),
-            pairs(&[("home.nl-ams.full", "Home")]),
-            pairs(&[("home.nl-ams.full", r"D:\vpn\home.nl-ams.full.conf")]),
-            Some("home.nl-ams.full".into()),
-            Some("lab.sg.v4".into()),
-        );
+        let mut s = Settings {
+            window: Some(WindowRect { x: -1200.0, y: 40.0, width: 1300.0, height: 800.0 }),
+            maximized: true,
+            left_width: 610.0,
+            graph_range: GraphRange::Month,
+            view: View { groups: false, col_tx: true, ..Default::default() },
+            sort: SortKey::Share,
+            sort_desc: true,
+            ping_host: "8.8.8.8".into(),
+            language: "deu".into(),
+            log_dir: r"D:\logs".into(),
+            book: TunnelBook::from_stored(
+                &strs(&["Home", "Office"]),
+                ["Office".to_string()].into(),
+                pairs(&[("home.nl-ams.full", "Home")]),
+                pairs(&[("home.nl-ams.full", r"D:\vpn\home.nl-ams.full.conf")]),
+                Some("home.nl-ams.full".into()),
+                Some("lab.sg.v4".into()),
+            ),
+            ..Default::default()
+        };
         s.hidden_dialogs.insert(DialogId::ModeEngine);
         s.update_notified.insert("app".into(), "0.4.0".into());
         s.update_notified.insert("native".into(), "1.2.3".into());
@@ -544,8 +545,7 @@ mod tests {
         // Имена закреплены: это формат файла.
         assert_eq!(Theme::ALL.map(Theme::as_str), ["graphite", "slate", "daylight", "system"]);
         for theme in Theme::ALL {
-            let mut s = Settings::default();
-            s.theme = theme;
+            let s = Settings { theme, ..Default::default() };
             assert_eq!(s.to_ini().get("options", "theme"), Some(theme.as_str()));
             assert_eq!(reload(&s), s, "{theme:?}");
         }
@@ -557,8 +557,7 @@ mod tests {
         let all: Vec<_> = GraphRange::ALL.iter().map(|r| r.as_str()).collect();
         assert_eq!(all, ["2m", "10m", "1h", "day", "month", "year"]);
         for range in GraphRange::ALL {
-            let mut s = Settings::default();
-            s.graph_range = range;
+            let s = Settings { graph_range: range, ..Default::default() };
             assert_eq!(s.to_ini().get("layout", "graph_range"), Some(range.as_str()));
             assert_eq!(reload(&s), s, "{range:?}");
         }
@@ -596,15 +595,17 @@ mod tests {
 
     #[test]
     fn nested_groups_roundtrip_and_flat_compat() {
-        let mut s = Settings::default();
-        s.book = TunnelBook::from_stored(
-            &strs(&["Europe", "Europe/Netherlands", "Lab"]),
-            ["Europe/Netherlands".to_string()].into(),
-            pairs(&[("nl", "Europe/Netherlands")]),
-            BTreeMap::new(),
-            None,
-            None,
-        );
+        let s = Settings {
+            book: TunnelBook::from_stored(
+                &strs(&["Europe", "Europe/Netherlands", "Lab"]),
+                ["Europe/Netherlands".to_string()].into(),
+                pairs(&[("nl", "Europe/Netherlands")]),
+                BTreeMap::new(),
+                None,
+                None,
+            ),
+            ..Default::default()
+        };
         assert_eq!(reload(&s), s);
         // Файл прежней версии с плоскими именами и файл, где предок не записан.
         let old = Settings::from_ini(&Ini::parse("[groups]\n1=Home\n2=Office\n3=Travel/Nordics\n[assign]\nt=Home\n"));

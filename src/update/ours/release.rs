@@ -11,6 +11,9 @@ use crate::update::busy::{Busy, Release};
 use crate::update::sources::Sources;
 use crate::update::{feed, sign};
 
+/// Итог проверки скачанного манифеста по подписи: разобранный манифест или причина отказа.
+type Checked = Result<sign::Manifest, String>;
+
 /// Манифест релиза, скачанный заново, обязан совпасть с тем, что проверен при поиске обновления, — целиком, не
 /// только версией: файлы выше проверены по записям `m`, а ставится этот манифест (по нему движку доверяют). Один
 /// путь для движка и программы: у переподписанного манифеста с теми же версиями другие суммы DLL, и поставленные
@@ -19,7 +22,7 @@ fn refetch_same_manifest(
     rel: &feed::Release,
     m: &sign::Manifest,
     get: &dyn Fn(&str) -> Result<Vec<u8>, String>,
-    check: &dyn Fn(&[u8], &str) -> Result<sign::Manifest, String>,
+    check: &dyn Fn(&[u8], &str) -> Checked,
 ) -> Result<(Vec<u8>, String), String> {
     let (json, sig) = manifest_files(rel, get).map_err(|e| e.message)?;
     let fresh = check(&json, &sig)?;
@@ -49,7 +52,7 @@ fn manifest_set(src: &dyn Sources, rel: &feed::Release, m: &sign::Manifest, work
 impl InstallTarget {
     /// Скачать файлы движка из релиза в `work`, проверить по манифесту и поставить в Program Files.
     pub(super) fn update_engine(&self, src: &dyn Sources, fs: &dyn Fs, rel: &feed::Release, m: &sign::Manifest, work: &Path, busy: &mut dyn FnMut(Busy)) -> Result<(), String> {
-        std::fs::create_dir_all(work).map_err(|e| crate::fsutil::io_ctx(&work, e))?;
+        std::fs::create_dir_all(work).map_err(|e| crate::fsutil::io_ctx(work, e))?;
         let mut files = Vec::new();
         for entry in &m.engine.files {
             files.push((entry.name.clone(), fetch(src, rel, entry, work, busy)?));
@@ -70,7 +73,7 @@ impl InstallTarget {
 
     /// Набор сборки программы, скачанный и проверенный в `work`; до установки ничего не трогает в папке программы.
     fn app_set(&self, src: &dyn Sources, rel: &feed::Release, m: &sign::Manifest, work: &Path, busy: &mut dyn FnMut(Busy)) -> Result<Vec<(String, PathBuf)>, String> {
-        std::fs::create_dir_all(work).map_err(|e| crate::fsutil::io_ctx(&work, e))?;
+        std::fs::create_dir_all(work).map_err(|e| crate::fsutil::io_ctx(work, e))?;
         let mut files = vec![(APP_EXE.to_string(), fetch(src, rel, &m.app, work, busy)?)];
         if self.dir.join(ENGINE_FILES[0]).exists() && !engine_matches(&self.dir, m) {
             for entry in &m.engine.files {

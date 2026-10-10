@@ -69,9 +69,9 @@ pub(super) struct UpdatesWindow {
     badge: Arc<AtomicBool>,
     badge_at: Option<Instant>,
     /// Обновления из последнего ответа ядра; кадр забирает их и решает, о чём сообщить (настройки — в потоке окна).
-    proposed: Arc<Mutex<Option<Vec<(Component, String)>>>>,
+    proposed: Arc<Mutex<Option<Offers>>>,
     /// Что ядро предлагает сейчас (последний ответ); пусто после установки — напоминания прекращаются.
-    offered_now: Vec<(Component, String)>,
+    offered_now: Offers,
     /// Не раньше какого момента снова спрашивать Windows, на месте ли пользователь (после отказа сообщить).
     next_check: Option<Instant>,
     /// Уведомление закрыто «Позже», крестиком или Esc (или открыто кнопкой): следующий кадр сдвигает напоминание на сутки.
@@ -81,12 +81,15 @@ pub(super) struct UpdatesWindow {
     /// Откуда берётся состояние пользователя; в тестах подменяется.
     presence: fn() -> Presence,
     /// Показанное и ещё не закрытое уведомление: компонент и версия.
-    news: Vec<(Component, String)>,
+    news: Offers,
     /// Уведомление — активное окно: последний щелчок мыши был по нему. Только тогда ему достаётся Esc.
     news_focused: bool,
     /// Открытое окно «Что нового» (одно): текст релиза выбранного компонента.
     notes: Option<Notes>,
 }
+
+/// Обновления с версиями: что ядро предлагает поставить или о чём напомнить.
+type Offers = Vec<(Component, String)>;
 
 /// Текст релиза в окне «Что нового»: разобран один раз при открытии, дальше окно не зависит от опроса ядра.
 struct Notes {
@@ -518,13 +521,13 @@ impl UpdatesWindow {
 
 /// Опрос состояния: прошлый ответ получен и с прошлого опроса прошла секунда.
 fn poll_due(polling: bool, polled_at: Option<Instant>, now: Instant) -> bool {
-    !polling && polled_at.map_or(true, |t| now.saturating_duration_since(t) >= POLL_EVERY)
+    !polling && polled_at.is_none_or(|t| now.saturating_duration_since(t) >= POLL_EVERY)
 }
 
 /// Фоновая проверка для отметки меню: окно закрыто (иначе её ведёт его опрос), агент есть (не демо), с прошлой —
 /// полчаса.
 fn badge_due(window_open: bool, has_agent: bool, badge_at: Option<Instant>, now: Instant) -> bool {
-    !window_open && has_agent && badge_at.map_or(true, |t| now.saturating_duration_since(t) >= BADGE_EVERY)
+    !window_open && has_agent && badge_at.is_none_or(|t| now.saturating_duration_since(t) >= BADGE_EVERY)
 }
 
 /// Что делает подтверждение после кадра.
@@ -1003,14 +1006,14 @@ fn take_updates_reply(
     seq: u64,
     polled: &Mutex<Polled>,
     badge: &AtomicBool,
-    proposed: &Mutex<Option<Vec<(Component, String)>>>,
+    proposed: &Mutex<Option<Offers>>,
     error: &ErrorSink,
 ) {
-    let mut p = lock(&polled);
+    let mut p = lock(polled);
     match result {
         Ok(state) => {
             badge.store(has_updates(&state), Ordering::SeqCst);
-            *lock(&proposed) = Some(offered_updates(&state));
+            *lock(proposed) = Some(offered_updates(&state));
             if seq > p.applied {
                 p.state = state;
                 p.applied = seq;
@@ -1040,7 +1043,7 @@ fn has_updates(s: &UpdatesState) -> bool {
 }
 
 /// Компоненты, у которых есть обновление, и его версия.
-fn offered_updates(s: &UpdatesState) -> Vec<(Component, String)> {
+fn offered_updates(s: &UpdatesState) -> Offers {
     s.components
         .iter()
         .filter(|c| c.update)
@@ -1058,7 +1061,7 @@ pub(super) fn component_key(c: Component) -> &'static str {
 
 /// Предложенные обновления, о которых ещё не сообщали; запоминает их в `notified`. По компоненту помнится одна
 /// версия: выпущенная позже сообщается снова, одна и та же — один раз.
-fn to_notify(offered: &[(Component, String)], notified: &mut BTreeMap<String, String>) -> Vec<(Component, String)> {
+fn to_notify(offered: &[(Component, String)], notified: &mut BTreeMap<String, String>) -> Offers {
     let mut fresh = Vec::new();
     for (c, v) in offered {
         if notified.get(component_key(*c)) == Some(v) {
@@ -1077,7 +1080,7 @@ fn news_text(list: &[(Component, String)], reminder: bool) -> String {
 }
 
 /// Компоненты с версиями, которые пользователь видел в подтверждении: ядро ставит только их.
-fn targets(s: &UpdatesState, list: &[Component]) -> Vec<(Component, String)> {
+fn targets(s: &UpdatesState, list: &[Component]) -> Offers {
     list.iter()
         .filter_map(|c| {
             let row = s.components.iter().find(|r| r.component == Some(*c))?;

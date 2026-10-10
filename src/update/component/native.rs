@@ -550,7 +550,7 @@ mod tests {
         let mut host = FakeHost::new(&dir, Some("1.1"));
         Arc::get_mut(&mut host).unwrap().hang = true;
         let ops = NativeOps::new(core.clone(), host.clone());
-        let run = MsiRun { ops: &ops, m: &*m, held: Mutex::new(vec!["a".into()]), leased: true };
+        let run = MsiRun { ops: &ops, m: &m, held: Mutex::new(vec!["a".into()]), leased: true };
         // Первое продление проходит, после него ядро «пропадает».
         run.renew();
         core.refuse_hold_now();

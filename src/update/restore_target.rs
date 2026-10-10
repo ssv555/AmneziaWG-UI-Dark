@@ -101,7 +101,7 @@ fn by_version<'a>(history: &'a [HistoryEntry], row: &HistoryEntry, version: &str
         .iter()
         .filter(|e| e.component == row.component && e.action == Action::Backup && e.id < row.id)
         .filter(|e| e.from.as_deref().map(str::trim) == Some(version))
-        .filter(|e| e.backup.as_deref().map_or(false, |b| exists(b)))
+        .filter(|e| e.backup.as_deref().is_some_and(exists))
         .max_by_key(|e| e.id)
         .and_then(|e| e.backup.as_deref())
 }

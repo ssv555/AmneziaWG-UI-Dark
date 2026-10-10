@@ -269,7 +269,7 @@ mod tests {
     #[test]
     fn target_syntax() {
         assert_eq!(parse_target("1234:420"), Ok((1234, 420)));
-        for bad in ["", "1234", "1234:", ":420", "0:420", "1234:0", "x:1", "1:0x1a4", r"C:\tmp\r.txt", "1:2:3"] {
+        for bad in ["", "1234", "1234:", ":420", "0:420", "1234:0", "x:1", "1:0x1a4", r"C:\Temp\r.txt", "1:2:3"] {
             assert!(parse_target(bad).is_err(), "{bad}");
         }
     }

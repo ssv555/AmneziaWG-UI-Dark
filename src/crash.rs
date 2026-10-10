@@ -9,21 +9,38 @@
 //! служб её перезапускает.
 //!
 //! Окно. Паника любого потока — запись в `crash.log`, сообщение пользователю и выход: окно без потока опроса
-//! показывало бы застывшие данные, а при `windows_subsystem = "windows"` stderr никто не видит.
+//! показывало бы застывшие данные, а при `windows_subsystem = "windows"` stderr никто не видит. Паника в слое GPU
+//! (сброс драйвера видеокарты) — исключение: окно перезапускает себя без сообщения (`relaunch`). Каждая строка
+//! `crash.log` окна несёт видеоадаптер (`remember_gpu`) и итог перезапуска.
+
+pub mod relaunch;
 
 use std::any::Any;
 use std::cell::{Cell, RefCell};
 use std::ops::ControlFlow;
 use std::panic::PanicHookInfo;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Mutex, MutexGuard, OnceLock, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::Duration;
+
+use relaunch::Outcome;
+
+/// Журнал сбоев окна в его каталоге журналов.
+pub const CRASH_LOG: &str = "crash.log";
 
 /// Первая паника фонового потока ядра — по ней главный цикл останавливает службу.
 static CORE_FAILURE: OnceLock<String> = OnceLock::new();
 /// Окно уже сообщает о сбое: остальные паникующие потоки ждут, пока первый завершит процесс.
 static WINDOW_REPORTING: AtomicBool = AtomicBool::new(false);
+/// Видеоадаптер окна (`remember_gpu`) — для строки `crash.log`.
+static GPU: OnceLock<String> = OnceLock::new();
+/// Видно ли окно: `SHOWN_UNKNOWN` — окно ещё не создано, иначе `SHOWN_NO` / `SHOWN_YES`. Пишет окно
+/// (`set_window_shown`), читает перезапуск после сбоя: окно в трее возвращается в трей.
+static WINDOW_SHOWN: AtomicU8 = AtomicU8::new(SHOWN_UNKNOWN);
+const SHOWN_UNKNOWN: u8 = 0;
+const SHOWN_NO: u8 = 1;
+const SHOWN_YES: u8 = 2;
 
 thread_local! {
     /// Поток выполняет запрос внутри `isolate`: его паника не роняет ядро.
@@ -34,16 +51,21 @@ thread_local! {
 
 /// Текст паники: поток, место в коде, сообщение.
 fn describe(thread: Option<&str>, location: Option<String>, payload: &dyn Any) -> String {
-    let message = payload
-        .downcast_ref::<&str>()
-        .copied()
-        .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
-        .unwrap_or("non-string panic payload");
+    let message = payload_text(payload);
     let thread = thread.unwrap_or("unnamed");
     match location {
         Some(at) => format!("panic in thread '{thread}' at {at}: {message}"),
         None => format!("panic in thread '{thread}': {message}"),
     }
+}
+
+/// Сообщение паники.
+fn payload_text(payload: &dyn Any) -> &str {
+    payload
+        .downcast_ref::<&str>()
+        .copied()
+        .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+        .unwrap_or("non-string panic payload")
 }
 
 fn describe_hook(info: &PanicHookInfo) -> String {
@@ -199,13 +221,56 @@ pub fn window_log_dir(base: &Path, log_dir: &str) -> PathBuf {
 pub fn install_window(log_dir: PathBuf) {
     std::panic::set_hook(Box::new(move |info| {
         let text = describe_hook(info);
-        report_window_failure(&log_dir, &text, "crash.window");
+        let message = payload_text(info.payload());
+        let gpu = relaunch::is_gpu_failure(info.location().map(|l| l.file()), message);
+        fail_window(&log_dir, &text, "crash.window", gpu.then_some(message));
     }));
 }
 
-/// Окно не может продолжать: причина — в `crash.log` и пользователю в сообщении, процесс завершается с кодом 1.
-/// `key` — текст сообщения (`{0}` — причина, `{1}` — где подробности).
-pub fn report_window_failure(log_dir: &Path, text: &str, key: &str) -> ! {
+/// Видеоадаптер окна — в каждую строку `crash.log` окна. Задаётся один раз, когда eframe создал устройство wgpu.
+pub fn remember_gpu(name: &str, backend: &str, driver: &str, driver_info: &str) {
+    // Второй вызов (второго устройства у окна нет) ничего не меняет: важен адаптер, на котором окно работает с начала.
+    let _ = GPU.set(gpu_text(name, backend, driver, driver_info));
+}
+
+fn gpu_text(name: &str, backend: &str, driver: &str, driver_info: &str) -> String {
+    let or_dash = |s: &str| if s.trim().is_empty() { "-".to_string() } else { s.trim().to_string() };
+    format!("gpu: {}, backend {}, driver {}, driver_info {}", or_dash(name), or_dash(backend), or_dash(driver), or_dash(driver_info))
+}
+
+/// Окно показано или спрятано (в трей). Пишет поток окна при каждой смене видимости.
+pub fn set_window_shown(shown: bool) {
+    WINDOW_SHOWN.store(if shown { SHOWN_YES } else { SHOWN_NO }, Ordering::SeqCst);
+}
+
+fn window_shown() -> Option<bool> {
+    match WINDOW_SHOWN.load(Ordering::SeqCst) {
+        SHOWN_YES => Some(true),
+        SHOWN_NO => Some(false),
+        _ => None,
+    }
+}
+
+/// Окно не открылось (`eframe::run_native` вернул ошибку). Окно, запущенное перезапуском после сбоя GPU
+/// (`after_crash`), попадает сюда, если драйвер видеокарты после сброса ещё не поднялся: это тот же сбой, поэтому
+/// после паузы новая попытка в пределах `relaunch`, а не сообщение, после которого окно осталось бы закрытым.
+pub fn report_start_failure(log_dir: &Path, text: &str, after_crash: bool) -> ! {
+    let gpu_cause = start_failure_gpu_cause(text, after_crash);
+    if gpu_cause.is_some() {
+        std::thread::sleep(relaunch::START_RETRY_PAUSE);
+    }
+    fail_window(log_dir, text, "crash.start", gpu_cause)
+}
+
+fn start_failure_gpu_cause(text: &str, after_crash: bool) -> Option<&str> {
+    after_crash.then_some(text)
+}
+
+/// Сбой окна. `gpu_cause` — сообщение паники в слое GPU: тогда окно перезапускается (`relaunch`) и выходит без
+/// сообщения пользователю. Перезапуск не состоялся (предел, ошибка) или сбой не в GPU — как раньше: сообщение и
+/// выход с кодом 1. `key` — текст сообщения (`{0}` — причина, `{1}` — где подробности). Новый процесс запускается до записи `crash.log`, потому что строка несёт его pid; читать её он
+/// может только после выхода этого процесса — он ждёт его (`relaunch::take_after_crash`).
+fn fail_window(log_dir: &Path, text: &str, key: &str, gpu_cause: Option<&str>) -> ! {
     if WINDOW_REPORTING.swap(true, Ordering::SeqCst) {
         // О сбое уже сообщает другой поток и сам завершит процесс; этот (часто — UI-поток, упавший на отравленной
         // блокировке) ждёт, чтобы окно не закрылось раньше, чем пользователь прочтёт сообщение.
@@ -213,12 +278,43 @@ pub fn report_window_failure(log_dir: &Path, text: &str, key: &str) -> ! {
             std::thread::park();
         }
     }
-    let file = log_dir.join("crash.log");
-    let saved = match append_crash(&file, text) {
+    let (outcome, note) = match gpu_cause {
+        None => (Outcome::NotGpu, None),
+        Some(cause) => {
+            let args: Vec<String> = std::env::args().skip(1).collect();
+            let next = relaunch::relaunch_args(&args, std::process::id(), window_shown());
+            let history = log_dir.join(relaunch::HISTORY_FILE);
+            relaunch::relaunch(&history, crate::monitor::unix_now(), || relaunch::spawn_window(&next, cause))
+        }
+    };
+    let file = log_dir.join(CRASH_LOG);
+    let line = crash_line(text, GPU.get().map(String::as_str), &outcome, note.as_deref());
+    let saved = match append_crash(&file, &line) {
         Ok(()) => file.display().to_string(),
         Err(e) => crate::fsutil::io_ctx(&file, e),
     };
+    if let Outcome::Relaunched(_) = outcome {
+        terminate_now();
+    }
     show_error(&crate::i18n::trf(key, &[text, &saved]));
+    std::process::exit(1);
+}
+
+/// Строка `crash.log` окна: причина, видеоадаптер, итог перезапуска и, если была, заметка (испорченная история).
+fn crash_line(text: &str, gpu: Option<&str>, outcome: &Outcome, note: Option<&str>) -> String {
+    let gpu = gpu.unwrap_or("gpu: unknown (not initialised)");
+    match note {
+        Some(note) => format!("{text} | {gpu} | relaunch: {outcome} | {note}"),
+        None => format!("{text} | {gpu} | relaunch: {outcome}"),
+    }
+}
+
+/// Выйти сразу, без `ExitProcess`: тот отключает каждую DLL, в том числе драйвер видеокарты, который только что
+/// сбросился, и зависание там держало бы новое окно в ожидании этого pid. `crash.log` уже закрыт.
+fn terminate_now() -> ! {
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, TerminateProcess};
+    unsafe { TerminateProcess(GetCurrentProcess(), 1) };
+    // TerminateProcess текущего процесса не возвращается; если вернулся — обычный выход.
     std::process::exit(1);
 }
 
@@ -235,7 +331,7 @@ fn append_crash(file: &Path, text: &str) -> std::io::Result<()> {
 /// Сообщение об ошибке. Показывается из отдельного потока: модальный цикл сообщения в UI-потоке раздавал бы
 /// сообщения окну, которое как раз упало, и его обработчики могли бы паниковать снова.
 fn show_error(text: &str) {
-    let text: Vec<u16> = crate::win::wide(&text);
+    let text: Vec<u16> = crate::win::wide(text);
     // В потоке только вызов MessageBoxW — паниковать там нечему, так что ожидание `join` конечно: оно длится,
     // пока пользователь не закроет сообщение.
     let shown = std::thread::Builder::new().name("crash-message".into()).spawn({
@@ -267,6 +363,28 @@ mod tests {
     fn window_log_dir_is_relative_to_the_program_unless_absolute() {
         assert_eq!(window_log_dir(Path::new("app"), "logs"), Path::new("app").join("logs"));
         assert_eq!(window_log_dir(Path::new("app"), r"D:ogs"), Path::new(r"D:ogs"));
+    }
+
+    #[test]
+    fn start_failure_after_a_gpu_relaunch_is_retried_and_a_plain_one_is_not() {
+        assert_eq!(start_failure_gpu_cause("no suitable adapter", true), Some("no suitable adapter"));
+        assert_eq!(start_failure_gpu_cause("no suitable adapter", false), None);
+    }
+
+    #[test]
+    fn crash_line_carries_gpu_and_relaunch_outcome() {
+        let gpu = gpu_text("NVIDIA GeForce RTX 3080 Ti", "dx12", "32.0.15.6094", "");
+        assert_eq!(gpu, "gpu: NVIDIA GeForce RTX 3080 Ti, backend dx12, driver 32.0.15.6094, driver_info -");
+        assert_eq!(
+            crash_line("panic in thread 'main' at x.rs:1:2: boom", Some(&gpu), &Outcome::Relaunched(42), None),
+            format!("panic in thread 'main' at x.rs:1:2: boom | {gpu} | relaunch: relaunched as pid 42")
+        );
+        assert_eq!(
+            crash_line("boom", None, &Outcome::LimitReached(3), Some("relaunch history unreadable, treated as empty: x")),
+            "boom | gpu: unknown (not initialised) | relaunch: limit reached: 3 relaunches in the last 10 min, not relaunched \
+             | relaunch history unreadable, treated as empty: x"
+        );
+        assert_eq!(crash_line("boom", None, &Outcome::NotGpu, None), "boom | gpu: unknown (not initialised) | relaunch: not relaunched: not a video adapter failure");
     }
 
     #[test]

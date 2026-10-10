@@ -46,11 +46,11 @@ fn fetch_store_info(
     let result = fetch(tunnel);
     match &result {
         Ok(info) => {
-            lock(&infos).insert(tunnel.to_string(), (info.clone(), tr("det.from_store")));
+            lock(infos).insert(tunnel.to_string(), (info.clone(), tr("det.from_store")));
         }
         Err(_) => std::thread::sleep(retry),
     }
-    lock(&loading).remove(tunnel);
+    lock(loading).remove(tunnel);
     result.map(|_| ())
 }
 

@@ -279,75 +279,6 @@ fn running_pipes() -> io::Result<Vec<String>> {
     Ok(names)
 }
 
-#[cfg(test)]
-mod tests {
-    /// Паника потока с замком демо-туннелей не роняет следующих: список восстанавливается, команды идут дальше.
-    #[test]
-    fn demo_survives_a_poisoned_lock() {
-        use super::TunnelHost;
-        let demo = std::sync::Arc::new(super::Demo::new());
-        let d = demo.clone();
-        let _ = std::thread::spawn(move || {
-            let _g = d.running.lock().unwrap();
-            panic!("poison it");
-        })
-        .join();
-        assert!(demo.running.is_poisoned());
-        assert_eq!(demo.running().unwrap(), ["home.nl-ams.full"]);
-        demo.connect("lab.sg.v4").unwrap();
-        assert_eq!(demo.running().unwrap(), ["home.nl-ams.full", "lab.sg.v4"]);
-        assert!(!demo.running.is_poisoned());
-    }
-
-    #[test]
-    fn hung_process_is_killed_at_the_deadline() {
-        let started = std::time::Instant::now();
-        let mut cmd = std::process::Command::new("ping");
-        cmd.args(["-n", "30", "127.0.0.1"]);
-        let err = super::run_with_deadline(&mut cmd, std::time::Duration::from_millis(300)).unwrap_err();
-        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut, "{err}");
-        assert!(started.elapsed() < std::time::Duration::from_secs(10), "ждали процесс, а не предел");
-    }
-
-    #[test]
-    fn leftover_child_holding_stderr_does_not_block_after_the_process_exits() {
-        // `start /b` запускает ping с унаследованным stderr и сразу выходит: канал остаётся открытым у потомка.
-        let started = std::time::Instant::now();
-        let mut cmd = std::process::Command::new("cmd");
-        cmd.args(["/c", "start /b ping -n 8 127.0.0.1 >nul & exit 0"]);
-        let out = super::run_with_deadline_grace(&mut cmd, std::time::Duration::from_secs(30), std::time::Duration::from_millis(300)).unwrap();
-        assert!(out.status.success());
-        assert!(started.elapsed() < std::time::Duration::from_secs(5), "ждали потомка, а не предел: {:?}", started.elapsed());
-    }
-
-    #[test]
-    fn finished_process_returns_exit_code_and_stderr() {
-        let mut cmd = std::process::Command::new("cmd");
-        cmd.args(["/c", "echo boom 1>&2 & exit 3"]);
-        let out = super::run_with_deadline(&mut cmd, std::time::Duration::from_secs(30)).unwrap();
-        assert_eq!(out.status.code(), Some(3));
-        assert!(String::from_utf8_lossy(&out.stderr).contains("boom"));
-    }
-
-    #[test]
-    fn demo_counter_only_grows() {
-        let mut prev = 0;
-        for i in 1..3000 {
-            let now = super::demo_bytes(i as f64 * 0.25, 60_000.0, 2.1);
-            assert!(now > prev, "t={}", i as f64 * 0.25);
-            prev = now;
-        }
-    }
-
-    #[test]
-    fn lists_pipes_on_windows() {
-        // Каналы есть в любой работающей Windows; ошибка здесь = неверный путь к пространству каналов.
-        let all = std::fs::read_dir(crate::uapi::PIPE_ROOT).unwrap().count();
-        assert!(all > 0);
-        super::running_pipes().unwrap();
-    }
-}
-
 pub struct Demo {
     names: Vec<String>,
     running: Mutex<BTreeSet<String>>,
@@ -422,4 +353,73 @@ pub fn native_exe() -> PathBuf {
     // Не из переменной окружения: её пользователь может подменить, а помощник ядра запускает этот exe
     // с правами администратора.
     crate::win::service_binary(MANAGER_SERVICE).unwrap_or_else(|| crate::win::program_files().join("AmneziaWG").join("amneziawg.exe"))
+}
+
+#[cfg(test)]
+mod tests {
+    /// Паника потока с замком демо-туннелей не роняет следующих: список восстанавливается, команды идут дальше.
+    #[test]
+    fn demo_survives_a_poisoned_lock() {
+        use super::TunnelHost;
+        let demo = std::sync::Arc::new(super::Demo::new());
+        let d = demo.clone();
+        let _ = std::thread::spawn(move || {
+            let _g = d.running.lock().unwrap();
+            panic!("poison it");
+        })
+        .join();
+        assert!(demo.running.is_poisoned());
+        assert_eq!(demo.running().unwrap(), ["home.nl-ams.full"]);
+        demo.connect("lab.sg.v4").unwrap();
+        assert_eq!(demo.running().unwrap(), ["home.nl-ams.full", "lab.sg.v4"]);
+        assert!(!demo.running.is_poisoned());
+    }
+
+    #[test]
+    fn hung_process_is_killed_at_the_deadline() {
+        let started = std::time::Instant::now();
+        let mut cmd = std::process::Command::new("ping");
+        cmd.args(["-n", "30", "127.0.0.1"]);
+        let err = super::run_with_deadline(&mut cmd, std::time::Duration::from_millis(300)).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut, "{err}");
+        assert!(started.elapsed() < std::time::Duration::from_secs(10), "ждали процесс, а не предел");
+    }
+
+    #[test]
+    fn leftover_child_holding_stderr_does_not_block_after_the_process_exits() {
+        // `start /b` запускает ping с унаследованным stderr и сразу выходит: канал остаётся открытым у потомка.
+        let started = std::time::Instant::now();
+        let mut cmd = std::process::Command::new("cmd");
+        cmd.args(["/c", "start /b ping -n 8 127.0.0.1 >nul & exit 0"]);
+        let out = super::run_with_deadline_grace(&mut cmd, std::time::Duration::from_secs(30), std::time::Duration::from_millis(300)).unwrap();
+        assert!(out.status.success());
+        assert!(started.elapsed() < std::time::Duration::from_secs(5), "ждали потомка, а не предел: {:?}", started.elapsed());
+    }
+
+    #[test]
+    fn finished_process_returns_exit_code_and_stderr() {
+        let mut cmd = std::process::Command::new("cmd");
+        cmd.args(["/c", "echo boom 1>&2 & exit 3"]);
+        let out = super::run_with_deadline(&mut cmd, std::time::Duration::from_secs(30)).unwrap();
+        assert_eq!(out.status.code(), Some(3));
+        assert!(String::from_utf8_lossy(&out.stderr).contains("boom"));
+    }
+
+    #[test]
+    fn demo_counter_only_grows() {
+        let mut prev = 0;
+        for i in 1..3000 {
+            let now = super::demo_bytes(i as f64 * 0.25, 60_000.0, 2.1);
+            assert!(now > prev, "t={}", i as f64 * 0.25);
+            prev = now;
+        }
+    }
+
+    #[test]
+    fn lists_pipes_on_windows() {
+        // Каналы есть в любой работающей Windows; ошибка здесь = неверный путь к пространству каналов.
+        let all = std::fs::read_dir(crate::uapi::PIPE_ROOT).unwrap().count();
+        assert!(all > 0);
+        super::running_pipes().unwrap();
+    }
 }

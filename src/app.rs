@@ -89,6 +89,8 @@ pub struct Start {
     pub about: bool,
     /// Settings.ini был, но не прочитался (отодвинут в сторону): сказать об этом в журнале и в `window-errors.log`.
     pub settings_problem: Option<crate::ini::Unreadable>,
+    /// Окно перезапущено после сбоя видеоадаптера (`--after-crash`): сказать об этом в журнале и подсказкой.
+    pub after_crash: Option<crate::crash::relaunch::AfterCrash>,
 }
 
 enum Action {
@@ -219,6 +221,15 @@ fn base_style(ctx: &egui::Context) {
     });
 }
 
+/// Окно перезапущено после сбоя видеоадаптера: одно событие в журнале и подсказка с причиной и путём к `crash.log`
+/// (`log_dir` — каталог журналов окна); прежнее окно не дождались — ещё предупреждение.
+fn report_after_crash(shared: &Shared, notice: &Notices, after: &crate::crash::relaunch::AfterCrash, log_dir: &std::path::Path) {
+    if let Some(warning) = after.wait_warning() {
+        shared.log("", crate::events::Severity::Warn, &warning);
+    }
+    notice.warn(after.notice(&log_dir.join(crate::crash::CRASH_LOG)));
+}
+
 /// Наименьшая ширина таблицы туннелей и наименьшая ширина карточки туннеля справа от неё: две кнопки по 140–150 pt
 /// и хотя бы ~80 pt имени рядом с ними, сетка состояния из четырёх колонок (4x60 + 3x24). Таблица не шире, чем
 /// остаётся после карточки, и не больше 60 % окна: раньше сохранённые 520 pt в окне 760 оставляли карточке 240, и её
@@ -245,6 +256,11 @@ impl App {
             Ok(RawWindowHandle::Win32(w)) => w.hwnd.get(),
             _ => 0,
         };
+        // Видеоадаптер — в строку crash.log, если окно упадёт: сбой драйвера видно без отдельного расследования.
+        if let Some(rs) = &cc.wgpu_render_state {
+            let gpu = rs.adapter.get_info();
+            crate::crash::remember_gpu(&gpu.name, gpu.backend.to_str(), &gpu.driver, &gpu.driver_info);
+        }
         // Служба менеджера AmneziaWG — забота ядра, пинг — агента; в демо пинг выдуманный, прямо в окне.
         let action_error = ErrorSink::new(shared.clone(), ctx.clone());
         let core: Core = match &start.demo {
@@ -305,8 +321,13 @@ impl App {
             modals.open(Modal::About);
         }
         let notice = Notices::new(shared.clone());
+        if let Some(after) = &start.after_crash {
+            report_after_crash(&shared, &notice, after, &crate::crash::window_log_dir(&start.base_dir, &start.settings.log_dir));
+        }
         let updates = UpdatesWindow::new(updates::Link::new(agent.clone(), action_error.clone(), notice.clone(), ctx.clone()));
         let start_hidden = start.hidden && start.settings.tray;
+        // Начальная видимость для перезапуска после сбоя; дальше её ведёт трей (`WM_SHOWWINDOW`).
+        crate::crash::set_window_shown(!start_hidden);
         let saved_text = if start.settings_path.exists() { start.settings.to_ini().to_text() } else { String::new() };
         let graph = GraphState { pause: GraphPause::default(), feed: history_feed::HistoryFeed::real(agent.clone(), ctx.clone()) };
         App {

@@ -208,7 +208,7 @@ fn window(exe: &Path) -> Result<HWND, String> {
     if let Some(h) = find_window() {
         return Ok(h);
     }
-    std::process::Command::new(exe).spawn().map_err(|e| crate::fsutil::io_ctx(&exe, e))?;
+    std::process::Command::new(exe).spawn().map_err(|e| crate::fsutil::io_ctx(exe, e))?;
     let deadline = Instant::now() + WINDOW_TIMEOUT;
     while Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(250));
