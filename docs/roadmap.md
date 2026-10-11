@@ -43,6 +43,8 @@ Full per-version lists are in the [changelog](../CHANGELOG.md). Only the headlin
 13. **0.5.8** (2026.10.10): the core really re-applies its restart-on-failure actions at start (no more "Access is
    denied" warning); after a reboot it waits for a tunnel service that Windows is still starting instead of tearing it
    down.
+14. **0.5.9** (2026.10.11): a tunnel whose server goes silent right after a handshake (a lost NAT mapping) is restarted
+   after 30 s of silence instead of 3 minutes, so sessions inside the tunnel (RDP and the like) reconnect by themselves.
 
 ## Next
 

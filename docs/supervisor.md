@@ -147,13 +147,19 @@ The schedule above sees only stopped and missing services. A tunnel whose servic
 handled by the dead-tunnel watch: decisions in `src/daemon/deadwatch.rs`, applied by `Core::watch_dead` in `src/daemon/server.rs` on every supervisor
 tick, from the core's 1 s poll (`src/monitor.rs`, `Live`: last handshake, rx/tx byte counters). Always on, no setting.
 
-1. **Dead** means all of:
-   1. the tunnel is desired and its service runs;
-   2. no handshake for more than `STALE_HANDSHAKE_SECS` (180 s, `src/health.rs`), or none at all. WireGuard renews the handshake every 2 min while
-      traffic flows and rejects session keys older than 3 min, so past 180 s no data can pass;
-   3. over the last `WINDOW` (60 s) the sent counter grew and the received one did not. Handshake attempts count as sent bytes, so an unreachable peer
-      shows as sending without receiving. An idle tunnel sends nothing and is **not** dead, however old its handshake.
-   After a restart only samples of the new service count, so the window fills again; samples older than 10 s (poll not running) decide nothing.
+1. **Dead** means the tunnel is desired, its service runs, and one of two signs holds:
+   1. **Silent peer**, whatever the age of the handshake: over the last `SILENT` (30 s) the sent counter grew by at least `SILENT_MIN_TX` (1 KB)
+      and the received one did not grow at all. A live WireGuard peer answers received data within 10 s (with data or an empty keepalive), and after
+      15 s without an answer WireGuard starts a handshake itself, which a live peer answers in a fraction of a second. The 1 KB floor keeps an idle
+      tunnel with `PersistentKeepalive` alive: the peer does not answer empty keepalives, and even one per second is under 1 KB in 30 s. This catches a
+      drop right after a handshake (a router or provider that lost the connection mapping): with the stale-handshake sign alone the restart came
+      3 minutes later, and sessions inside the tunnel (RDP and the like) had already dropped.
+   2. **Stale handshake**, for tunnels with little traffic: no handshake for more than `STALE_HANDSHAKE_SECS` (180 s, `src/health.rs`), or none at
+      all, and over the last `WINDOW` (60 s) the sent counter grew while the received one did not. WireGuard renews the handshake every 2 min while
+      traffic flows and rejects session keys older than 3 min, so past 180 s no data can pass.
+   Handshake attempts count as sent bytes, so an unreachable peer shows as sending without receiving. An idle tunnel sends nothing and is **not**
+   dead, however old its handshake. After a restart only samples of the new service count, so both windows fill again; samples older than 10 s
+   (poll not running) decide nothing.
 2. **Restart.** The ordinary switch with `Reconnect` (origin "dead"), under the `switching` lock, of this tunnel only (its running neighbours are not
    touched). It does nothing if the tunnel no longer runs (the retry schedule brings it up), is no longer desired or is held. A restart that fails while the
    tunnel is still running (the disconnect step failed, the service kept going) is not handed to the retry schedule: that schedule would see a running
@@ -206,7 +212,7 @@ The event log (`events.log`, shown in the window) gets these supervisor lines; t
 | `<t> connected after N attempts` | info | tunnel confirmed after at least one attempt of the core, any phase |
 | `Connected` | info | tunnel came up without an attempt of the core (confirmed after 5 s) |
 | `Reconnecting <t>: started over by the user` | info | `Retry` |
-| `<t>: no handshake for over 3 minutes, the tunnel is sending but receives nothing - restarting it` | warning | a dead tunnel detected (once per drop) |
+| `<t>: the tunnel is sending but receives nothing, the server does not answer - restarting it` | warning | a dead tunnel detected (once per drop) |
 | `<t>: dead tunnel restarted (restart N)[, error: ...]` | warning | restarts 1-3 (pauses 1, 2, 5 min) |
 | `<t> still has no connection after N restarts. Next - one restart every 10 minutes[, error: ...]` | error, with a notification | once, on entering the 10-minute phase; later restarts are **not** logged |
 | `<t> came back after N restarts` | info | a fresh handshake after at least one restart |

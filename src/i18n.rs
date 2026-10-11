@@ -296,7 +296,7 @@ const STRINGS: &[(&str, &str, &str)] = &[
     ("core.retry_restarted", "Reconnecting {0}: started over by the user", "Переподключение {0}: заново по команде пользователя"),
     ("core.retry_not_desired", "{0} is not among the tunnels to keep connected", "{0} нет среди туннелей, которые нужно держать подключёнными"),
     ("core.retry_outside", "{0} was disconnected outside this program (its service is gone): it will not be reconnected", "{0} отключён вне программы (его службы нет): переподключаться не будет"),
-    ("core.dead_detected", "{0}: no handshake for over 3 minutes, the tunnel is sending but receives nothing — restarting it", "{0}: рукопожатия нет больше 3 минут, туннель шлёт, но ничего не получает — перезапускаю"),
+    ("core.dead_detected", "{0}: the tunnel is sending but receives nothing, the server does not answer — restarting it", "{0}: туннель шлёт, но ничего не получает, сервер не отвечает — перезапускаю"),
     ("core.dead_restarted", "{0}: dead tunnel restarted (restart {1})", "{0}: мёртвый туннель перезапущен (перезапуск {1})"),
     ("core.dead_restart_failed", ", error: {0}", ", ошибка: {0}"),
     ("core.dead_slow", "{0} still has no connection after {1} restarts. Next — one restart every 10 minutes", "У {0} всё ещё нет связи после {1} перезапусков. Дальше — перезапуск раз в 10 минут"),
