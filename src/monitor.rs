@@ -218,8 +218,12 @@ pub struct FrameView<'a> {
 pub struct PendingGuard {
     shared: Arc<Shared>,
     names: Vec<String>,
-    /// Из `names` — те, что команда останавливает: после неё они остаются в `Shared::stopped`.
+    /// Из `names` — те, что команда останавливает.
     stopping: Vec<String>,
+    /// Из `stopping` — те, чью остановку команда подтвердила (`stopped`): только они после неё остаются в
+    /// `Shared::stopped`. Сорвавшаяся остановка отметки не оставляет: туннель работает, и его падение в ближайшие
+    /// `STOP_MARK_TTL` — авария, а не «отключён по запросу» (аудит 2026-10-11, п. 3).
+    confirmed: Vec<String>,
 }
 
 impl PendingGuard {
@@ -228,7 +232,16 @@ impl PendingGuard {
         if let Some(i) = self.names.iter().position(|n| n == name) {
             self.names.swap_remove(i);
             self.stopping.retain(|n| n != name);
+            self.confirmed.retain(|n| n != name);
             lock(&self.shared.pending).remove(name);
+        }
+    }
+
+    /// Команда остановила туннель (вызов отключения удался): после неё он помечается «остановлен по запросу».
+    /// Туннель, который команда не останавливает, не помечается.
+    pub fn stopped(&mut self, name: &str) {
+        if self.stopping.iter().any(|n| n == name) && !self.confirmed.iter().any(|n| n == name) {
+            self.confirmed.push(name.to_string());
         }
     }
 }
@@ -240,7 +253,7 @@ impl Drop for PendingGuard {
             pending.remove(name);
         }
         let (mut stopped, now) = (lock(&self.shared.stopped), Instant::now());
-        stopped.extend(self.stopping.iter().map(|n| (n.clone(), now)));
+        stopped.extend(self.confirmed.iter().map(|n| (n.clone(), now)));
     }
 }
 
@@ -444,7 +457,7 @@ impl Shared {
             }
             names.push(name);
         }
-        PendingGuard { shared: self.clone(), names, stopping }
+        PendingGuard { shared: self.clone(), names, stopping, confirmed: Vec::new() }
     }
 
     /// Занять туннель, если он не занят: проверка и пометка — под одним замком, два нажатия подряд не пройдут оба.
@@ -456,7 +469,7 @@ impl Shared {
         pending.insert(name.to_string(), label);
         lock(&self.stopped).remove(name);
         let stopping = if is_stop_label(label) { vec![name.to_string()] } else { Vec::new() };
-        Some(PendingGuard { shared: self.clone(), names: vec![name.to_string()], stopping })
+        Some(PendingGuard { shared: self.clone(), names: vec![name.to_string()], stopping, confirmed: Vec::new() })
     }
 
     /// Туннели «по команде»: те, с которыми она работает сейчас, и остановленные ею, пока монитор не увидел их
@@ -473,6 +486,12 @@ impl Shared {
     /// которую он уже учёл (или туннеля больше нет), помнить незачем.
     fn settle_stops(&self, levels: &BTreeMap<String, Health>) {
         lock(&self.stopped).retain(|name, _| levels.get(name).is_some_and(|h| h.level != Level::Off));
+    }
+
+    /// Тестам ядра: туннели с отметкой «остановлен по запросу».
+    #[cfg(test)]
+    pub(crate) fn stop_marks(&self) -> BTreeSet<String> {
+        lock(&self.stopped).keys().cloned().collect()
     }
 
     // --- настройки фоновых потоков
@@ -913,7 +932,10 @@ mod tests {
         };
         round(&mut watch, Level::Ok);
         // Переключение A → B: A отключается под пометкой «занят»; пометка снята до того, как опрос увидел остановку.
-        drop(shared.pending_guard([("a".to_string(), "busy.disconnect"), ("b".to_string(), "busy.connect")]));
+        let mut busy = shared.pending_guard([("a".to_string(), "busy.disconnect"), ("b".to_string(), "busy.connect")]);
+        busy.stopped("a");
+        busy.stopped("b"); // не останавливаемый командой — не помечается
+        drop(busy);
         round(&mut watch, Level::Ok);
         round(&mut watch, Level::Off);
         round(&mut watch, Level::Off);
@@ -928,17 +950,40 @@ mod tests {
         assert_eq!(last, Some((Severity::Bad, tr("ev.dropped"))));
     }
 
+    /// Аудит 2026-10-11, п. 3: команда остановки сорвалась (туннель работает) — отметки «остановлен по запросу» нет,
+    /// и настоящее падение в следующие 30 с — авария (FAIL), а не «Отключён по запросу».
+    #[test]
+    fn a_failed_stop_leaves_no_mark_and_a_later_drop_is_a_failure() {
+        let shared = shared();
+        *lock(&shared.snapshot) = Snapshot { tunnels: ["a".to_string()].into(), ..Default::default() };
+        let (mut watch, none) = (Watch::default(), BTreeMap::new());
+        let levels = |a| BTreeMap::from([("a".to_string(), Health::new(a, "t".into()))]);
+        let round = |watch: &mut Watch, level| {
+            let (_, user, _) = shared.levels();
+            react(&shared, watch, &levels(level), &user, &none, true);
+        };
+        round(&mut watch, Level::Ok);
+        // Остановка не подтверждена (команда вернула ошибку): охранник уничтожен без `stopped`.
+        drop(shared.pending_guard([("a".to_string(), "busy.disconnect")]));
+        round(&mut watch, Level::Ok);
+        round(&mut watch, Level::Ok);
+        round(&mut watch, Level::Off);
+        let last = shared.events_since(0).pop().map(|(_, e)| (e.severity, e.text));
+        assert_eq!(last, Some((Severity::Bad, tr("ev.dropped"))));
+    }
+
     /// Новая команда отменяет отметку об остановке; отметка истекает, если монитор так и не увидел отключения.
     #[test]
     fn stop_mark_is_replaced_by_a_new_command_and_expires() {
         let shared = shared();
         let now = Instant::now();
-        drop(shared.pending_guard([("a".to_string(), "busy.disconnect")]));
+        let confirmed = |mut g: PendingGuard| g.stopped("a");
+        confirmed(shared.pending_guard([("a".to_string(), "busy.disconnect")]));
         assert!(shared.in_command(now).contains("a"));
         drop(shared.pending_guard([("a".to_string(), "busy.connect")]));
         assert!(shared.in_command(now).is_empty(), "поднятый заново туннель не «остановлен по запросу»");
 
-        drop(shared.try_pending_guard("a", "busy.disconnect"));
+        confirmed(shared.try_pending_guard("a", "busy.disconnect").unwrap());
         assert!(shared.in_command(now).contains("a"));
         assert!(shared.in_command(now + STOP_MARK_TTL + Duration::from_secs(1)).is_empty(), "истекла");
         drop(shared.pending_guard([("a".to_string(), "busy.reconnect")]));

@@ -616,10 +616,11 @@ impl Core {
         };
         // Отключаемые попутно — тоже «по команде», а не авария.
         mark("switch: marking tunnels busy");
-        let _busy = self.shared.pending_guard(std::iter::once((name.to_string(), label)).chain(others.iter().map(|o| (o.clone(), "busy.disconnect"))));
+        let mut busy = self.shared.pending_guard(std::iter::once((name.to_string(), label)).chain(others.iter().map(|o| (o.clone(), "busy.disconnect"))));
         mark("switch: engine calls begin");
         let result = run_switch(b.as_ref(), name, plan, &others);
         mark("switch: engine calls done");
+        confirm_stops(&mut busy, b.as_ref(), std::iter::once(name).chain(others.iter().map(String::as_str)), result.is_ok());
         if let Err(e) = &result {
             if origin == Origin::User {
                 self.shared.log(name, Severity::Bad, e);
@@ -746,6 +747,9 @@ impl Core {
         };
         // Хоста нет только при ошибке в программе: её уже пишет любой запрос окна (`host`), такт просто ждёт.
         let Ok(host) = self.host() else { return };
+        // Заметки хранителей DNS — до чтения списков туннелей: `prune` удаляет только файлы из этого перечня, а туннель,
+        // импортированный и подключённый, пока такт читает списки, пишет свой файл уже после перечня (аудит 2026-10-11, п. 13.3).
+        let mut dns_notes = lock(&self.dns_notes).take();
         let running = host.running().ok();
         let tick = lock(&self.retries).tick(
             now,
@@ -776,7 +780,6 @@ impl Core {
         for (t, note) in tick.notes {
             self.log_note(&t, note);
         }
-        let mut dns_notes = lock(&self.dns_notes).take();
         // Файлы заметок удалённых и переименованных туннелей: удаляет читающий их — ядро. Только в режиме 2 (в
         // режиме 1 список хоста — туннели AmneziaWG, не хранилища) и только при удавшемся чтении обоих списков.
         if self.mode() == Mode::Engine {
@@ -995,8 +998,9 @@ impl Core {
         let running = old.running().map_err(|e| e.to_string())?;
         // Отключение по смене режима — по команде, не авария (без тревожных событий и уведомлений).
         let disconnected = {
-            let _busy = self.shared.pending_guard(running.iter().map(|t| (t.clone(), "busy.disconnect")));
-            running.iter().try_for_each(|t| old.disconnect(t))
+            let mut busy = self.shared.pending_guard(running.iter().map(|t| (t.clone(), "busy.disconnect")));
+            // «Остановлен по запросу» — только те, чьё отключение удалось (аудит 2026-10-11, п. 3).
+            running.iter().try_for_each(|t| old.disconnect(t).map(|()| busy.stopped(t)))
         };
         disconnected?;
         let mut saving = lock(&self.saving);
@@ -1101,6 +1105,16 @@ pub(crate) fn run_switch(host: &dyn TunnelHost, name: &str, plan: Plan, others: 
         mark("engine: service up (or wait timed out)");
     }
     Ok(())
+}
+
+/// Подтвердить охраннику остановку туннелей команды (аудит 2026-10-11, п. 3): отметку «остановлен по запросу» ставит
+/// только удавшаяся остановка. Переключение удалось — остановлены все снимаемые; сорвалось — только те, кого нет в
+/// удавшемся чтении списка работающих (не прочитался — ни один: сомнение решается в пользу аварии, а не тишины).
+/// Туннели, которые команда не останавливает, охранник пропускает сам.
+fn confirm_stops<'a>(busy: &mut PendingGuard, host: &dyn TunnelHost, names: impl Iterator<Item = &'a str>, switched: bool) {
+    let running = if switched { Some(Vec::new()) } else { host.running().ok() };
+    let Some(running) = running else { return };
+    names.filter(|t| !running.iter().any(|r| r == t)).for_each(|t| busy.stopped(t));
 }
 
 /// Туннель работает после сорвавшегося переключения; список не прочитался — «нет»: надзор лучше, чем ничего.
@@ -1341,7 +1355,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("awg-core-dns-notes-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let files = || {
-            let mut names: Vec<String> = std::fs::read_dir(&dir).unwrap().flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect();
+            let mut names: Vec<String> = std::fs::read_dir(&dir).unwrap().flatten().map(|e| e.file_name().to_string_lossy().into_owned()).filter(|n| n.ends_with(".notes")).collect();
             names.sort();
             names
         };
@@ -1722,6 +1736,33 @@ mod tests {
         assert_eq!(core.switch("a", Plan::Reconnect, false), Err("down a: refused".into()));
         assert!(lock(&core.retries).view(t0).is_empty());
         assert_eq!(journal(&core).iter().filter(|t| *t == "down a: refused").count(), 1, "{:?}", journal(&core));
+    }
+
+    /// Аудит 2026-10-11, п. 3: отметку «остановлен по запросу» ставит только подтверждённая остановка. Сорвавшееся
+    /// отключение (туннель работает) отметки не оставляет; удавшееся — оставляет.
+    #[test]
+    fn only_a_confirmed_stop_is_marked_as_stopped_on_request() {
+        let host = Arc::new(Recorder { running: Mutex::new(vec!["a".into(), "b".into()]), fail: Some("down a"), ..Default::default() });
+        let core = core_over(host.clone(), &["a", "b"]);
+        assert_eq!(core.switch("a", Plan::Disconnect, false), Err("down a: refused".into()));
+        assert!(core.shared.stop_marks().is_empty(), "{:?}", core.shared.stop_marks());
+        assert_eq!(core.switch("b", Plan::Disconnect, false), Ok(()));
+        assert_eq!(core.shared.stop_marks(), ["b".to_string()].into());
+
+        // Подключение `c` снимает остальных (`a` отказал, `b` уже снят): остановленные — с отметкой, отказавший — без.
+        let host = Arc::new(Recorder { running: Mutex::new(vec!["a".into(), "b".into()]), fail: Some("down b"), ..Default::default() });
+        let core = core_over(host.clone(), &["a", "b"]);
+        assert!(core.switch("c", Plan::Connect, false).is_err());
+        assert_eq!(core.shared.stop_marks(), ["a".to_string()].into());
+    }
+
+    /// Аудит 2026-10-11, п. 3: смена режима, не сумевшая отключить туннель, не помечает его остановленным по запросу.
+    #[test]
+    fn mode_change_marks_only_the_tunnels_it_really_stopped() {
+        let host = Arc::new(Recorder { running: Mutex::new(vec!["a".into(), "b".into()]), fail: Some("down b"), ..Default::default() });
+        let core = core_over(host.clone(), &["a", "b"]);
+        assert_eq!(core.set_mode(Mode::Overlay), Err("down b: refused".into()));
+        assert_eq!(core.shared.stop_marks(), ["a".to_string()].into());
     }
 
     /// Режим 1: переподключение по команде пользователя сорвалось на `/installtunnelservice` — службы нет. Ошибка

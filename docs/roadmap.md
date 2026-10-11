@@ -47,6 +47,8 @@ Full per-version lists are in the [changelog](../CHANGELOG.md). Only the headlin
    after 30 s of silence instead of 3 minutes, so sessions inside the tunnel (RDP and the like) reconnect by themselves.
 15. **0.5.10** (2026.10.11): with the built-in engine the profile DNS is set on the tunnel adapter (the engine ignored it, so
    names were resolved outside the tunnel); a requested tunnel switch is no longer logged as a failure.
+16. **0.5.11** (2026.10.11): DNS of the tunnel: no lost boot-time warning, re-set when Windows makes it unreadable, no
+   false warning at connect; a failed disconnect is not taken for a requested stop.
 
 ## Next
 

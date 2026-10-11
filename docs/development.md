@@ -57,6 +57,12 @@ CI runs `cargo test --release --locked`. Tests are unit tests next to the code (
 fixtures are in `tests/fixtures/`. They use mocks and temporary folders and do not touch services, other accounts or
 real tunnels.
 
+UI tests run an egui frame only through `app::testkit::RunFrame::run_frame` (`use crate::app::testkit::RunFrame as _;`),
+never through `Context::run_ui` directly: the first frame uploads the font atlas, and a `FullOutput` whose
+`TexturesDelta` is dropped unhandled panics in a debug build (`cargo test` without `--release`). `run_frame` clears the
+delta in one place (tests need no GPU). The guard test `app::tests::frames_in_tests_go_through_run_frame` fails on a
+direct call, so a new UI test that bypasses the helper breaks the build instead of failing only in debug.
+
 Tests marked `#[ignore]` are not run by default:
 
 | Test | What it needs |

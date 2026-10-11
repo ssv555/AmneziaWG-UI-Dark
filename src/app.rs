@@ -771,10 +771,13 @@ impl Switcher {
         };
         // Повторное нажатие, пока туннель переключается, — ничего не делать. Пометка снимается охранником —
         // и тогда, когда поток переключения упал.
-        let Some(busy) = self.shared.try_pending_guard(&name, label) else { return };
+        let Some(mut busy) = self.shared.try_pending_guard(&name, label) else { return };
         let (core, error, ctx) = (self.core.clone(), self.error.clone(), self.ctx.clone());
         std::thread::spawn(move || {
-            switch_through_core(core.as_ref(), &name, plan, multiple, &error);
+            // «Остановлен по запросу» — только если ядро подтвердило переключение (аудит 2026-10-11, п. 3).
+            if switch_through_core(core.as_ref(), &name, plan, multiple, &error) {
+                busy.stopped(&name);
+            }
             drop(busy);
             ctx.request_repaint();
         });
@@ -784,11 +787,14 @@ impl Switcher {
 /// Переключить туннель через ядро. Ошибку самого переключения ядро пишет в журнал — она придёт с состоянием;
 /// а если до ядра не достучались, оно отказало, не взяв запрос (`Refused`: занято), или ответ не тот, не напишет
 /// никто, и щелчок остался бы без следа.
-fn switch_through_core(core: &dyn CoreApi, name: &str, plan: Plan, multiple: bool, error: &ErrorSink) {
+/// `true` — ядро выполнило переключение.
+fn switch_through_core(core: &dyn CoreApi, name: &str, plan: Plan, multiple: bool, error: &ErrorSink) -> bool {
     let reply = core.call(Request::Switch { tunnel: name.to_string(), plan, multiple });
+    let done = matches!(reply, Ok(Response::Ok));
     if let Some(e) = switch_transport_error(reply) {
         error.push_for(name, e);
     }
+    done
 }
 
 /// «Повторить» через ядро. Отказ ядра в журнал ядра не попадает — его записывает окно, под именем туннеля.
