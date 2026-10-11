@@ -62,6 +62,8 @@ pub struct Core {
     held: Mutex<HashMap<String, PendingGuard>>,
     /// Движок заменён: такт надзора переподключит туннели режима 2 (`ReconnectEngine`).
     engine_replaced: AtomicBool,
+    /// Notes of the mode 2 DNS keepers (`tunnel_dns`) not yet put into the event log; read by the supervision tick.
+    dns_notes: Mutex<crate::tunnel_dns::Inbox>,
     /// Состояние второго процесса (агента); пишет только его сторож (`agent_watch`).
     agent: Arc<AgentCell>,
     /// До какого номера журнал ядра забрал агент: `events_after` его последнего `State` (`agent::journal`). На
@@ -158,6 +160,7 @@ pub fn run(stop: &AtomicBool, ready: impl FnOnce(), persist_tail: impl FnOnce(Ve
         retries: Mutex::default(),
         held: Mutex::default(),
         engine_replaced: AtomicBool::new(false),
+        dns_notes: Mutex::new(crate::tunnel_dns::Inbox::new(Some(crate::tunnel_dns::notes_dir()), crate::tunnel_dns::now_ms())),
         agent: Arc::default(),
         agent_took: AtomicU64::new(0),
     });
@@ -773,6 +776,18 @@ impl Core {
         for (t, note) in tick.notes {
             self.log_note(&t, note);
         }
+        let mut dns_notes = lock(&self.dns_notes).take();
+        // Файлы заметок удалённых и переименованных туннелей: удаляет читающий их — ядро. Только в режиме 2 (в
+        // режиме 1 список хоста — туннели AmneziaWG, не хранилища) и только при удавшемся чтении обоих списков.
+        if self.mode() == Mode::Engine {
+            if let (Some(running), Ok(configs)) = (running.as_deref(), host.configs()) {
+                let known: Vec<String> = configs.into_iter().chain(running.iter().cloned()).collect();
+                dns_notes.extend(lock(&self.dns_notes).prune(&known));
+            }
+        }
+        for (t, note) in dns_notes {
+            self.shared.log(&t, if note.warn { Severity::Warn } else { Severity::Info }, &note.text);
+        }
         self.unmark_held(&tick.expired);
         for t in &tick.expired {
             self.shared.log(t, Severity::Warn, &trf("core.hold_expired", &[t]));
@@ -1288,6 +1303,7 @@ mod tests {
             retries: Mutex::default(),
             held: Mutex::default(),
             engine_replaced: AtomicBool::new(false),
+            dns_notes: Mutex::new(crate::tunnel_dns::Inbox::new(None, 0)),
             agent: Arc::default(),
             agent_took: AtomicU64::new(0),
         })
@@ -1316,6 +1332,33 @@ mod tests {
         assert!(!core.shared.is_pending("a"));
         core.release(&["a".to_string()]).unwrap();
         assert_eq!(calls(&host), ["up a"], "повторный возврат ничего не делает");
+    }
+
+    /// Заметки хранителей DNS (`tunnel_dns`) удалённого или переименованного туннеля ядро убирает на такте надзора;
+    /// туннели хранилища и работающие остаются; в режиме 1 и при нечитаемом списке запущенных файлы не трогаются.
+    #[test]
+    fn supervise_tick_prunes_dns_notes_of_vanished_tunnels_only_when_it_is_sure() {
+        let dir = std::env::temp_dir().join(format!("awg-core-dns-notes-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let files = || {
+            let mut names: Vec<String> = std::fs::read_dir(&dir).unwrap().flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect();
+            names.sort();
+            names
+        };
+        let host = Arc::new(Recorder { running: Mutex::new(vec!["b".into()]), configs: Some(vec!["b".into(), "c".into()]), ..Default::default() });
+        let core = core_over(host.clone(), &[]);
+        *lock(&core.dns_notes) = crate::tunnel_dns::Inbox::new(Some(dir.clone()), 0);
+        for t in ["gone", "b", "c"] {
+            crate::tunnel_dns::Outbox::new(&dir, t, 1_000).push(&crate::tunnel_dns::Note { warn: false, text: "x".into() }).unwrap();
+        }
+        lock(&core.config).mode = Mode::Overlay;
+        core.supervise_tick(Instant::now(), false);
+        assert_eq!(files(), ["b.notes", "c.notes", "gone.notes"], "режим 1: список хоста — не хранилище");
+
+        lock(&core.config).mode = Mode::Engine;
+        core.supervise_tick(Instant::now(), false);
+        assert_eq!(files(), ["b.notes", "c.notes"], "нет в хранилище и не работает — файл убран");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Мёртвый туннель перезапускается обычным переключением ядра — только он, работающий сосед не трогается; под

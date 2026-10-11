@@ -157,6 +157,10 @@ pub struct Shared {
     snapshot: Mutex<Snapshot>,
     /// туннель → «Подключение…»/«Отключение…», пока идёт команда пользователя
     pending: Mutex<BTreeMap<String, &'static str>>,
+    /// Туннели, остановленные командой (`busy.disconnect`), которых монитор ещё не видел отключёнными: команда
+    /// кончается (пометка «занят» снята) раньше, чем опрос замечает остановку, и без этой памяти плановое
+    /// отключение при переключении A → B читалось бы как авария. Берётся после `pending`.
+    stopped: Mutex<BTreeMap<String, Instant>>,
     ping: Mutex<PingState>,
     options: Mutex<Options>,
     /// Общий с потоком `events-writer`: он кладёт сюда сбои записи файла.
@@ -214,6 +218,8 @@ pub struct FrameView<'a> {
 pub struct PendingGuard {
     shared: Arc<Shared>,
     names: Vec<String>,
+    /// Из `names` — те, что команда останавливает: после неё они остаются в `Shared::stopped`.
+    stopping: Vec<String>,
 }
 
 impl PendingGuard {
@@ -221,6 +227,7 @@ impl PendingGuard {
     pub fn release(&mut self, name: &str) {
         if let Some(i) = self.names.iter().position(|n| n == name) {
             self.names.swap_remove(i);
+            self.stopping.retain(|n| n != name);
             lock(&self.shared.pending).remove(name);
         }
     }
@@ -232,7 +239,18 @@ impl Drop for PendingGuard {
         for name in &self.names {
             pending.remove(name);
         }
+        let (mut stopped, now) = (lock(&self.shared.stopped), Instant::now());
+        stopped.extend(self.stopping.iter().map(|n| (n.clone(), now)));
     }
+}
+
+/// Сколько отметка «остановлен командой» ждёт, пока монитор увидит туннель отключённым. Опрос — раз в секунду;
+/// дольше — команда не довела остановку (паника, сбой), и позднее падение уже не её.
+const STOP_MARK_TTL: Duration = Duration::from_secs(30);
+
+/// Метка занятости, при которой туннель останавливают.
+fn is_stop_label(label: &str) -> bool {
+    label == "busy.disconnect"
 }
 
 impl Shared {
@@ -245,6 +263,7 @@ impl Shared {
             host: RwLock::new(host),
             snapshot: Default::default(),
             pending: Default::default(),
+            stopped: Default::default(),
             ping: Mutex::new(PingState { host: options.ping_host.clone(), ..Default::default() }),
             options: Mutex::new(options),
             events,
@@ -414,14 +433,18 @@ impl Shared {
     /// Пометить туннели занятыми; пометка снимается, когда охранник уничтожен (в том числе при панике).
     pub fn pending_guard(self: &Arc<Self>, items: impl IntoIterator<Item = (String, &'static str)>) -> PendingGuard {
         let mut pending = lock(&self.pending);
-        let names = items
-            .into_iter()
-            .map(|(name, label)| {
-                pending.insert(name.clone(), label);
-                name
-            })
-            .collect();
-        PendingGuard { shared: self.clone(), names }
+        let mut stopped = lock(&self.stopped);
+        let (mut names, mut stopping) = (Vec::new(), Vec::new());
+        for (name, label) in items {
+            pending.insert(name.clone(), label);
+            // Новая команда отменяет прежнюю отметку: поднятый ею снова туннель, упавший позже, — авария.
+            stopped.remove(&name);
+            if is_stop_label(label) {
+                stopping.push(name.clone());
+            }
+            names.push(name);
+        }
+        PendingGuard { shared: self.clone(), names, stopping }
     }
 
     /// Занять туннель, если он не занят: проверка и пометка — под одним замком, два нажатия подряд не пройдут оба.
@@ -431,7 +454,25 @@ impl Shared {
             return None;
         }
         pending.insert(name.to_string(), label);
-        Some(PendingGuard { shared: self.clone(), names: vec![name.to_string()] })
+        lock(&self.stopped).remove(name);
+        let stopping = if is_stop_label(label) { vec![name.to_string()] } else { Vec::new() };
+        Some(PendingGuard { shared: self.clone(), names: vec![name.to_string()], stopping })
+    }
+
+    /// Туннели «по команде»: те, с которыми она работает сейчас, и остановленные ею, пока монитор не увидел их
+    /// отключёнными, — их отключение не авария.
+    fn in_command(&self, now: Instant) -> BTreeSet<String> {
+        let mut set: BTreeSet<String> = lock(&self.pending).keys().cloned().collect();
+        let mut stopped = lock(&self.stopped);
+        stopped.retain(|_, at| now.duration_since(*at) < STOP_MARK_TTL);
+        set.extend(stopped.keys().cloned());
+        set
+    }
+
+    /// Монитор разобрал уровни: отметка остаётся только у туннелей, которые он ещё видит работающими, — остановку,
+    /// которую он уже учёл (или туннеля больше нет), помнить незачем.
+    fn settle_stops(&self, levels: &BTreeMap<String, Health>) {
+        lock(&self.stopped).retain(|name, _| levels.get(name).is_some_and(|h| h.level != Level::Off));
     }
 
     // --- настройки фоновых потоков
@@ -492,7 +533,7 @@ impl Shared {
         let want_ping = lock(&self.options).ping;
         let ping = want_ping.then(|| lock(&self.ping).clone());
         let map = snap.tunnels.iter().map(|t| (t.clone(), snap.health(t, pending.get(t).copied(), ping.as_ref()))).collect();
-        (map, pending.into_keys().collect(), supervised)
+        (map, self.in_command(Instant::now()), supervised)
     }
 }
 
@@ -610,6 +651,7 @@ fn react(
 ) {
     let options = lock(&shared.options).clone();
     let fresh = watch.step(levels, supervised, user, unix_now());
+    shared.settle_stops(levels);
     if make_events {
         record_and_notify(&shared.events, fresh, options.notify && options.tray, &mut |e| toast(e));
     }
@@ -854,6 +896,53 @@ mod tests {
 
     fn event(text: &str, notify: bool) -> Event {
         Event::new(1, "a", Severity::Warn, text, notify)
+    }
+
+    /// Живой прогон переключения A → B (pc-dev, 2026-10-11): опрос снял состояние до остановки A, команда кончилась и
+    /// сняла «занят» раньше следующего разбора, и остановка по запросу попала в журнал как «Туннель отключился» (FAIL).
+    #[test]
+    fn stop_on_request_seen_after_the_command_ended_is_info_not_a_failure() {
+        let shared = shared();
+        *lock(&shared.snapshot) = Snapshot { tunnels: ["a".to_string(), "b".to_string()].into(), ..Default::default() };
+        let (mut watch, none) = (Watch::default(), BTreeMap::new());
+        let levels = |a| BTreeMap::from([("a".to_string(), Health::new(a, "t".into()))]);
+        // То, что делает монитор за один круг: «по команде» из общего состояния, разбор, события в журнал.
+        let round = |watch: &mut Watch, level| {
+            let (_, user, _) = shared.levels();
+            react(&shared, watch, &levels(level), &user, &none, true);
+        };
+        round(&mut watch, Level::Ok);
+        // Переключение A → B: A отключается под пометкой «занят»; пометка снята до того, как опрос увидел остановку.
+        drop(shared.pending_guard([("a".to_string(), "busy.disconnect"), ("b".to_string(), "busy.connect")]));
+        round(&mut watch, Level::Ok);
+        round(&mut watch, Level::Off);
+        round(&mut watch, Level::Off);
+        let log: Vec<_> = shared.events_since(0).into_iter().map(|(_, e)| (e.severity, e.text)).collect();
+        assert_eq!(log, [(Severity::Info, tr("ev.disconnected"))], "остановка по запросу — Info, без FAIL");
+        assert!(tr("ev.disconnected") != tr("ev.dropped"));
+
+        // Отметка сработала один раз: тот же туннель, поднятый и упавший сам, — по-прежнему авария.
+        round(&mut watch, Level::Ok);
+        round(&mut watch, Level::Off);
+        let last = shared.events_since(0).pop().map(|(_, e)| (e.severity, e.text));
+        assert_eq!(last, Some((Severity::Bad, tr("ev.dropped"))));
+    }
+
+    /// Новая команда отменяет отметку об остановке; отметка истекает, если монитор так и не увидел отключения.
+    #[test]
+    fn stop_mark_is_replaced_by_a_new_command_and_expires() {
+        let shared = shared();
+        let now = Instant::now();
+        drop(shared.pending_guard([("a".to_string(), "busy.disconnect")]));
+        assert!(shared.in_command(now).contains("a"));
+        drop(shared.pending_guard([("a".to_string(), "busy.connect")]));
+        assert!(shared.in_command(now).is_empty(), "поднятый заново туннель не «остановлен по запросу»");
+
+        drop(shared.try_pending_guard("a", "busy.disconnect"));
+        assert!(shared.in_command(now).contains("a"));
+        assert!(shared.in_command(now + STOP_MARK_TTL + Duration::from_secs(1)).is_empty(), "истекла");
+        drop(shared.pending_guard([("a".to_string(), "busy.reconnect")]));
+        assert!(shared.in_command(now).is_empty(), "переподключение не оставляет отметки: туннель снова работает");
     }
 
     /// Живой прогон пропадания питания: ядро поднялось, туннель под надзором — в журнале было «Подключён», пока служба

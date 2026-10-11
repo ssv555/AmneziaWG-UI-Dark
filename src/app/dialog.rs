@@ -265,6 +265,7 @@ pub(super) fn note_popups(ctx: &egui::Context) {
 #[cfg(test)]
 pub(super) mod tests {
     use super::*;
+use crate::app::testkit::RunFrame as _;
 
     fn key(key: egui::Key, pressed: bool, repeat: bool, modifiers: egui::Modifiers) -> egui::Event {
         egui::Event::Key { key, physical_key: None, pressed, repeat, modifiers }
@@ -328,7 +329,7 @@ pub(super) mod tests {
     fn button_row_lays_out_in_list_order() {
         let ctx = egui::Context::default();
         let mut rects = Vec::new();
-        let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+        let _ = ctx.run_frame(egui::RawInput::default(), |ui| {
             let row = ok_cancel_apply_row(("OK", true), "Cancel", ("Apply", true));
             rects = button_row(ui, &row).iter().map(|r| r.rect).collect();
         });
@@ -368,7 +369,7 @@ pub(super) mod tests {
             events,
             ..Default::default()
         };
-        let _ = ctx.run_ui(input, |ui| {
+        let _ = ctx.run_frame(input, |ui| {
             let ctx = ui.ctx();
             // Как `App::ui`: снимок «открыт ли список» до рисования.
             note_popups(ctx);
@@ -472,7 +473,7 @@ pub(super) mod tests {
         let mut rect = Rect::NOTHING;
         for _ in 0..3 {
             let input = egui::RawInput { screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, screen)), ..Default::default() };
-            let _ = ctx.run_ui(input, |ui| {
+            let _ = ctx.run_frame(input, |ui| {
                 let ctx = ui.ctx();
                 let mut open = true;
                 let shown = build(dialog_window(ctx, "t", "test-bounds", &mut open)).show(ctx, |ui| {
@@ -511,7 +512,7 @@ pub(super) mod tests {
         let (mut window, mut row) = (Rect::NOTHING, Rect::NOTHING);
         for _ in 0..3 {
             let input = egui::RawInput { screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, screen)), ..Default::default() };
-            let _ = ctx.run_ui(input, |ui| {
+            let _ = ctx.run_frame(input, |ui| {
                 let ctx = ui.ctx();
                 let mut open = true;
                 let shown = dialog_window(ctx, "t", "test-body", &mut open).show(ctx, |ui| {
@@ -553,7 +554,7 @@ pub(super) mod tests {
         let ctx = egui::Context::default();
         let heights = |text: &str| {
             let (mut error, mut row) = (Rect::NOTHING, Rect::NOTHING);
-            let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+            let _ = ctx.run_frame(egui::RawInput::default(), |ui| {
                 ui.set_width(300.0);
                 let before = ui.cursor().top();
                 error_line(ui, text);

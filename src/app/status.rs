@@ -78,6 +78,7 @@ pub(super) fn status_bar(ui: &mut Ui, bar: &StatusBar, actions: &mut Vec<Action>
 #[cfg(test)]
 mod tests {
     use super::*;
+use crate::app::testkit::RunFrame as _;
     use super::super::theme::{DAYLIGHT, GRAPHITE, SLATE};
 
     const PALETTES: [(&str, &Palette); 3] = [("graphite", &GRAPHITE), ("slate", &SLATE), ("daylight", &DAYLIGHT)];
@@ -119,7 +120,7 @@ mod tests {
         let mut link = None;
         for _ in 0..2 {
             let input = egui::RawInput { screen_rect: Some(screen), ..Default::default() };
-            let _ = ctx.run_ui(input, |ui| {
+            let _ = ctx.run_frame(input, |ui| {
                 link = status_bar(ui, &bar(Some("pipe: closed"), true, Some(&notice)), &mut Vec::new());
             });
         }

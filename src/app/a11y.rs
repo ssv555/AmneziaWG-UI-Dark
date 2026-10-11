@@ -98,6 +98,7 @@ pub(super) fn describe(resp: &Response, what: Painted) {
 #[cfg(test)]
 mod tests {
     use super::*;
+use crate::app::testkit::RunFrame as _;
     use eframe::egui::{self, accesskit, Sense, Vec2};
 
     /// Один кадр с включённым AccessKit: нарисовать элемент через `describe`, вернуть узел дерева по его id.
@@ -105,7 +106,7 @@ mod tests {
         let ctx = egui::Context::default();
         ctx.enable_accesskit();
         let mut id = None;
-        let out = ctx.run_ui(egui::RawInput::default(), |ui| {
+        let out = ctx.run_frame(egui::RawInput::default(), |ui| {
             let (_, resp) = ui.allocate_exact_size(Vec2::new(200.0, 20.0), Sense::click());
             describe(&resp, what());
             id = Some(resp.id);

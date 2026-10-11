@@ -454,6 +454,7 @@ pub(super) fn tunnel_row(
 #[cfg(test)]
 mod tests {
     use super::*;
+use crate::app::testkit::RunFrame as _;
     use crate::app::theme::{DAYLIGHT, GRAPHITE, SLATE};
 
     /// Подсказка к имени группы показывается, когда имя обрезано: признак — `elided` того же galley, что рисуется.
@@ -461,7 +462,7 @@ mod tests {
     #[test]
     fn truncated_group_name_is_detected_for_its_tooltip() {
         let ctx = egui::Context::default();
-        let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+        let _ = ctx.run_frame(egui::RawInput::default(), |ui| {
             let font = FontId::proportional(15.0);
             let long = truncated(ui, "Очень длинное имя группы туннелей", font.clone(), GRAPHITE.text_strong, 60.0);
             assert!(long.elided && long.size().x <= 60.0 + 1.0, "{}", long.size().x);

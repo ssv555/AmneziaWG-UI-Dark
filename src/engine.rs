@@ -192,6 +192,11 @@ pub fn tunnel_name(conf: &Path) -> String {
 pub fn run_service(conf: &Path) -> i32 {
     let name = tunnel_name(conf);
     let Ok(text) = crate::store::read(conf) else { return 2 };
+    // `tunnel.dll` never sets the interface's DNS (see `tunnel_dns`): the keeper does it until the engine stops.
+    // Its notes reach the core's event log, in the core's language.
+    crate::daemon::use_core_language();
+    let (plan, tunnel) = (crate::tunnel_dns::Plan::of(&text), name.clone());
+    std::thread::spawn(move || crate::tunnel_dns::run(plan, &tunnel, &|| service_stopping(&tunnel)));
     let dll = std::env::current_exe().ok().and_then(|e| e.parent().map(|d| d.join("tunnel.dll"))).unwrap_or_default();
     unsafe {
         let lib = LoadLibraryExW(wide(&dll.to_string_lossy()).as_ptr(), null_mut(), LOAD_WITH_ALTERED_SEARCH_PATH);
@@ -203,6 +208,13 @@ pub fn run_service(conf: &Path) -> i32 {
         let run: unsafe extern "C" fn(*const u16, *const u16) -> u8 = std::mem::transmute(entry);
         i32::from(run(wide(&text).as_ptr(), wide(&name).as_ptr()) == 0)
     }
+}
+
+/// The tunnel's own service is stopping or stopped (the engine reports `StopPending` before it tears the interface
+/// down): the DNS keeper ends there.
+fn service_stopping(tunnel: &str) -> Result<bool, String> {
+    let st = Handle::scm_connect().and_then(|scm| Service::open(&scm, tunnel, SERVICE_QUERY_STATUS)).and_then(|svc| svc.query())?;
+    Ok(matches!(st.state, State::StopPending | State::Stopped))
 }
 
 /// Поднять туннель: служба с этим именем (своя старая — пересоздаётся, чужая — ошибка), запуск, ожидание.

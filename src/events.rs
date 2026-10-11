@@ -453,9 +453,10 @@ impl EventLog {
         }
     }
 
-    /// События с номером больше `after` — вместе с номерами.
+    /// События с номером больше `after` — вместе с номерами. `u64::MAX` («события не нужны», так спрашивает пинг
+    /// агента) — пусто: `after + 1` здесь переполнялось бы (паника в отладочной сборке, «всё подряд» в выпускной).
     pub fn since(&self, after: u64) -> Vec<(u64, Event)> {
-        let skip = (after + 1).saturating_sub(self.first_seq) as usize;
+        let skip = usize::try_from(after.saturating_add(1).saturating_sub(self.first_seq)).unwrap_or(usize::MAX);
         self.items.iter().enumerate().skip(skip).map(|(i, e)| (self.first_seq + i as u64, e.clone())).collect()
     }
 }
@@ -592,6 +593,24 @@ mod tests {
         let last = all.last().unwrap().0;
         assert!(log.since(last).is_empty());
         assert_eq!(log.since(last - 2).iter().map(|(n, _)| *n).collect::<Vec<_>>(), vec![last - 1, last]);
+    }
+
+    #[test]
+    fn since_handles_the_boundary_positions() {
+        let mut log = EventLog::open(None);
+        assert!(log.since(0).is_empty() && log.since(u64::MAX).is_empty(), "пустой журнал");
+        for i in 0..KEEP + 3 {
+            log.push(Event::new(i as u64, "t", Severity::Info, "x", false));
+        }
+        let last = log.last_seq();
+        assert!(log.since(u64::MAX).is_empty(), "u64::MAX — события не нужны, а не «всё подряд»");
+        assert!(log.since(u64::MAX - 1).is_empty());
+        assert!(log.since(last + 1).is_empty(), "позиция дальше журнала");
+        assert!(log.since(last).is_empty());
+        assert_eq!(log.since(last - 1).len(), 1);
+        assert_eq!(log.since(0).len(), KEEP, "позиция до вытесненных — весь журнал");
+        assert_eq!(log.since(3).len(), KEEP, "3 — последнее вытесненное: остались все");
+        assert_eq!(log.since(4).len(), KEEP - 1);
     }
 
     #[test]

@@ -1185,6 +1185,7 @@ fn versions(e: &HistoryEntry) -> String {
 mod tests {
     use super::super::theme::{DAYLIGHT, GRAPHITE};
     use super::*;
+use crate::app::testkit::RunFrame as _;
 
     pub(super) fn row(id: Component, installed: Option<&str>, available: Option<&str>, update: bool) -> ComponentState {
         ComponentState {
@@ -1538,7 +1539,7 @@ mod tests {
     #[test]
     fn measured_widths_follow_the_text() {
         let ctx = egui::Context::default();
-        let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+        let _ = ctx.run_frame(egui::RawInput::default(), |ui| {
             let short = text_width(ui, RichText::new("OK"));
             let long = text_width(ui, RichText::new("Amnezia released v3.2.0 — comes with an app update"));
             assert!(short > SLACK && long > short * 5.0, "{short} {long}");
@@ -1556,6 +1557,7 @@ mod core_tests {
     use super::super::testkit::{errors, sink};
     use super::tests::{pair, row, state};
     use super::*;
+use crate::app::testkit::RunFrame as _;
     use crate::daemon::agent::proto::{AgentRequest, AgentResponse};
 
     type Reply = dyn Fn(&AgentRequest) -> Result<AgentResponse, String> + Send + Sync;
@@ -1762,7 +1764,7 @@ mod core_tests {
     /// Кадр: уведомление, под ним окно-«редактор» (слой `Middle`, как у всех окон); `true` — Esc достался «редактору».
     fn news_frame(ctx: &egui::Context, w: &mut UpdatesWindow, events: Vec<egui::Event>) -> bool {
         let mut editor_escape = false;
-        let _ = ctx.run_ui(egui::RawInput { events, ..Default::default() }, |ui| {
+        let _ = ctx.run_frame(egui::RawInput { events, ..Default::default() }, |ui| {
             let ctx = ui.ctx();
             w.show_news(ctx);
             let mut open = true;
@@ -1831,7 +1833,7 @@ mod core_tests {
         let view = View { state, error: None, selected: &selected, busy: false, locked: false };
         let ctx = egui::Context::default();
         let mut height = 0.0;
-        let _ = ctx.run_ui(egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(1000.0, 700.0))), ..Default::default() }, |ui| {
+        let _ = ctx.run_frame(egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(1000.0, 700.0))), ..Default::default() }, |ui| {
             egui::CentralPanel::default().show(ui, |ui| {
                 components_table(ui, &view, &mut Vec::new());
                 height = ui.min_rect().height();
@@ -1879,7 +1881,7 @@ mod core_tests {
     /// Кадр с окном «Что нового» под окном-«редактором»; `true` — Esc достался «редактору».
     fn notes_frame(ctx: &egui::Context, w: &mut UpdatesWindow, events: Vec<egui::Event>) -> bool {
         let mut editor_escape = false;
-        let _ = ctx.run_ui(egui::RawInput { events, ..Default::default() }, |ui| {
+        let _ = ctx.run_frame(egui::RawInput { events, ..Default::default() }, |ui| {
             let ctx = ui.ctx();
             let mut open = true;
             dialog_window(ctx, "editor", "test-editor", &mut open).default_pos([100.0, 100.0]).show(ctx, |ui| ui.label("text"));
@@ -2046,7 +2048,7 @@ mod core_tests {
         // «Позже» в середине суток: окно закрыло уведомление и пометило отсрочку.
         let ctx = egui::Context::default();
         w.news_focused = true;
-        let _ = ctx.run_ui(egui::RawInput { events: escape(), ..Default::default() }, |ui| w.show_news(ui.ctx()));
+        let _ = ctx.run_frame(egui::RawInput { events: escape(), ..Default::default() }, |ui| w.show_news(ui.ctx()));
         assert!(w.news.is_empty() && w.snoozed);
         let later = T0 + DAY / 2;
         answered(&w, &[pair(Component::App, "0.5.0")]);
@@ -2066,10 +2068,10 @@ mod core_tests {
         let mut w = quiet_window();
         w.news = news.clone();
         let ctx = egui::Context::default();
-        let _ = ctx.run_ui(egui::RawInput { events: enter(), ..Default::default() }, |ui| w.show_news(ui.ctx()));
+        let _ = ctx.run_frame(egui::RawInput { events: enter(), ..Default::default() }, |ui| w.show_news(ui.ctx()));
         assert_eq!((w.news.clone(), w.is_open()), (news, false), "the notice is not active: Enter is not its");
         w.news_focused = true;
-        let _ = ctx.run_ui(egui::RawInput { events: enter(), ..Default::default() }, |ui| w.show_news(ui.ctx()));
+        let _ = ctx.run_frame(egui::RawInput { events: enter(), ..Default::default() }, |ui| w.show_news(ui.ctx()));
         assert!(w.news.is_empty() && w.is_open(), "Enter on the active notice = Open");
     }
 

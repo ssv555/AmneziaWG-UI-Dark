@@ -817,6 +817,7 @@ mod testkit {
     use super::ErrorSink;
     use crate::events::Severity;
     use crate::monitor::{Options, Shared};
+    use eframe::egui;
 
     pub(super) fn sink() -> (Arc<Shared>, ErrorSink) {
         let options = Options { ping: false, ping_host: String::new(), notify: false, tray: false, taskbar: false };
@@ -828,6 +829,21 @@ mod testkit {
     pub(super) fn errors(shared: &Shared) -> Vec<(String, String)> {
         shared.events_since(0).into_iter().filter(|(_, e)| e.severity == Severity::Bad).map(|(_, e)| (e.tunnel, e.text)).collect()
     }
+
+    /// Кадр egui для тестов. Прямой `Context::run_ui` отдаёт `FullOutput`, а его `TexturesDelta` (загрузка атласа шрифтов
+    /// в первом кадре) в отладочной сборке паникует при сбросе без обработки; тестам GPU не нужен — дельта очищается
+    /// здесь, в одном месте. Прямой вызов в тестах запрещён (`tests::frames_in_tests_go_through_run_frame`).
+    pub(super) trait RunFrame {
+        fn run_frame(&self, input: egui::RawInput, build: impl FnMut(&mut egui::Ui)) -> egui::FullOutput;
+    }
+
+    impl RunFrame for egui::Context {
+        fn run_frame(&self, input: egui::RawInput, build: impl FnMut(&mut egui::Ui)) -> egui::FullOutput {
+            let mut out = self.run_ui(input, build);
+            out.textures_delta.clear();
+            out
+        }
+    }
 }
 
 #[cfg(test)]
@@ -835,6 +851,33 @@ mod tests {
     use super::testkit::{errors, sink};
     use super::*;
     use crate::daemon::fake::FakeCore;
+
+    /// Кадры egui в тестах идут через `testkit::RunFrame::run_frame`: прямой вызов роняет тест в отладочной сборке
+    /// (`TexturesDelta` сброшен без обработки), а выпускная, на которой гоняют тесты, этого не видит.
+    #[test]
+    fn frames_in_tests_go_through_run_frame() {
+        fn rust_files(dir: &std::path::Path, out: &mut Vec<PathBuf>) {
+            for entry in std::fs::read_dir(dir).unwrap_or_else(|e| panic!("{}: {e}", dir.display())) {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    rust_files(&path, out);
+                } else if path.extension().is_some_and(|x| x == "rs") {
+                    out.push(path);
+                }
+            }
+        }
+        let src = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut files = Vec::new();
+        rust_files(&src, &mut files);
+        let direct = [".run", "_ui("].concat();
+        let offenders: Vec<String> = files
+            .iter()
+            .filter(|p| **p != src.join("app.rs"))
+            .filter(|p| std::fs::read_to_string(p).unwrap_or_else(|e| panic!("{}: {e}", p.display())).contains(&direct))
+            .map(|p| p.display().to_string())
+            .collect();
+        assert!(offenders.is_empty(), "прямой {direct} вместо run_frame: {offenders:?}");
+    }
 
     #[test]
     fn table_keys_are_off_while_any_window_is_over_the_table() {

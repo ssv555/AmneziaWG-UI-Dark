@@ -27,6 +27,7 @@ mod stats;
 mod store;
 mod taskbar;
 mod tray;
+mod tunnel_dns;
 mod uapi;
 mod update;
 mod win;

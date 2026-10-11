@@ -439,6 +439,7 @@ fn header(ui: &mut Ui, cols: &[(SortKey, &str, f32)], s: &Settings, actions: &mu
 #[cfg(test)]
 mod tests {
     use super::*;
+use crate::app::testkit::RunFrame as _;
 
     #[test]
     fn activation_only_connects() {
@@ -586,7 +587,7 @@ mod tests {
     #[test]
     fn measured_columns_hold_their_widest_value() {
         let ctx = egui::Context::default();
-        let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+        let _ = ctx.run_frame(egui::RawInput::default(), |ui| {
             let s = all_columns();
             for (key, title) in numeric_columns(&s) {
                 let w = natural_width(ui, key, title);

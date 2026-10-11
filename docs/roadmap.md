@@ -45,6 +45,8 @@ Full per-version lists are in the [changelog](../CHANGELOG.md). Only the headlin
    down.
 14. **0.5.9** (2026.10.11): a tunnel whose server goes silent right after a handshake (a lost NAT mapping) is restarted
    after 30 s of silence instead of 3 minutes, so sessions inside the tunnel (RDP and the like) reconnect by themselves.
+15. **0.5.10** (2026.10.11): with the built-in engine the profile DNS is set on the tunnel adapter (the engine ignored it, so
+   names were resolved outside the tunnel); a requested tunnel switch is no longer logged as a failure.
 
 ## Next
 

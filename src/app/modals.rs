@@ -196,6 +196,7 @@ fn make_modal(ctx: &egui::Context, window: egui::Id) {
 #[cfg(test)]
 mod tests {
     use super::*;
+use crate::app::testkit::RunFrame as _;
 
     fn press(key: egui::Key) -> egui::Event {
         egui::Event::Key { key, physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers::NONE }
@@ -214,7 +215,7 @@ mod tests {
     /// Контекст общий для кадров: признак автоповтора egui ставит сам по удержанным клавишам.
     fn frame(ctx: &egui::Context, modals: &mut Modals, events: Vec<egui::Event>, close: &[&str]) -> Vec<(&'static str, bool, bool)> {
         let mut seen = Vec::new();
-        let _ = ctx.run_ui(egui::RawInput { events, ..Default::default() }, |ui| {
+        let _ = ctx.run_frame(egui::RawInput { events, ..Default::default() }, |ui| {
             let ctx = ui.ctx();
             modals.run(ctx, |m, turn| {
                 let (enter, escape) = turn.keys(ctx);
@@ -334,7 +335,7 @@ mod tests {
     fn window_frame(ctx: &egui::Context, modals: &mut Modals, events: Vec<egui::Event>) -> (bool, egui::Rect, egui::Id) {
         let mut main = (false, egui::Rect::NOTHING, egui::Id::NULL);
         let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 500.0));
-        let _ = ctx.run_ui(egui::RawInput { screen_rect: Some(screen), events, ..Default::default() }, |ui| {
+        let _ = ctx.run_frame(egui::RawInput { screen_rect: Some(screen), events, ..Default::default() }, |ui| {
             let ctx = ui.ctx();
             let mut shown = true;
             super::super::dialog::dialog_window(ctx, "main", "test-main", &mut shown)

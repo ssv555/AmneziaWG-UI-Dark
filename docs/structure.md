@@ -40,6 +40,7 @@ Top-level files, by layer. Layers are explained in [modules](modules.md).
 | `archive.rs` | Import from zip and password-protected backup archives |
 | `native.rs` | Driving the original AmneziaWG window through UI Automation |
 | `uapi.rs` | Tunnel state over the WireGuard UAPI pipe |
+| `tunnel_dns.rs` | Mode 2: DNS of the tunnel interface from the profile's `DNS =` (the engine does not set it), kept by the tunnel service process |
 | `conf.rs`, `conf/check.rs` | Tunnel details parsed from a `.conf` file; config check with the engine's parser rules (keys, addresses, Endpoint, AmneziaWG parameters), shown under the editor with line numbers |
 | `scm.rs` | Windows service control behind one interface, with a fake for tests |
 | `win.rs` | Windows specifics: administrator check, title bar and window border per theme, manager service, autostart, single instance |

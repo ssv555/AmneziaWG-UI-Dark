@@ -13,6 +13,7 @@ use super::core_ui::{banner_row, Banner};
 use super::dialog::{dialog_body, dialog_ok_cancel_apply, dialog_window, window_bounds};
 use super::engine_mode::MODE_SWITCH_WIDTH;
 use super::settings_dialog::{sections, Choices, SETTINGS_WIDTH};
+use super::testkit::RunFrame as _;
 use super::*;
 use crate::events::{Event, Severity};
 use crate::i18n::{tr, trf};
@@ -38,7 +39,7 @@ fn frames(ctx: &egui::Context, screen: Vec2, mut build: impl FnMut(&mut Ui)) -> 
     let mut shapes = Vec::new();
     for _ in 0..3 {
         let input = egui::RawInput { screen_rect: Some(Rect::from_min_size(Pos2::ZERO, screen)), ..Default::default() };
-        shapes = ctx.run_ui(input, |ui| build(ui)).shapes;
+        shapes = ctx.run_frame(input, |ui| build(ui)).shapes;
     }
     shapes
 }
