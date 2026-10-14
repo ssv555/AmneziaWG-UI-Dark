@@ -12,7 +12,7 @@ eframe = { version = "0.36", default-features = false, features = ["wgpu_no_defa
 # все бэкенды wgpu по умолчанию (Vulkan, GL, Metal), поэтому у eframe фича без них, а DX12 включает эта строка.
 wgpu = { version = "30", default-features = false, features = ["dx12"] }
 raw-window-handle = "0.6"
-x25519-dalek = { version = "2", features = ["static_secrets"] }
+x25519-dalek = { version = "3", features = ["static_secrets"] }
 png = "0.17"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 # Импорт туннелей из zip и резервная копия с паролем (AES-256).
